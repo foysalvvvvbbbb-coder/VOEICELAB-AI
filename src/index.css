@@ -1,0 +1,38 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --bg-primary: #0B1512;
+    --bg-secondary: #12231D;
+    --bg-card: #19352A;
+    --accent-primary: #16A36A;
+    --accent-secondary: #42D9A0;
+    --text-primary: #F4F8F5;
+    --text-secondary: #A2B5AA;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', 'Hind Siliguri', 'Noto Sans Devanagari', sans-serif;
+    background-color: #0B1512;
+    color: #F4F8F5;
+    letter-spacing: 0.01em;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'IBM Plex Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.font-bengali {
+  font-family: 'Hind Siliguri', 'Plus Jakarta Sans', sans-serif;
+}
+
+.font-hindi {
+  font-family: 'Noto Sans Devanagari', 'Plus Jakarta Sans', sans-serif;
+}

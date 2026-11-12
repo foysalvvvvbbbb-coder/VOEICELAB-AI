@@ -1,0 +1,6 @@
+{
+  "name": "VoiceLab AI",
+  "description": "Professional Same-Language AI Voice Cloning Studio (Bengali, Hindi, English) and Universal Multilingual Audio-to-SRT Generator with FFmpeg DSP acoustic analysis.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
