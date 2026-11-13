@@ -41,7 +41,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
 
       - name: Install FFmpeg & FFprobe
         run: |
@@ -50,7 +57,7 @@ jobs:
           ffmpeg -version | head -n 2
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: Run TypeScript type check
         run: npm run lint
@@ -62,9 +69,15 @@ jobs:
 
       - name: Smoke-test production Express server & /api/health
         run: |
-          NODE_ENV=production PORT=3099 node server.ts &
+          NODE_ENV=production PORT=3099 npx tsx server.ts >/tmp/voicelab_ci_server.log 2>&1 &
           SERVER_PID=$!
-          sleep 2
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:3099/api/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
           curl -fsS http://127.0.0.1:3099/api/health | grep '"status":"operational"'
           curl -fsS http://127.0.0.1:3099/ | grep 'id="root"'
-          kill -TERM $SERVER_PID || true
+          kill -9 $SERVER_PID 2>/dev/null || true
+          pkill -f "PORT=3099" 2>/dev/null || true

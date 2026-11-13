@@ -58,3 +58,4 @@ npm-debug.log*
 Thumbs.db
 coverage/
 .vite/
+public/assets/aistudio/
