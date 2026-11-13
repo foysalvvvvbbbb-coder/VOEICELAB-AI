@@ -471,6 +471,16 @@ async function synthesizeSingleBlockRawWav(options: {
   throw new Error(formatGeminiApiError(lastError, 'Speech synthesis failed'));
 }
 
+export interface BackendPipelineProgressEvent {
+  stageIndex: number;
+  stageLabel: string;
+  stageDetail?: string;
+  progressPct: number | null;
+  progressSource: 'backend-chunks' | 'indeterminate-inference';
+  completedUnits?: number;
+  totalUnits?: number;
+}
+
 /**
  * Synthesizes speech with automatic sentence-boundary chunking and zero-click crossfaded
  * concatenation for medium and long texts (> 240 chars) so prosody, pronunciation, and
@@ -482,8 +492,9 @@ async function synthesizeRawSpeechWav(options: {
   voicePersona: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
   styleDirective: string;
   outputRawWavPath: string;
+  onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<string> {
-  const { text, voicePersona, outputRawWavPath } = options;
+  const { text, voicePersona, outputRawWavPath, onProgress } = options;
   const cleanText = text.trim();
 
   // Group sentences into chunks of <= 240 chars to prevent long-text prosody degradation
@@ -506,6 +517,12 @@ async function synthesizeRawSpeechWav(options: {
   }
 
   if (textBlocks.length <= 1) {
+    onProgress?.({
+      stageIndex: 1,
+      stageLabel: `Synthesizing speech audio (${voicePersona} persona)...`,
+      progressPct: null,
+      progressSource: 'indeterminate-inference'
+    });
     return synthesizeSingleBlockRawWav({
       text: cleanText,
       voicePersona,
@@ -517,12 +534,30 @@ async function synthesizeRawSpeechWav(options: {
   let modelUsed = 'gemini-3.8-flash-lite-tts';
   try {
     for (let i = 0; i < textBlocks.length; i++) {
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: `Synthesizing sentence block ${i + 1} of ${textBlocks.length}...`,
+        stageDetail: `Block ${i + 1}/${textBlocks.length}`,
+        progressPct: Math.round((i / textBlocks.length) * 100),
+        progressSource: 'backend-chunks',
+        completedUnits: i,
+        totalUnits: textBlocks.length
+      });
       const partPath = `${outputRawWavPath}.part_${i}.wav`;
       chunkPaths.push(partPath);
       modelUsed = await synthesizeSingleBlockRawWav({
         text: textBlocks[i],
         voicePersona,
         outputRawWavPath: partPath
+      });
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: `Completed sentence block ${i + 1} of ${textBlocks.length}`,
+        stageDetail: `Block ${i + 1}/${textBlocks.length}`,
+        progressPct: Math.round(((i + 1) / textBlocks.length) * 100),
+        progressSource: 'backend-chunks',
+        completedUnits: i + 1,
+        totalUnits: textBlocks.length
       });
     }
     await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180);
@@ -554,6 +589,7 @@ export async function executeSameLanguageVoiceCloning(options: {
   preserveSpectralTimbre: boolean;
   outputDir: string;
   localEndpointUrl?: string;
+  onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<VoiceCloneResult> {
   const {
     jobId,
@@ -564,8 +600,16 @@ export async function executeSameLanguageVoiceCloning(options: {
     preservePitchContour,
     preserveSpectralTimbre,
     outputDir,
-    localEndpointUrl
+    localEndpointUrl,
+    onProgress
   } = options;
+
+  onProgress?.({
+    stageIndex: 0,
+    stageLabel: 'Validating same-language script & reference vocal profile...',
+    progressPct: null,
+    progressSource: 'indeterminate-inference'
+  });
 
   // 1. Validate same-language text script strictly
   const scriptCheck = validateSameLanguageText(text, language);
@@ -623,6 +667,12 @@ export async function executeSameLanguageVoiceCloning(options: {
   try {
     // 3. Stage 2 Speaker-Conditioned Neural Generation with Strict Mode Isolation:
     if (activeLocalUrlRaw) {
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: 'Synthesizing speech via Mode 2 Local Neural Node...',
+        progressPct: null,
+        progressSource: 'indeterminate-inference'
+      });
       const validatedOrigin = validateLocalNodeEndpointUrl(activeLocalUrlRaw);
       if (!referenceFilePath || !fs.existsSync(referenceFilePath)) {
         throw new Error('Mode 2 Local Neural Node Error: Reference audio file is missing on server.');
@@ -689,9 +739,17 @@ export async function executeSameLanguageVoiceCloning(options: {
         language,
         voicePersona: basePersona,
         styleDirective,
-        outputRawWavPath: rawWavPath
+        outputRawWavPath: rawWavPath,
+        onProgress
       });
     }
+
+    onProgress?.({
+      stageIndex: 2,
+      stageLabel: 'Applying FFmpeg DSP acoustic finishing & WAV/MP3 export...',
+      progressPct: null,
+      progressSource: 'indeterminate-inference'
+    });
 
     // 4. Conservative Optional Post-Synthesis DSP Audio Finishing & WAV/MP3 Export
     const dspResult = await applyReferenceAcousticIdentityAndExport({
@@ -701,6 +759,13 @@ export async function executeSameLanguageVoiceCloning(options: {
       preserveSpectralTimbre,
       outputWavPath: finalWavPath,
       outputMp3Path: finalMp3Path
+    });
+
+    onProgress?.({
+      stageIndex: 3,
+      stageLabel: 'Extracting 3072-D & 16-D audio embeddings...',
+      progressPct: null,
+      progressSource: 'indeterminate-inference'
     });
 
     // 5. Extract Real 3,072-D General Audio Embeddings (gemini-embedding-2) & 16-D Spectral Embeddings
@@ -723,6 +788,13 @@ export async function executeSameLanguageVoiceCloning(options: {
             dspResult.finalAcoustics.acousticEmbedding16D
           )
         : 0;
+
+    onProgress?.({
+      stageIndex: 4,
+      stageLabel: 'Running ASR back-transcription quality verification...',
+      progressPct: null,
+      progressSource: 'indeterminate-inference'
+    });
 
     // 6. Real Post-Synthesis ASR Back-Transcription & Character Match Rate (100 - CER)
     const ai = getGenAIClient();
@@ -952,6 +1024,7 @@ export async function executeMultilingualSrtPipeline(options: {
   durationSeconds: number;
   requestedLanguage: string; // 'auto' or ISO code
   audioPreviewUrl: string;
+  onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<SrtTranscriptionResult> {
   const startWallTime = Date.now();
   const {
@@ -960,7 +1033,8 @@ export async function executeMultilingualSrtPipeline(options: {
     originalFileName,
     durationSeconds,
     requestedLanguage,
-    audioPreviewUrl
+    audioPreviewUrl,
+    onProgress
   } = options;
 
   if (!filePath || !fs.existsSync(filePath)) {
@@ -968,6 +1042,13 @@ export async function executeMultilingualSrtPipeline(options: {
   }
 
   const ai = getGenAIClient();
+
+  onProgress?.({
+    stageIndex: 0,
+    stageLabel: 'Detecting speech intervals & splitting silence-aligned chunks (FFmpeg)...',
+    progressPct: null,
+    progressSource: 'indeterminate-inference'
+  });
 
   // 1. Detect speech intervals and split into silence-aligned chunks via FFmpeg
   const { chunks } = await detectSpeechIntervalsAndChunks(
@@ -998,7 +1079,20 @@ export async function executeMultilingualSrtPipeline(options: {
         }). NEVER translate into another language.`;
 
   try {
-    for (const chunk of chunks) {
+    for (let cIdx = 0; cIdx < chunks.length; cIdx++) {
+      const chunk = chunks[cIdx];
+      const isMultiChunk = chunks.length > 1;
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: isMultiChunk
+          ? `Transcribing audio chunk ${cIdx + 1} of ${chunks.length} with Gemini ASR...`
+          : 'Transcribing speech audio with Gemini Multilingual ASR...',
+        stageDetail: isMultiChunk ? `Chunk ${cIdx + 1}/${chunks.length}` : undefined,
+        progressPct: isMultiChunk ? Math.round((cIdx / chunks.length) * 100) : null,
+        progressSource: isMultiChunk ? 'backend-chunks' : 'indeterminate-inference',
+        completedUnits: isMultiChunk ? cIdx : undefined,
+        totalUnits: isMultiChunk ? chunks.length : undefined
+      });
       const chunkDuration = Number((chunk.endSec - chunk.startSec).toFixed(2));
       const [chunkBytes, acousticProfile] = await Promise.all([
         fs.promises.readFile(chunk.chunkFilePath),
@@ -1245,6 +1339,18 @@ Requirements:
           );
         }
       }
+
+      if (chunks.length > 1) {
+        onProgress?.({
+          stageIndex: 1,
+          stageLabel: `Completed ASR chunk ${cIdx + 1} of ${chunks.length}`,
+          stageDetail: `Chunk ${cIdx + 1}/${chunks.length}`,
+          progressPct: Math.round(((cIdx + 1) / chunks.length) * 100),
+          progressSource: 'backend-chunks',
+          completedUnits: cIdx + 1,
+          totalUnits: chunks.length
+        });
+      }
     }
   } finally {
     // Clean up temporary chunk WAV files
@@ -1262,6 +1368,13 @@ Requirements:
         : 'No recognizable speech could be transcribed from the uploaded audio file. Please verify that the audio contains clear speech and try again.'
     );
   }
+
+  onProgress?.({
+    stageIndex: 2,
+    stageLabel: 'Verifying exact token sequence & chronological timeline integrity...',
+    progressPct: null,
+    progressSource: 'indeterminate-inference'
+  });
 
   // Enforce strict timeline integrity, non-overlapping chronology, duration bounds & ordered token sequence preservation
   const { segments: normalizedSegments, validationReport } = enforceAndValidateSrtTimelineIntegrity(

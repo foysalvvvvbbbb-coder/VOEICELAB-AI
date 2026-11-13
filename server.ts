@@ -126,6 +126,65 @@ const uploadedFilesRegistry = new Map<
   { filePath: string; analysis: AudioSignalAnalysis; createdAtMs: number }
 >();
 
+// Real-time operation progress registry & SSE subscribers for Live Activity Bar
+interface ServerOperationProgress {
+  operationId: string;
+  stageIndex: number;
+  stageLabel: string;
+  stageDetail?: string;
+  progressPct: number | null;
+  progressSource: 'backend-chunks' | 'indeterminate-inference' | 'completed';
+  completedUnits?: number;
+  totalUnits?: number;
+  status: 'running' | 'succeeded' | 'failed';
+  updatedAtMs: number;
+}
+
+const operationProgressRegistry = new Map<string, ServerOperationProgress>();
+const operationSseSubscribers = new Map<string, Set<express.Response>>();
+
+function extractOperationIdFromReq(req: express.Request): string | null {
+  const raw = req.headers['x-voicelab-operation-id'] || req.query.operationId;
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 96 || !/^[a-zA-Z0-9_.-]+$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function emitServerOperationProgress(
+  operationId: string | null,
+  update: Omit<ServerOperationProgress, 'operationId' | 'updatedAtMs'>
+): void {
+  if (!operationId) return;
+  const payload: ServerOperationProgress = {
+    operationId,
+    ...update,
+    updatedAtMs: Date.now()
+  };
+  operationProgressRegistry.set(operationId, payload);
+  const subs = operationSseSubscribers.get(operationId);
+  if (subs && subs.size > 0) {
+    const frame = `data: ${JSON.stringify(payload)}\n\n`;
+    for (const res of subs) {
+      try {
+        res.write(frame);
+      } catch {
+        subs.delete(res);
+      }
+    }
+    if (update.status === 'succeeded' || update.status === 'failed') {
+      for (const res of subs) {
+        try {
+          res.end();
+        } catch {
+          // Ignore
+        }
+      }
+      operationSseSubscribers.delete(operationId);
+    }
+  }
+}
+
 const ALLOWED_EXTENSIONS = new Set(['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm', '.aac']);
 const SAFE_IDENTIFIER_REGEX = /^[a-zA-Z0-9_.-]+$/;
 
@@ -555,6 +614,13 @@ const cleanupIntervalTimer = setInterval(async () => {
       }
     }
   }
+  // Prune settled operation progress records older than 10 minutes
+  for (const [opId, state] of operationProgressRegistry.entries()) {
+    if (now - state.updatedAtMs > 10 * 60 * 1000) {
+      operationProgressRegistry.delete(opId);
+      operationSseSubscribers.delete(opId);
+    }
+  }
 }, 15 * 60 * 1000);
 cleanupIntervalTimer.unref?.();
 
@@ -602,7 +668,7 @@ async function startServer() {
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.setHeader(
           'Access-Control-Allow-Headers',
-          'Content-Type, Accept, X-Requested-With, X-VoiceLab-Session'
+          'Content-Type, Accept, X-Requested-With, X-VoiceLab-Session, X-VoiceLab-Operation-Id'
         );
         res.setHeader('Access-Control-Expose-Headers', 'X-VoiceLab-Session-Token');
         res.setHeader('Vary', 'Origin');
@@ -808,8 +874,60 @@ async function startServer() {
     });
   });
 
+  // 1c. Live Operation Progress Endpoints (SSE stream & JSON snapshot)
+  app.get('/api/operations/:operationId', (req, res) => {
+    const opId = String(req.params.operationId || '').trim();
+    if (!opId || !SAFE_IDENTIFIER_REGEX.test(opId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid operationId.' });
+      return;
+    }
+    const op = operationProgressRegistry.get(opId) || null;
+    res.status(200).type('application/json').json({ operation: op });
+  });
+
+  app.get('/api/operations/:operationId/events', (req, res) => {
+    const opId = String(req.params.operationId || '').trim();
+    if (!opId || !SAFE_IDENTIFIER_REGEX.test(opId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid operationId.' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const current = operationProgressRegistry.get(opId);
+    if (current) {
+      res.write(`data: ${JSON.stringify(current)}\n\n`);
+      if (current.status === 'succeeded' || current.status === 'failed') {
+        res.end();
+        return;
+      }
+    }
+
+    let subs = operationSseSubscribers.get(opId);
+    if (!subs) {
+      subs = new Set();
+      operationSseSubscribers.set(opId, subs);
+    }
+    subs.add(res);
+
+    req.on('close', () => {
+      const set = operationSseSubscribers.get(opId);
+      if (set) {
+        set.delete(res);
+        if (set.size === 0) {
+          operationSseSubscribers.delete(opId);
+        }
+      }
+    });
+  });
+
   // 2. Load or Synthesize Real Authorized Reference Sample Audio (Workspace A: Voice Cloning only)
   app.get('/api/sample-reference/:lang', async (req, res) => {
+    const operationId = extractOperationIdFromReq(req);
     try {
       const lang = req.params.lang as CloningLanguageCode;
       if (!['bn', 'hi', 'en'].includes(lang)) {
@@ -818,6 +936,14 @@ async function startServer() {
         });
         return;
       }
+
+      emitServerOperationProgress(operationId, {
+        stageIndex: 1,
+        stageLabel: `Preparing & inspecting ${lang.toUpperCase()} studio reference audio...`,
+        progressPct: null,
+        progressSource: 'indeterminate-inference',
+        status: 'running'
+      });
 
       const shimMap = new Map<string, { filePath: string; analysis: AudioSignalAnalysis }>();
       for (const [k, v] of uploadedFilesRegistry.entries()) {
@@ -834,8 +960,23 @@ async function startServer() {
         });
       }
 
+      emitServerOperationProgress(operationId, {
+        stageIndex: 2,
+        stageLabel: 'Studio reference voice loaded',
+        progressPct: 100,
+        progressSource: 'completed',
+        status: 'succeeded'
+      });
+
       res.status(200).type('application/json').json({ analysis });
     } catch (err: any) {
+      emitServerOperationProgress(operationId, {
+        stageIndex: 1,
+        stageLabel: err?.message || 'Failed to load sample reference',
+        progressPct: null,
+        progressSource: 'indeterminate-inference',
+        status: 'failed'
+      });
       res.status(400).type('application/json').json({
         error: err?.message || 'Failed to prepare authorized sample reference recording.'
       });
@@ -864,19 +1005,36 @@ async function startServer() {
     requireAuthenticatedSession,
     handleAudioUploadMiddleware,
     async (req, res) => {
+      const operationId = extractOperationIdFromReq(req);
       try {
         if (!req.file || !req.file.path) {
           res.status(400).type('application/json').json({ error: 'No audio file provided.' });
           return;
         }
 
+        emitServerOperationProgress(operationId, {
+          stageIndex: 1,
+          stageLabel: 'Verifying audio container signature & running FFprobe/FFmpeg DSP...',
+          progressPct: null,
+          progressSource: 'indeterminate-inference',
+          status: 'running'
+        });
+
         // Verify binary magic bytes before running FFprobe/FFmpeg
         const hasValidSignature = await verifyAudioFileMagicBytes(req.file.path);
         if (!hasValidSignature) {
           await fs.promises.unlink(req.file.path).catch(() => {});
+          const sigErr =
+            'Security validation failed: File binary header does not match a valid audio container (WAV, MP3, FLAC, OGG, M4A, AAC, WEBM).';
+          emitServerOperationProgress(operationId, {
+            stageIndex: 1,
+            stageLabel: sigErr,
+            progressPct: null,
+            progressSource: 'indeterminate-inference',
+            status: 'failed'
+          });
           res.status(400).type('application/json').json({
-            error:
-              'Security validation failed: File binary header does not match a valid audio container (WAV, MP3, FLAC, OGG, M4A, AAC, WEBM).'
+            error: sigErr
           });
           return;
         }
@@ -895,16 +1053,31 @@ async function startServer() {
 
         if (!analysis.isValid) {
           await fs.promises.unlink(req.file.path).catch(() => {});
+          const valErr =
+            analysis.qualityWarnings.join(' ') ||
+            'Uploaded audio is empty, corrupted, or contains only silence.';
+          emitServerOperationProgress(operationId, {
+            stageIndex: 1,
+            stageLabel: valErr,
+            progressPct: null,
+            progressSource: 'indeterminate-inference',
+            status: 'failed'
+          });
           res.status(422).type('application/json').json({
-            error:
-              analysis.qualityWarnings.join(' ') ||
-              'Uploaded audio is empty, corrupted, or contains only silence.'
+            error: valErr
           });
           return;
         }
 
         // If uploaded in Voice Cloning Studio, also run spoken language & vocal identity extraction
         if (workspace === 'voice-cloning') {
+          emitServerOperationProgress(operationId, {
+            stageIndex: 2,
+            stageLabel: 'Analyzing spoken language & reference vocal identity...',
+            progressPct: null,
+            progressSource: 'indeterminate-inference',
+            status: 'running'
+          });
           analysis.detectedSpokenLanguage = await analyzeReferenceVoiceLanguageAndIdentity(
             req.file.path,
             analysis
@@ -913,11 +1086,26 @@ async function startServer() {
 
         await saveUploadedFileEntry(fileId, req.file.path, analysis);
 
+        emitServerOperationProgress(operationId, {
+          stageIndex: workspace === 'voice-cloning' ? 2 : 1,
+          stageLabel: 'Audio validated and ready',
+          progressPct: 100,
+          progressSource: 'completed',
+          status: 'succeeded'
+        });
+
         res.status(200).type('application/json').json({ analysis });
       } catch (err: any) {
         if (req.file?.path) {
           await fs.promises.unlink(req.file.path).catch(() => {});
         }
+        emitServerOperationProgress(operationId, {
+          stageIndex: 1,
+          stageLabel: err?.message || 'Audio validation failed',
+          progressPct: null,
+          progressSource: 'indeterminate-inference',
+          status: 'failed'
+        });
         res.status(400).type('application/json').json({
           error: err?.message || 'Failed to validate uploaded audio file.'
         });
@@ -1004,6 +1192,7 @@ async function startServer() {
           return;
         }
 
+        const operationId = extractOperationIdFromReq(req);
         const jobId = `clone_${language}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         const result = await executeSameLanguageVoiceCloning({
           jobId,
@@ -1014,11 +1203,33 @@ async function startServer() {
           preservePitchContour: Boolean(preservePitchContour),
           preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
           outputDir: GENERATED_DIR,
-          localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined
+          localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
+          onProgress: (ev) => {
+            emitServerOperationProgress(operationId, {
+              ...ev,
+              status: 'running'
+            });
+          }
+        });
+
+        emitServerOperationProgress(operationId, {
+          stageIndex: 4,
+          stageLabel: 'Voice cloning completed',
+          progressPct: 100,
+          progressSource: 'completed',
+          status: 'succeeded'
         });
 
         res.status(200).type('application/json').json({ result });
       } catch (err: any) {
+        const operationId = extractOperationIdFromReq(req);
+        emitServerOperationProgress(operationId, {
+          stageIndex: 1,
+          stageLabel: err?.message || 'Voice cloning failed',
+          progressPct: null,
+          progressSource: 'indeterminate-inference',
+          status: 'failed'
+        });
         res.status(400).type('application/json').json({
           error: err?.message || 'Voice cloning pipeline failed.'
         });
@@ -1030,6 +1241,7 @@ async function startServer() {
   // Supports both direct multipart File/Blob upload ('audio' field) AND uploaded fileId JSON reference.
   // Strictly prohibits demo/sample audio substitution.
   const handleSrtTranscriptionRequest = async (req: express.Request, res: express.Response) => {
+    const operationId = extractOperationIdFromReq(req);
     try {
       const requestedLanguage = String(
         req.body?.requestedLanguage || req.body?.language || 'auto'
@@ -1115,11 +1327,32 @@ async function startServer() {
         originalFileName: targetFileName,
         durationSeconds: targetDurationSeconds,
         requestedLanguage,
-        audioPreviewUrl: targetPreviewUrl
+        audioPreviewUrl: targetPreviewUrl,
+        onProgress: (ev) => {
+          emitServerOperationProgress(operationId, {
+            ...ev,
+            status: 'running'
+          });
+        }
+      });
+
+      emitServerOperationProgress(operationId, {
+        stageIndex: 2,
+        stageLabel: `Generated ${result.segments.length} SRT subtitle blocks`,
+        progressPct: 100,
+        progressSource: 'completed',
+        status: 'succeeded'
       });
 
       res.status(200).type('application/json').json({ result });
     } catch (err: any) {
+      emitServerOperationProgress(operationId, {
+        stageIndex: 1,
+        stageLabel: err?.message || 'SRT transcription failed',
+        progressPct: null,
+        progressSource: 'indeterminate-inference',
+        status: 'failed'
+      });
       res.status(422).type('application/json').json({
         error: err?.message || 'Multilingual SRT transcription failed for the uploaded audio.'
       });

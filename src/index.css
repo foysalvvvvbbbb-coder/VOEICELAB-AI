@@ -36,3 +36,18 @@
 .font-hindi {
   font-family: 'Noto Sans Devanagari', 'Plus Jakarta Sans', sans-serif;
 }
+
+@keyframes voicelab-indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+.voicelab-indeterminate-bar {
+  width: 38%;
+  animation: voicelab-indeterminate-slide 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+

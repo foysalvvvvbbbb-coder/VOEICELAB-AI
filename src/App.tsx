@@ -16,7 +16,14 @@ import {
 import { VoiceCloningWorkspace } from './components/VoiceCloningWorkspace';
 import { SrtGeneratorWorkspace } from './components/SrtGeneratorWorkspace';
 import { ArchitectureAndQaView } from './components/ArchitectureAndQaView';
+import { FloatingActivityBar } from './components/FloatingActivityBar';
 import { ensureSessionInitialized, fetchApiJson } from './utils/apiClient';
+import {
+  completeOperation,
+  failOperation,
+  startOperation,
+  updateOperationStage
+} from './utils/activityManager';
 
 export type ActiveScreen = 'dashboard' | 'voice-cloning' | 'srt-generator' | 'architecture-qa';
 
@@ -71,26 +78,61 @@ export default function App() {
       setActiveScreen(act.targetScreen);
       return;
     }
+    const filename = act.downloadFilename || 'voicelab_subtitles.srt';
+    const op = startOperation({
+      feature: 'export-download',
+      title: `Export ${filename}`,
+      stages: [
+        'Encoding UTF-8 BOM SubRip (.srt) payload',
+        'Triggering browser file download'
+      ],
+      initialProgressPct: 50,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
     const blob = new Blob([`\uFEFF${act.srtContent}`], { type: 'text/plain;charset=utf-8' });
+    updateOperationStage(op.operationId, {
+      stageIndex: 1,
+      stageLabel: `Downloading ${filename}...`,
+      progressPct: 100,
+      progressSource: 'task-steps'
+    });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = act.downloadFilename || 'voicelab_subtitles.srt';
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    completeOperation(op.operationId, `Downloaded ${filename}`);
   };
 
   const handlePurgeTemporaryAudio = async () => {
+    const op = startOperation({
+      feature: 'storage-cleanup',
+      title: 'Purge Ephemeral Audio',
+      stages: [
+        'Requesting ephemeral storage cleanup',
+        'Removing temporary uploaded & generated media'
+      ],
+      initialProgressPct: null,
+      progressSource: 'indeterminate-inference',
+      canCancel: false
+    });
     try {
       const data = await fetchApiJson<{ status: string; deletedFilesCount: number }>(
         '/api/storage/cleanup',
-        { method: 'DELETE' }
+        { method: 'DELETE', operationId: op.operationId, signal: op.signal }
       );
       setPurgeStatus(`Purged (${data.deletedFilesCount})`);
+      completeOperation(
+        op.operationId,
+        `Purged ${data.deletedFilesCount} temporary audio file(s)`
+      );
       setTimeout(() => setPurgeStatus(null), 3000);
-    } catch {
+    } catch (err: any) {
+      failOperation(op.operationId, err?.message || 'Storage cleanup failed.');
       setPurgeStatus('Cleaned');
       setTimeout(() => setPurgeStatus(null), 2500);
     }
@@ -530,7 +572,7 @@ export default function App() {
         </main>
 
         {/* Compact Footer */}
-        <footer className="border-t border-[#19352A]/80 px-3 sm:px-6 py-3 text-[11px] text-[#A2B5AA]">
+        <footer className="border-t border-[#19352A]/80 px-3 sm:px-6 py-3 pb-16 sm:pb-4 text-[11px] text-[#A2B5AA]">
           <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
             <div>VoiceLab AI · Same-Language Voice Cloning &amp; Multilingual SRT Workstation</div>
             <div className="flex items-center gap-3">
@@ -561,6 +603,9 @@ export default function App() {
           </div>
         </footer>
       </div>
+
+      {/* Global Floating Bottom Activity Bar */}
+      <FloatingActivityBar />
     </div>
   );
 }

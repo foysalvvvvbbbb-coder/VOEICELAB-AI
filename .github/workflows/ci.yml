@@ -50,10 +50,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
-      - name: Install FFmpeg & FFprobe
+      - name: Install FFmpeg, FFprobe & ZIP utilities
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg zip unzip
           ffmpeg -version | head -n 2
 
       - name: Install dependencies
@@ -81,3 +81,120 @@ jobs:
           curl -fsS http://127.0.0.1:3099/ | grep 'id="root"'
           kill -9 $SERVER_PID 2>/dev/null || true
           pkill -f "PORT=3099" 2>/dev/null || true
+
+      - name: Package production Web App into VoiceLab-AI-v3.3.0-Web-App.zip
+        run: |
+          echo "Preparing clean production staging directory..."
+          WORKSPACE_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
+          rm -rf /tmp/voicelab-release-stage "$WORKSPACE_DIR/VoiceLab-AI-v3.3.0-Web-App.zip"
+          mkdir -p /tmp/voicelab-release-stage/dist
+          mkdir -p /tmp/voicelab-release-stage/src/server
+          mkdir -p /tmp/voicelab-release-stage/src/types
+          mkdir -p /tmp/voicelab-release-stage/src/data
+
+          # Copy compiled Vite frontend bundle (dist/) and remove source maps & private chat attachments
+          cp -R dist/. /tmp/voicelab-release-stage/dist/
+          rm -rf /tmp/voicelab-release-stage/dist/assets/aistudio
+          find /tmp/voicelab-release-stage/dist -type f -name "*.map" -delete
+
+          # Copy production full-stack Express runtime & deployment descriptors
+          cp server.ts package.json tsconfig.json .npmrc .env.example Dockerfile render.yaml README.md /tmp/voicelab-release-stage/
+          if [ -f package-lock.json ]; then
+            cp package-lock.json /tmp/voicelab-release-stage/
+          fi
+          cp -R src/server/. /tmp/voicelab-release-stage/src/server/
+          cp -R src/types/. /tmp/voicelab-release-stage/src/types/
+          cp -R src/data/. /tmp/voicelab-release-stage/src/data/
+
+          # Package into VoiceLab-AI-v3.3.0-Web-App.zip
+          python3 - <<'EOF'
+          import os, zipfile
+
+          stage_dir = "/tmp/voicelab-release-stage"
+          workspace_dir = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+          zip_path = os.path.join(workspace_dir, "VoiceLab-AI-v3.3.0-Web-App.zip")
+          forbidden_ext = (".map", ".pem", ".key", ".wav", ".mp3", ".flac", ".ogg", ".m4a")
+          forbidden_dirs = {".git", "node_modules", "voicelab_ai_storage", "aistudio"}
+
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk(stage_dir):
+                  dirs[:] = sorted([d for d in dirs if d not in forbidden_dirs])
+                  for file in sorted(files):
+                      if file.startswith(".env") and file != ".env.example":
+                          continue
+                      if file.endswith(forbidden_ext):
+                          continue
+                      full_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(full_path, stage_dir)
+                      zf.write(full_path, rel_path)
+          EOF
+
+          test -f "$WORKSPACE_DIR/VoiceLab-AI-v3.3.0-Web-App.zip"
+          ls -lh "$WORKSPACE_DIR/VoiceLab-AI-v3.3.0-Web-App.zip"
+
+      - name: Verify VoiceLab-AI-v3.3.0-Web-App.zip integrity, contents & security exclusions
+        run: |
+          python3 - <<'EOF'
+          import os, re, shutil, zipfile
+
+          workspace_dir = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+          zip_path = os.path.join(workspace_dir, "VoiceLab-AI-v3.3.0-Web-App.zip")
+          forbidden_ext = (".map", ".pem", ".key", ".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              bad_file = zf.testzip()
+              if bad_file is not None:
+                  raise SystemExit(f"ERROR: Corrupt file in ZIP archive: {bad_file}")
+              names = zf.namelist()
+              print(f"Verified ZIP archive ({len(names)} production files):")
+              for n in names:
+                  info = zf.getinfo(n)
+                  print(f"  - {n} ({info.file_size} B)")
+
+              required_exact = {"dist/index.html", "server.ts", "package.json", ".env.example", ".npmrc"}
+              missing = required_exact - set(names)
+              if missing:
+                  raise SystemExit(f"ERROR: Missing required production files in ZIP: {missing}")
+              if not any(n.startswith("dist/assets/") and n.endswith(".js") for n in names):
+                  raise SystemExit("ERROR: Missing compiled JS bundle in dist/assets/!")
+              if not any(n.startswith("dist/assets/") and n.endswith(".css") for n in names):
+                  raise SystemExit("ERROR: Missing compiled CSS bundle in dist/assets/!")
+
+              for n in names:
+                  base = os.path.basename(n)
+                  if (base.startswith(".env") and base != ".env.example") or "node_modules/" in n or "aistudio/" in n or n.endswith(forbidden_ext):
+                      raise SystemExit(f"ERROR: Forbidden file included in ZIP: {n}")
+
+          extract_dir = "/tmp/voicelab-extract-verify"
+          if os.path.exists(extract_dir):
+              shutil.rmtree(extract_dir)
+          os.makedirs(extract_dir, exist_ok=True)
+
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              zf.extractall(extract_dir)
+
+          assert os.path.isfile(os.path.join(extract_dir, "dist", "index.html"))
+          assert os.path.isfile(os.path.join(extract_dir, "server.ts"))
+
+          secret_pattern = re.compile(r"AIzaSy[0-9A-Za-z_-]{33}")
+          for root, _, files in os.walk(extract_dir):
+              for file in files:
+                  fpath = os.path.join(root, file)
+                  with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                      content = f.read()
+                      if secret_pattern.search(content):
+                          raise SystemExit(f"ERROR: Hardcoded API key found in extracted file {fpath}!")
+
+          shutil.rmtree(extract_dir, ignore_errors=True)
+          shutil.rmtree("/tmp/voicelab-release-stage", ignore_errors=True)
+          print("ZIP integrity, contents, security scan, and clean extraction verified successfully.")
+          EOF
+
+      - name: Upload VoiceLab AI Web App ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceLab-AI-Web-App
+          path: VoiceLab-AI-v3.3.0-Web-App.zip
+          retention-days: 30
+          if-no-files-found: error
+

@@ -27,6 +27,15 @@ import {
 } from '../types/voicelab';
 import { SRT_SUPPORTED_LANGUAGES } from '../data/researchAndConfigs';
 import { fetchApiJson } from '../utils/apiClient';
+import {
+  completeOperation,
+  connectBackendOperationStream,
+  failOperation,
+  recordOperationRetry,
+  startOperation,
+  updateOperationStage,
+  updateUploadBytes
+} from '../utils/activityManager';
 
 interface SrtGeneratorWorkspaceProps {
   onActivityComplete?: (info: {
@@ -156,6 +165,28 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
     setIsTranscribing(false);
     setIsUploading(true);
 
+    const op = startOperation({
+      feature: 'audio-upload',
+      title: `Upload & Validate ${file.name}`,
+      stages: [
+        'Uploading audio file bytes',
+        'Verifying audio container signature & running FFprobe/FFmpeg DSP'
+      ],
+      initialProgressPct: 0,
+      progressSource: 'upload-bytes',
+      canCancel: true,
+      cancelPreviousSameFeature: true
+    });
+    const stopStream = connectBackendOperationStream(op.operationId);
+
+    op.signal.addEventListener(
+      'abort',
+      () => {
+        controller.abort();
+      },
+      { once: true }
+    );
+
     try {
       const formData = new FormData();
       formData.append('audio', file);
@@ -166,27 +197,37 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
         {
           method: 'POST',
           body: formData,
-          signal: controller.signal
+          operationId: op.operationId,
+          signal: controller.signal,
+          onUploadProgress: (loaded, total) => updateUploadBytes(op.operationId, loaded, total),
+          onRetry: (_, reason) => recordOperationRetry(op.operationId, reason)
         }
       );
 
-      if (currentOpSeq !== operationSeqRef.current) {
+      if (currentOpSeq !== operationSeqRef.current || op.isStale()) {
         return;
       }
 
       setAudioAnalysis(data.analysis);
       setSrtResult(null);
       setSegments([]);
+      completeOperation(
+        op.operationId,
+        `Validated ${data.analysis.fileName} (${data.analysis.durationSeconds}s · ${data.analysis.sampleRateHz} Hz)`
+      );
     } catch (err: any) {
-      if (err?.name === 'AbortError' || currentOpSeq !== operationSeqRef.current) {
+      if (err?.name === 'AbortError' || currentOpSeq !== operationSeqRef.current || op.isStale()) {
         return;
       }
+      const msg = err?.message || 'Failed to upload and validate audio file.';
       setSelectedAudioFile(null);
       setAudioAnalysis(null);
       setSrtResult(null);
       setSegments([]);
-      setUploadError(err?.message || 'Failed to upload and validate audio file.');
+      setUploadError(msg);
+      failOperation(op.operationId, msg);
     } finally {
+      stopStream();
       if (currentOpSeq === operationSeqRef.current) {
         setIsUploading(false);
       }
@@ -264,6 +305,31 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
     setSrtResult(null);
     setSegments([]);
 
+    const targetName =
+      audioAnalysis?.fileName || selectedAudioFile?.name || 'Uploaded Audio';
+    const op = startOperation({
+      feature: 'srt-transcription',
+      title: `Transcribe ${targetName}`,
+      stages: [
+        'Detecting speech intervals & splitting silence-aligned chunks (FFmpeg)',
+        'Transcribing speech audio with Gemini Multilingual ASR',
+        'Verifying exact token sequence & chronological timeline integrity'
+      ],
+      initialProgressPct: null,
+      progressSource: 'indeterminate-inference',
+      canCancel: true,
+      cancelPreviousSameFeature: true
+    });
+    const stopStream = connectBackendOperationStream(op.operationId);
+
+    op.signal.addEventListener(
+      'abort',
+      () => {
+        controller.abort();
+      },
+      { once: true }
+    );
+
     try {
       const formData = new FormData();
       if (selectedAudioFile) {
@@ -281,10 +347,12 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       }>('/api/srt/transcribe', {
         method: 'POST',
         body: formData,
-        signal: controller.signal
+        operationId: op.operationId,
+        signal: controller.signal,
+        onRetry: (_, reason) => recordOperationRetry(op.operationId, reason)
       });
 
-      if (currentOpSeq !== operationSeqRef.current) {
+      if (currentOpSeq !== operationSeqRef.current || op.isStale()) {
         return;
       }
 
@@ -301,6 +369,11 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       setSrtResult(result);
       setSegments(result.segments);
 
+      completeOperation(
+        op.operationId,
+        `Generated ${result.segments.length} ${result.detectedLanguageName} SRT subtitle blocks (${result.validationReport?.exactSequenceMatch ? '100% token match' : 'validated'})`
+      );
+
       if (onActivityComplete) {
         const activeFileName =
           data.analysis?.fileName || audioAnalysis?.fileName || selectedAudioFile?.name;
@@ -314,13 +387,16 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
         });
       }
     } catch (err: any) {
-      if (err?.name === 'AbortError' || currentOpSeq !== operationSeqRef.current) {
+      if (err?.name === 'AbortError' || currentOpSeq !== operationSeqRef.current || op.isStale()) {
         return;
       }
+      const msg = err?.message || 'Transcription pipeline failed.';
       setSrtResult(null);
       setSegments([]);
-      setTranscriptionError(err?.message || 'Transcription pipeline failed.');
+      setTranscriptionError(msg);
+      failOperation(op.operationId, msg);
     } finally {
+      stopStream();
       if (currentOpSeq === operationSeqRef.current) {
         setIsTranscribing(false);
       }
@@ -374,6 +450,17 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
   };
 
   const handleSplitSegment = (index: number) => {
+    const op = startOperation({
+      feature: 'subtitle-processing',
+      title: `Split Subtitle #${index + 1}`,
+      stages: [
+        `Calculating midpoint timestamp & splitting words for #${index + 1}`,
+        'Re-indexing chronological SRT timeline'
+      ],
+      initialProgressPct: 50,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
     setSegments((prev) => {
       const target = prev[index];
       const durationMs = target.endTimeMs - target.startTimeMs;
@@ -411,9 +498,21 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       const updated = [...prev.slice(0, index), segA, segB, ...prev.slice(index + 1)];
       return reindexSegments(updated);
     });
+    completeOperation(op.operationId, `Split subtitle segment #${index + 1} into two blocks`);
   };
 
   const handleMergeWithNext = (index: number) => {
+    const op = startOperation({
+      feature: 'subtitle-processing',
+      title: `Merge Subtitles #${index + 1} & #${index + 2}`,
+      stages: [
+        `Joining text and spanning timestamps for #${index + 1}–#${index + 2}`,
+        'Re-indexing chronological SRT timeline'
+      ],
+      initialProgressPct: 50,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
     setSegments((prev) => {
       if (index >= prev.length - 1) return prev;
       const current = prev[index];
@@ -431,16 +530,34 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       const updated = [...prev.slice(0, index), merged, ...prev.slice(index + 2)];
       return reindexSegments(updated);
     });
+    completeOperation(op.operationId, `Merged subtitle segments #${index + 1} & #${index + 2}`);
   };
 
   const handleDeleteSegment = (index: number) => {
+    const op = startOperation({
+      feature: 'subtitle-processing',
+      title: `Delete Subtitle #${index + 1}`,
+      stages: [`Removing segment #${index + 1}`, 'Re-indexing chronological SRT timeline'],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
     setSegments((prev) => {
       const updated = prev.filter((_, idx) => idx !== index);
       return reindexSegments(updated);
     });
+    completeOperation(op.operationId, `Deleted subtitle segment #${index + 1}`);
   };
 
   const handleInsertSegmentAfter = (index: number) => {
+    const op = startOperation({
+      feature: 'subtitle-processing',
+      title: `Insert Subtitle After #${index + 1}`,
+      stages: ['Allocating non-overlapping 2.0s cue window', 'Re-indexing chronological SRT timeline'],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
     setSegments((prev) => {
       const refSeg = prev[index];
       const startMs = refSeg ? refSeg.endTimeMs + 50 : 0;
@@ -456,6 +573,7 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       const updated = [...prev.slice(0, index + 1), newSeg, ...prev.slice(index + 1)];
       return reindexSegments(updated);
     });
+    completeOperation(op.operationId, `Inserted new subtitle segment #${index + 2}`);
   };
 
   const handleSeekAudioToMs = (ms: number) => {
@@ -466,26 +584,66 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
   };
 
   const handleDownloadSrtFile = () => {
-    const content = includeUtf8Bom ? `\uFEFF${liveSrtText}` : liveSrtText;
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
     const baseName = audioAnalysis?.fileName
       ? audioAnalysis.fileName.replace(/\.[^/.]+$/, '')
       : 'voicelab_subtitles';
     const langSuffix = srtResult?.detectedLanguageCode || requestedLanguage || 'multilingual';
+    const filename = `${baseName}_${langSuffix}.srt`;
+
+    const op = startOperation({
+      feature: 'export-download',
+      title: `Export ${filename}`,
+      stages: [
+        `Formatting ${segments.length} subtitle blocks (${includeUtf8Bom ? 'UTF-8 BOM' : 'UTF-8'})`,
+        'Triggering browser file download'
+      ],
+      initialProgressPct: 50,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
+
+    const content = includeUtf8Bom ? `\uFEFF${liveSrtText}` : liveSrtText;
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    updateOperationStage(op.operationId, {
+      stageIndex: 1,
+      stageLabel: `Downloading ${filename}...`,
+      progressPct: 100,
+      progressSource: 'task-steps'
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
     link.href = url;
-    link.download = `${baseName}_${langSuffix}.srt`;
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    completeOperation(
+      op.operationId,
+      `Exported ${filename} (${segments.length} subtitle blocks)`
+    );
   };
 
   const handleCopySrt = async () => {
-    await navigator.clipboard.writeText(liveSrtText);
-    setCopiedSrt(true);
-    setTimeout(() => setCopiedSrt(false), 2000);
+    const op = startOperation({
+      feature: 'export-download',
+      title: 'Copy SubRip (.SRT) to Clipboard',
+      stages: [`Copying ${segments.length} formatted SRT blocks to clipboard`],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
+    try {
+      await navigator.clipboard.writeText(liveSrtText);
+      setCopiedSrt(true);
+      completeOperation(
+        op.operationId,
+        `Copied ${segments.length} SRT blocks to clipboard`
+      );
+      setTimeout(() => setCopiedSrt(false), 2000);
+    } catch (err: any) {
+      failOperation(op.operationId, err?.message || 'Clipboard copy failed.');
+    }
   };
 
   const filteredSegments = useMemo(() => {

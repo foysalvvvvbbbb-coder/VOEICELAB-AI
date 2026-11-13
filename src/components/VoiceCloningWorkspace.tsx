@@ -26,6 +26,15 @@ import {
   validateSameLanguageText
 } from '../data/researchAndConfigs';
 import { fetchApiJson } from '../utils/apiClient';
+import {
+  completeOperation,
+  connectBackendOperationStream,
+  failOperation,
+  recordOperationRetry,
+  startOperation,
+  updateOperationStage,
+  updateUploadBytes
+} from '../utils/activityManager';
 
 interface VoiceCloningWorkspaceProps {
   onNavigateBackToDashboard?: () => void;
@@ -97,24 +106,77 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     if (!checkExisting.isValid) {
       setInputText(CLONING_LANGUAGES[lang].sampleTexts[0].text);
     }
+    const op = startOperation({
+      feature: 'voice-loading',
+      title: `Switch to ${CLONING_LANGUAGES[lang].englishName} (${CLONING_LANGUAGES[lang].nativeName})`,
+      stages: [
+        `Locking same-language script guard to ${CLONING_LANGUAGES[lang].scriptName}`,
+        `Loading ${CLONING_LANGUAGES[lang].nativeName} synthesis presets`
+      ],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
+    completeOperation(
+      op.operationId,
+      `Switched to ${CLONING_LANGUAGES[lang].englishName} (${CLONING_LANGUAGES[lang].nativeName})`
+    );
   };
 
   const handleLoadAuthorizedSample = async (lang: CloningLanguageCode) => {
     setIsUploading(true);
     setUploadError(null);
     setGenerationError(null);
+    const langCfg = CLONING_LANGUAGES[lang];
+    const op = startOperation({
+      feature: 'voice-loading',
+      title: `Load ${langCfg.englishName} Sample Voice`,
+      stages: [
+        `Requesting authorized ${langCfg.nativeName} studio sample`,
+        'Preparing WAV audio & running FFprobe/FFmpeg signal check',
+        'Applying reference vocal profile & alignment transcript'
+      ],
+      initialProgressPct: null,
+      progressSource: 'indeterminate-inference',
+      canCancel: true
+    });
+    const stopStream = connectBackendOperationStream(op.operationId);
+
     try {
       const data = await fetchApiJson<{ status: string; analysis: AudioSignalAnalysis }>(
-        `/api/sample-reference/${lang}`
+        `/api/sample-reference/${lang}`,
+        {
+          operationId: op.operationId,
+          signal: op.signal,
+          onRetry: (_, reason) => recordOperationRetry(op.operationId, reason)
+        }
       );
+      if (op.isStale()) return;
+
+      updateOperationStage(op.operationId, {
+        stageIndex: 2,
+        stageLabel: 'Applying reference vocal profile & alignment transcript...'
+      });
       setReferenceAnalysis(data.analysis);
       setReferenceTranscript(CLONING_LANGUAGES[lang].sampleTexts[0].text);
       if (selectedLang !== lang) {
-        handleSelectLanguage(lang);
+        setSelectedLang(lang);
+        const checkExisting = validateSameLanguageText(inputText, lang);
+        if (!checkExisting.isValid) {
+          setInputText(CLONING_LANGUAGES[lang].sampleTexts[0].text);
+        }
       }
+      completeOperation(
+        op.operationId,
+        `Loaded ${langCfg.englishName} sample (${data.analysis.durationSeconds}s · ${data.analysis.fundamentalFreqHz} Hz)`
+      );
     } catch (err: any) {
-      setUploadError(err?.message || 'Could not load studio sample reference.');
+      if (err?.name === 'AbortError' || op.isStale()) return;
+      const msg = err?.message || 'Could not load studio sample reference.';
+      setUploadError(msg);
+      failOperation(op.operationId, msg);
     } finally {
+      stopStream();
       setIsUploading(false);
     }
   };
@@ -123,6 +185,22 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     setIsUploading(true);
     setUploadError(null);
     setGenerationError(null);
+
+    const op = startOperation({
+      feature: 'audio-upload',
+      title: `Upload & Analyze ${file.name}`,
+      stages: [
+        'Uploading reference audio bytes',
+        'Verifying audio container signature & running FFprobe/FFmpeg DSP',
+        'Analyzing spoken language & reference vocal identity'
+      ],
+      initialProgressPct: 0,
+      progressSource: 'upload-bytes',
+      canCancel: true,
+      cancelPreviousSameFeature: true
+    });
+    const stopStream = connectBackendOperationStream(op.operationId);
+
     try {
       const formData = new FormData();
       formData.append('audio', file);
@@ -132,13 +210,26 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         '/api/audio/upload',
         {
           method: 'POST',
-          body: formData
+          body: formData,
+          operationId: op.operationId,
+          signal: op.signal,
+          onUploadProgress: (loaded, total) => updateUploadBytes(op.operationId, loaded, total),
+          onRetry: (_, reason) => recordOperationRetry(op.operationId, reason)
         }
       );
+      if (op.isStale()) return;
       setReferenceAnalysis(data.analysis);
+      completeOperation(
+        op.operationId,
+        `Validated ${data.analysis.fileName} (${data.analysis.durationSeconds}s · ${data.analysis.fundamentalFreqHz} Hz)`
+      );
     } catch (err: any) {
-      setUploadError(err?.message || 'Failed to upload and validate reference audio.');
+      if (err?.name === 'AbortError' || op.isStale()) return;
+      const msg = err?.message || 'Failed to upload and validate reference audio.';
+      setUploadError(msg);
+      failOperation(op.operationId, msg);
     } finally {
+      stopStream();
       setIsUploading(false);
     }
   };
@@ -232,6 +323,22 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     setGenerationError(null);
     setActivePipelineStep(0);
 
+    const op = startOperation({
+      feature: 'voice-cloning',
+      title: `${currentLangConfig.englishName} (${currentLangConfig.nativeName}) Synthesis`,
+      stages: [
+        'Validating same-language script & reference vocal profile',
+        'Synthesizing speech audio (Gemini TTS / Local Neural Node)',
+        'Applying FFmpeg DSP acoustic finishing & WAV/MP3 export',
+        'Extracting 3072-D & 16-D audio embeddings',
+        'Running ASR back-transcription quality verification'
+      ],
+      initialProgressPct: null,
+      progressSource: 'indeterminate-inference',
+      canCancel: true
+    });
+    const stopStream = connectBackendOperationStream(op.operationId);
+
     const stepInterval = window.setInterval(() => {
       setActivePipelineStep((prev) => (prev < PIPELINE_A_STEPS.length - 1 ? prev + 1 : prev));
     }, 1200);
@@ -242,6 +349,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          operationId: op.operationId,
+          signal: op.signal,
+          onRetry: (_, reason) => recordOperationRetry(op.operationId, reason),
           body: JSON.stringify({
             referenceFileId: referenceAnalysis.fileId,
             language: selectedLang,
@@ -255,9 +365,15 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         }
       );
 
+      if (op.isStale()) return;
+
       const resObj: VoiceCloneResult = data.result;
       setCloneResult(resObj);
       setActivePipelineStep(PIPELINE_A_STEPS.length - 1);
+      completeOperation(
+        op.operationId,
+        `${currentLangConfig.englishName} speech ready (${resObj.outputDurationSec}s · ${resObj.qualityControlReport.separatedMetrics.asrTranscriptAccuracy.characterMatchRatePct}% ASR match)`
+      );
 
       if (onActivityComplete) {
         onActivityComplete({
@@ -267,11 +383,30 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         });
       }
     } catch (err: any) {
-      setGenerationError(err?.message || 'Voice cloning pipeline encountered an error.');
+      if (err?.name === 'AbortError' || op.isStale()) return;
+      const msg = err?.message || 'Voice cloning pipeline encountered an error.';
+      setGenerationError(msg);
+      failOperation(op.operationId, msg);
     } finally {
+      stopStream();
       clearInterval(stepInterval);
       setIsGenerating(false);
     }
+  };
+
+  const handleTrackAudioDownload = (format: 'WAV' | 'MP3', filename: string) => {
+    const op = startOperation({
+      feature: 'export-download',
+      title: `Export ${format} Audio`,
+      stages: [
+        `Preparing ${format} audio stream (${filename})`,
+        'Starting browser file download'
+      ],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
+    completeOperation(op.operationId, `Downloading ${filename}`);
   };
 
   const formatBytes = (bytes: number) => {
@@ -770,6 +905,12 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <a
                     href={`${cloneResult.wavUrl}?download=1`}
                     download={`voicelab_${cloneResult.language}_${cloneResult.jobId}.wav`}
+                    onClick={() =>
+                      handleTrackAudioDownload(
+                        'WAV',
+                        `voicelab_${cloneResult.language}_${cloneResult.jobId}.wav`
+                      )
+                    }
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#16A36A] hover:bg-[#16A36A]/90 text-xs font-semibold text-[#F4F8F5] transition-colors whitespace-nowrap"
                   >
                     <Download className="w-3.5 h-3.5" />
@@ -778,6 +919,12 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <a
                     href={`${cloneResult.mp3Url}?download=1`}
                     download={`voicelab_${cloneResult.language}_${cloneResult.jobId}.mp3`}
+                    onClick={() =>
+                      handleTrackAudioDownload(
+                        'MP3',
+                        `voicelab_${cloneResult.language}_${cloneResult.jobId}.mp3`
+                      )
+                    }
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-xs font-semibold text-[#42D9A0] transition-colors whitespace-nowrap"
                   >
                     <Download className="w-3.5 h-3.5" />

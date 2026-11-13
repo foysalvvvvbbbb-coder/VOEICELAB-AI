@@ -5,6 +5,7 @@
  * 3. Pre-mutation GET /api/auth/session warmup (prevents Nginx Lua Auth Bridge cache-miss on POST multipart uploads)
  * 4. Hidden iframe Auth Bridge auto-recovery if __SECURE-aistudio_auth_token expired
  * 5. Dual-transport HMAC-signed session token (HttpOnly Cookie + X-VoiceLab-Session header)
+ * 6. Real byte-level upload progress via XMLHttpRequest.upload.onprogress + X-VoiceLab-Operation-Id correlation
  */
 function normalizeApiBaseUrl(): string {
   const raw =
@@ -52,6 +53,10 @@ export function resolveApiUrl(url: string): string {
     return url;
   }
   return url.startsWith('/') ? `${RAW_API_BASE}${url}` : `${RAW_API_BASE}/${url}`;
+}
+
+export function getCachedSessionTokenHeader(): string | null {
+  return cachedSessionToken;
 }
 
 /**
@@ -183,14 +188,168 @@ export async function ensureSessionInitialized(force = false): Promise<boolean> 
   return inflightSessionHandshake;
 }
 
+export interface ApiRequestOptions extends RequestInit {
+  operationId?: string;
+  onUploadProgress?: (loadedBytes: number, totalBytes: number) => void;
+  onRetry?: (attempt: number, reason: string) => void;
+}
+
+interface RawTransportResponse {
+  status: number;
+  ok: boolean;
+  redirected: boolean;
+  responseUrl: string;
+  contentType: string;
+  refreshedSessionToken: string | null;
+  rawText: string;
+}
+
+/**
+ * Executes an HTTP request using XMLHttpRequest when FormData upload byte progress is needed,
+ * or standard fetch() otherwise. Preserves credentials: 'include' and AbortSignal cancellation.
+ */
+function executeTransportRequest(
+  targetUrl: string,
+  method: string,
+  headers: Headers,
+  options: ApiRequestOptions
+): Promise<RawTransportResponse> {
+  const isMultipartUploadWithProgress =
+    typeof XMLHttpRequest !== 'undefined' &&
+    typeof FormData !== 'undefined' &&
+    options.body instanceof FormData &&
+    typeof options.onUploadProgress === 'function';
+
+  if (isMultipartUploadWithProgress) {
+    return new Promise<RawTransportResponse>((resolve, reject) => {
+      if (options.signal?.aborted) {
+        const abortErr = new Error('The operation was aborted.');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+        return;
+      }
+
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, targetUrl, true);
+      xhr.withCredentials = true;
+
+      headers.forEach((value, key) => {
+        if (key.toLowerCase() !== 'content-type') {
+          xhr.setRequestHeader(key, value);
+        }
+      });
+
+      const onAbortSignal = () => {
+        try {
+          xhr.abort();
+        } catch {
+          // Ignore
+        }
+      };
+
+      if (options.signal) {
+        options.signal.addEventListener('abort', onAbortSignal, { once: true });
+      }
+
+      if (xhr.upload && options.onUploadProgress) {
+        xhr.upload.onprogress = (ev: ProgressEvent) => {
+          if (ev.lengthComputable && ev.total > 0) {
+            options.onUploadProgress?.(ev.loaded, ev.total);
+          }
+        };
+      }
+
+      xhr.onload = () => {
+        if (options.signal) {
+          options.signal.removeEventListener('abort', onAbortSignal);
+        }
+        const status = xhr.status;
+        const ok = status >= 200 && status < 300;
+        const responseUrl = xhr.responseURL || targetUrl;
+        const redirected = Boolean(
+          xhr.responseURL &&
+            !xhr.responseURL.endsWith(targetUrl) &&
+            xhr.responseURL.includes('__cookie_check')
+        );
+        const contentType = (xhr.getResponseHeader('content-type') || '').toLowerCase();
+        const refreshedSessionToken = xhr.getResponseHeader('x-voicelab-session-token');
+        resolve({
+          status,
+          ok,
+          redirected,
+          responseUrl,
+          contentType,
+          refreshedSessionToken,
+          rawText: xhr.responseText || ''
+        });
+      };
+
+      xhr.onerror = () => {
+        if (options.signal) {
+          options.signal.removeEventListener('abort', onAbortSignal);
+        }
+        const offlineHint =
+          typeof navigator !== 'undefined' && !navigator.onLine
+            ? 'Your device is offline.'
+            : 'The network connection was interrupted.';
+        reject(new Error(`Network error while uploading to ${targetUrl}: ${offlineHint}`));
+      };
+
+      xhr.onabort = () => {
+        if (options.signal) {
+          options.signal.removeEventListener('abort', onAbortSignal);
+        }
+        const abortErr = new Error('The operation was aborted.');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+      };
+
+      xhr.send(options.body as FormData);
+    });
+  }
+
+  return (async () => {
+    try {
+      const response = await fetch(targetUrl, {
+        ...options,
+        headers,
+        credentials: 'include'
+      });
+      const rawText = await response.text();
+      return {
+        status: response.status,
+        ok: response.ok,
+        redirected: response.redirected,
+        responseUrl: response.url || targetUrl,
+        contentType: (response.headers.get('content-type') || '').toLowerCase(),
+        refreshedSessionToken: response.headers.get('x-voicelab-session-token'),
+        rawText
+      };
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        throw err;
+      }
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        throw new Error(
+          `Network connection interrupted while requesting ${targetUrl} (device offline).`
+        );
+      }
+      throw new Error(
+        err?.message || `Network connection error while communicating with ${targetUrl}.`
+      );
+    }
+  })();
+}
+
 export async function fetchApiJson<T = any>(
   url: string,
-  options: RequestInit = {},
+  options: ApiRequestOptions = {},
   maxWarmupRetries = 3
 ): Promise<T> {
   const targetUrl = resolveApiUrl(url);
   const method = String(options.method || 'GET').toUpperCase();
-  const isMutation = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+  const isMutation =
+    method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 
   // Always warm the GET session & Nginx auth_token_cache before any POST/DELETE request
   if (isMutation && !targetUrl.endsWith('/api/auth/session')) {
@@ -203,6 +362,9 @@ export async function fetchApiJson<T = any>(
   }
   if (!headers.has('X-Requested-With')) {
     headers.set('X-Requested-With', 'VoiceLab-Web-Client');
+  }
+  if (options.operationId) {
+    headers.set('X-VoiceLab-Operation-Id', options.operationId);
   }
 
   // Never manually set Content-Type on FormData; browser must generate the multipart boundary
@@ -218,20 +380,15 @@ export async function fetchApiJson<T = any>(
       headers.set('X-VoiceLab-Session', cachedSessionToken);
     }
 
-    const response = await fetch(targetUrl, {
-      ...options,
-      headers,
-      credentials: 'include'
-    });
+    const response = await executeTransportRequest(targetUrl, method, headers, options);
 
-    const refreshedTok = response.headers.get('x-voicelab-session-token');
-    if (refreshedTok) {
-      cachedSessionToken = refreshedTok;
+    if (response.refreshedSessionToken) {
+      cachedSessionToken = response.refreshedSessionToken;
       lastSessionVerifiedAtMs = Date.now();
     }
 
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    const rawText = await response.text();
+    const contentType = response.contentType;
+    const rawText = response.rawText;
     const trimmed = rawText.trimStart();
 
     const isHtmlPayload =
@@ -249,19 +406,21 @@ export async function fetchApiJson<T = any>(
 
       if (isWarmupPage && attempt < maxWarmupRetries) {
         attempt++;
+        options.onRetry?.(attempt, 'Server warming up — retrying request');
         await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
         continue;
       }
 
       const isCookieCheckOrAuth =
         response.redirected ||
-        response.url.includes('__cookie_check') ||
-        response.url.includes('applet-auth-bridge') ||
+        response.responseUrl.includes('__cookie_check') ||
+        response.responseUrl.includes('applet-auth-bridge') ||
         trimmed.includes('cookie_check');
 
       if (isCookieCheckOrAuth) {
         if (!authRecoveryAttempted) {
           authRecoveryAttempted = true;
+          options.onRetry?.(1, 'Refreshing session credentials');
           const recovered = await recoverAuthBridgeSessionViaHiddenIframe();
           if (recovered) {
             await ensureSessionInitialized(true);
@@ -282,6 +441,7 @@ export async function fetchApiJson<T = any>(
 
     if (response.status === 401 && !authRecoveryAttempted) {
       authRecoveryAttempted = true;
+      options.onRetry?.(1, 'Re-initializing session');
       const reinitialized = await ensureSessionInitialized(true);
       if (reinitialized) {
         continue;
