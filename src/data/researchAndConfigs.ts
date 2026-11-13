@@ -1,4 +1,4 @@
-import { CloningLanguageCode, CloningLanguageConfig, ModelResearchEntry } from '../types/voicelab';
+import type { CloningLanguageCode, CloningLanguageConfig, ModelResearchEntry } from '../types/voicelab.ts';
 
 export const CLONING_LANGUAGES: Record<CloningLanguageCode, CloningLanguageConfig> = {
   bn: {

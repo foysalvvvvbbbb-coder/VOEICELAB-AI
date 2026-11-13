@@ -2,7 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
-import {
+import type {
   AudioSignalAnalysis,
   SrtSegment,
   SrtValidationReport,

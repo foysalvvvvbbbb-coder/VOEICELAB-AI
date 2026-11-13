@@ -1,0 +1,70 @@
+name: VoiceLab AI — CI Verification & Production Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    name: Security Scan, TypeScript Check & Production Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan tracked files for accidental secrets or private audio
+        run: |
+          echo "Scanning tracked files for forbidden secrets or media files..."
+          if git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$'; then
+            echo "ERROR: A .env file is tracked in Git!"
+            exit 1
+          fi
+          if git ls-files | grep -E '\.(pem|key|wav|mp3|flac|ogg|m4a)$'; then
+            echo "ERROR: Private key or audio file is tracked in Git!"
+            exit 1
+          fi
+          if grep -rnE 'AIzaSy[0-9A-Za-z_-]{33}' src/ server.ts package.json 2>/dev/null; then
+            echo "ERROR: Hardcoded Google API key detected in source!"
+            exit 1
+          fi
+          echo "Secret and private-file scan passed (0 issues)."
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install FFmpeg & FFprobe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 2
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run TypeScript type check
+        run: npm run lint
+
+      - name: Build production frontend bundle
+        run: |
+          npm run build
+          test -f dist/index.html
+
+      - name: Smoke-test production Express server & /api/health
+        run: |
+          NODE_ENV=production PORT=3099 node server.ts &
+          SERVER_PID=$!
+          sleep 2
+          curl -fsS http://127.0.0.1:3099/api/health | grep '"status":"operational"'
+          curl -fsS http://127.0.0.1:3099/ | grep 'id="root"'
+          kill -TERM $SERVER_PID || true

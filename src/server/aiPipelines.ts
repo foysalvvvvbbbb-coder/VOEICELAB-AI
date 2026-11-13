@@ -1,7 +1,7 @@
 import { GoogleGenAI, Type } from '@google/genai';
 import fs from 'fs';
 import path from 'path';
-import {
+import type {
   AudioSignalAnalysis,
   CloningLanguageCode,
   SrtSegment,
@@ -17,7 +17,7 @@ import {
   applyReferenceAcousticIdentityAndExport,
   computeVectorCosineSimilarity,
   concatenateWavChunksWithCrossfade,
-  DetectedAcousticPause,
+  type DetectedAcousticPause,
   detectSpeechIntervalsAndChunks,
   enforceAndValidateSrtTimelineIntegrity,
   extractChunkAcousticTimingProfile,
@@ -25,13 +25,13 @@ import {
   inspectAndValidateAudioFile,
   msToSrtTimestamp,
   parseFlexibleTimestampToMs,
-  RawAsrSegmentInput,
+  type RawAsrSegmentInput,
   sanitizeRawAsrSegmentsOverlap,
   segmentChunkAsrIntoReadableSrtBlocks,
   splitTextIntoLinguisticSentences
 } from './audioDsp.ts';
 
-function resolveRuntimeGeminiApiKey(): string | undefined {
+export function resolveRuntimeGeminiApiKey(): string | undefined {
   if (
     process.env.GEMINI_API_KEY &&
     process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' &&

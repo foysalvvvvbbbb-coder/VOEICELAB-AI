@@ -1,0 +1,19 @@
+# ============================================================================
+# VoiceLab AI — Render Free-Tier Blueprint (Strictly ৳0 / $0 Free Plan)
+# ============================================================================
+services:
+  - type: web
+    name: voicelab-ai
+    runtime: docker
+    plan: free
+    autoDeploy: false
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true

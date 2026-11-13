@@ -1,8 +1,60 @@
+# ============================================================================
+# VoiceLab AI — Comprehensive .gitignore
+# Strictly excludes secrets, credentials, uploaded/generated audio, and builds
+# ============================================================================
+
+# Dependencies
 node_modules/
-build/
+.pnp
+.pnp.js
+
+# Production build outputs
 dist/
-coverage/
-.DS_Store
-*.log
-.env*
+build/
+server.js
+
+# Environment & Secrets (NEVER commit real secrets)
+.env
+.env.*
 !.env.example
+.voicelab_session_secret
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+firebase-applet-config.json
+service-account*.json
+
+# Ephemeral Audio Uploads, Samples & Generated Media
+voicelab_ai_storage/
+uploads/
+generated/
+samples/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.webm
+*.meta.json
+
+# Python Local Neural Node virtual environments & model weights
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+checkpoints/
+pretrained_models/
+*.pth
+*.safetensors
+*.onnx
+
+# Logs, caches & OS artifacts
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+coverage/
+.vite/

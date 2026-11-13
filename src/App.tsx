@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Mic2,
   Captions,
@@ -16,7 +16,7 @@ import {
 import { VoiceCloningWorkspace } from './components/VoiceCloningWorkspace';
 import { SrtGeneratorWorkspace } from './components/SrtGeneratorWorkspace';
 import { ArchitectureAndQaView } from './components/ArchitectureAndQaView';
-import { fetchApiJson } from './utils/apiClient';
+import { ensureSessionInitialized, fetchApiJson } from './utils/apiClient';
 
 export type ActiveScreen = 'dashboard' | 'voice-cloning' | 'srt-generator' | 'architecture-qa';
 
@@ -37,6 +37,24 @@ export default function App() {
   const [activeScreen, setActiveScreen] = useState<ActiveScreen>('dashboard');
   const [purgeStatus, setPurgeStatus] = useState<string | null>(null);
   const [recentActivities, setRecentActivities] = useState<ActivityRecord[]>([]);
+
+  // Initialize authenticated session on mount & keep Nginx Lua auth_token_cache (300s TTL) warm
+  useEffect(() => {
+    ensureSessionInitialized(true).catch(() => {});
+    const keepAliveTimer = window.setInterval(() => {
+      ensureSessionInitialized(true).catch(() => {});
+    }, 210_000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        ensureSessionInitialized(false).catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.clearInterval(keepAliveTimer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
 
   const handleRecordActivity = (item: Omit<ActivityRecord, 'id' | 'timestampLabel' | 'status'>) => {
     const newEntry: ActivityRecord = {

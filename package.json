@@ -1,15 +1,17 @@
 {
-  "name": "react-example",
+  "name": "voicelab-ai",
   "private": true,
-  "version": "0.0.0",
+  "version": "3.3.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build",
-    "start": "tsx server.ts",
-    "preview": "tsx server.ts",
+    "start": "node server.ts",
+    "start:prod": "NODE_ENV=production node server.ts",
+    "preview": "NODE_ENV=production node server.ts",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@google/genai": "^3.2.0",
