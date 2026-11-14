@@ -211,7 +211,10 @@ export const ArchitectureAndQaView: React.FC = () => {
                     },
                     {
                       label: 'ASR Match (100-CER)',
-                      value: `${sep.asrTranscriptAccuracy.characterMatchRatePct}%`
+                      value:
+                        sep.asrTranscriptAccuracy.characterMatchRatePct !== null
+                          ? `${sep.asrTranscriptAccuracy.characterMatchRatePct}%`
+                          : '0 Quota (Mode 2)'
                     }
                   ],
                   verdictNotes: `Live Verified: "${cloneData.result.qualityControlReport.verifiedTranscriptBackcheck.slice(
@@ -320,11 +323,11 @@ export const ArchitectureAndQaView: React.FC = () => {
           <div className="flex items-center gap-2">
             <Server className="w-4 h-4 text-[#42D9A0] shrink-0" />
             <h2 className="text-sm font-bold text-[#F4F8F5]">
-              Mode 1 — Cloud Persona Synthesis &amp; VAD SRT
+              Mode 1 — Cloud VAD SRT &amp; Acoustic Verification
             </h2>
           </div>
           <p className="text-xs text-[#A2B5AA] leading-relaxed">
-            Zero-cost cloud execution with sentence-chunked synthesis, 6 ms anti-click crossfades, and 20 ms PCM pause-aligned multilingual SRT transcription.
+            Zero-cost cloud execution for 20 ms PCM pause-aligned multilingual SRT transcription, emotion-tag script parsing, and acoustic/embedding verification. Cloud TTS models do not accept reference audio for voice cloning; Mode 2 is required for zero-shot cloning.
           </p>
         </div>
 
@@ -336,7 +339,7 @@ export const ArchitectureAndQaView: React.FC = () => {
             </h2>
           </div>
           <p className="text-xs text-[#A2B5AA] leading-relaxed">
-            Runs <span className="font-mono text-[#F4F8F5]">ai4bharat/IndicF5</span> (Bengali &amp; Hindi), <span className="font-mono text-[#F4F8F5]">myshell-ai/OpenVoiceV2</span> (English), and <span className="font-mono text-[#F4F8F5]">ECAPA-TDNN</span> 192-D speaker verification on <span className="font-mono text-[#42D9A0]">127.0.0.1:8001</span>.
+            Runs <span className="font-mono text-[#F4F8F5]">ai4bharat/IndicF5</span> (Bengali &amp; Hindi), <span className="font-mono text-[#F4F8F5]">myshell-ai/OpenVoiceV2</span> (English), and <span className="font-mono text-[#F4F8F5]">ECAPA-TDNN</span> 192-D speaker verification on <span className="font-mono text-[#42D9A0]">127.0.0.1:8001</span> or a Free Google Colab T4 GPU HTTPS tunnel (<span className="font-mono text-[#42D9A0]">https://*.trycloudflare.com</span>) with <strong className="text-[#F4F8F5]">0 Gemini quota consumed</strong>.
           </p>
         </div>
       </div>

@@ -55,14 +55,50 @@ export interface AudioSignalAnalysis {
   previewUrl: string;
 }
 
+export interface VoiceCloneChunkStatus {
+  chunkIndex: number;
+  chunkId: string;
+  totalChunks?: number;
+  spokenText: string;
+  charCount: number;
+  wordCount?: number;
+  activeEmotionTags: string[];
+  activeTags?: string[];
+  styleDirective: string;
+  leadingPauseMs: number;
+  trailingPauseMs: number;
+  status: 'completed' | 'cached' | 'failed';
+  durationSec?: number;
+  error?: string;
+}
+
+export interface VoiceCloneEmotionTagReport {
+  recognizedTagsUsed: string[];
+  recognizedTagsApplied?: string[];
+  unsupportedTagsDetected: string[];
+  unsupportedTagsWarning?: string | null;
+  emotionSegmentsCount?: number;
+  pauseCount: number;
+  pauseInstructionsApplied?: number;
+  totalPauseDurationMs: number;
+  totalExplicitPauseMs?: number;
+  zeroLiteralTagsInAudioVerified: boolean;
+  leakedTagsInTranscript?: string[];
+  modelEmotionSupportMode?: string;
+  honestCapabilityNote?: string;
+}
+
 export interface VoiceCloneRequest {
   referenceFileId: string;
   language: CloningLanguageCode;
   text: string;
   preservePitchContour: boolean;
   preserveSpectralTimbre: boolean;
+  reuseCompletedChunks?: boolean;
   consentConfirmed: boolean;
   localEndpointUrl?: string;
+  localNodeToken?: string;
+  enableCloudVerification?: boolean;
 }
 
 export interface VoiceCloneResult {
@@ -71,10 +107,15 @@ export interface VoiceCloneResult {
   cloningMode: 'local-neural-zero-shot' | 'cloud-persona-conditioned-tts';
   routedModelUsed: string;
   inputCharCount: number;
+  spokenCharCount?: number;
+  spokenWordCount?: number;
   referenceDurationSec: number;
   outputDurationSec: number;
   wavUrl: string;
   mp3Url: string;
+  chunkCount?: number;
+  chunks?: VoiceCloneChunkStatus[];
+  emotionTagReport?: VoiceCloneEmotionTagReport;
   speakerConditioningInfo: {
     embeddingExtractorUsed: string;
     neuralEmbeddingDimension: number;
@@ -116,8 +157,8 @@ export interface VoiceCloneResult {
         dimension: number;
       };
       asrTranscriptAccuracy: {
-        characterMatchRatePct: number;
-        cerPct: number;
+        characterMatchRatePct: number | null;
+        cerPct: number | null;
         grade: string;
         scriptVerified: string;
       };

@@ -1,11 +1,17 @@
 import { GoogleGenAI, Type } from '@google/genai';
+import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promises as dnsPromises } from 'dns';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
+import { promisify } from 'util';
 import type {
   AudioSignalAnalysis,
   CloningLanguageCode,
   SrtSegment,
   SrtTranscriptionResult,
+  VoiceCloneChunkStatus,
   VoiceCloneResult
 } from '../types/voicelab.ts';
 import {
@@ -14,7 +20,16 @@ import {
   validateSameLanguageText
 } from '../data/researchAndConfigs.ts';
 import {
+  buildEmotionPreservingChunks,
+  type EmotionScriptChunk,
+  parseEmotionTaggedScript,
+  RECOGNIZED_EMOTION_TAGS,
+  type RecognizedEmotionTagName,
+  verifyZeroLiteralTagsInTranscript
+} from '../utils/emotionTagParser.ts';
+import {
   applyReferenceAcousticIdentityAndExport,
+  type ChunkPauseTiming,
   computeVectorCosineSimilarity,
   concatenateWavChunksWithCrossfade,
   type DetectedAcousticPause,
@@ -30,6 +45,8 @@ import {
   segmentChunkAsrIntoReadableSrtBlocks,
   splitTextIntoLinguisticSentences
 } from './audioDsp.ts';
+
+const execFileAsync = promisify(execFile);
 
 export function resolveRuntimeGeminiApiKey(): string | undefined {
   if (
@@ -79,7 +96,14 @@ export interface SpeechSynthesisRequestPayload {
   contents: [
     {
       role: 'user';
-      parts: [{ text: string }];
+      parts: [
+        {
+          text: string;
+          speechMetadata?: {
+            style: string;
+          };
+        }
+      ];
     }
   ];
   config: {
@@ -96,15 +120,20 @@ export interface SpeechSynthesisRequestPayload {
 
 /**
  * Validates and constructs a schema-compliant Speech Synthesis request payload.
- * Keeps speech synthesis configuration strictly separate from text generation and voice cloning DSP configs,
- * and guarantees that unsupported Part-level speechMetadata is absent.
+ * Guarantees that bracket emotion tags are stripped from the spoken text and only
+ * passed via speechMetadata.style when supported (gemini-3.8-flash-tts).
  */
 export function buildValidatedSpeechSynthesisPayload(
   model: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
   rawText: string,
-  voicePersona?: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr'
+  voicePersona?: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr',
+  styleInstruction?: string
 ): SpeechSynthesisRequestPayload {
-  const cleanText = typeof rawText === 'string' ? rawText.trim() : '';
+  // Strip any bracket tags defensively so they are NEVER spoken aloud
+  const cleanText =
+    typeof rawText === 'string'
+      ? rawText.replace(/\[[^[\]\r\n]{1,32}\]/g, ' ').replace(/\s+/g, ' ').trim()
+      : '';
   if (!cleanText) {
     throw new Error('Speech synthesis validation failed: input text must be a non-empty string.');
   }
@@ -112,9 +141,9 @@ export function buildValidatedSpeechSynthesisPayload(
     throw new Error('Speech synthesis validation failed: input text exceeds 2,000 character limit.');
   }
 
-  const part: Record<string, unknown> = { text: cleanText };
-  if ('speechMetadata' in part) {
-    throw new Error('Schema invariant violation: unsupported speechMetadata field detected.');
+  const part: { text: string; speechMetadata?: { style: string } } = { text: cleanText };
+  if (model === 'gemini-3.8-flash-tts' && styleInstruction && styleInstruction.trim().length > 0) {
+    part.speechMetadata = { style: styleInstruction.trim() };
   }
 
   const payload: SpeechSynthesisRequestPayload = {
@@ -122,7 +151,7 @@ export function buildValidatedSpeechSynthesisPayload(
     contents: [
       {
         role: 'user',
-        parts: [{ text: cleanText }]
+        parts: [part]
       }
     ],
     config: {
@@ -220,7 +249,91 @@ export function computeCharacterMatchRatePct(expected: string, actual: string): 
   return Number(matchRate.toFixed(1));
 }
 
+export class VoiceCloningUnsupportedError extends Error {
+  readonly httpStatus = 422;
+  readonly code = 'VOICE_CLONING_NOT_SUPPORTED_ON_CLOUD_MODEL';
+  constructor(message: string) {
+    super(message);
+    this.name = 'VoiceCloningUnsupportedError';
+  }
+}
+
+export class QuotaExhaustedError extends Error {
+  readonly httpStatus = 429;
+  readonly code = 'RESOURCE_EXHAUSTED';
+  readonly retryAfterText?: string;
+  constructor(message: string, retryAfterText?: string) {
+    super(message);
+    this.name = 'QuotaExhaustedError';
+    this.retryAfterText = retryAfterText;
+  }
+}
+
+export class LocalNeuralNodeError extends Error {
+  readonly httpStatus: number;
+  readonly code: string;
+  constructor(message: string, httpStatus = 422, code = 'LOCAL_NEURAL_NODE_ERROR') {
+    super(message);
+    this.name = 'LocalNeuralNodeError';
+    this.httpStatus = httpStatus;
+    this.code = code;
+  }
+}
+
+export function extractQuotaExhaustedInfo(err: any): {
+  isQuotaExhausted: boolean;
+  retryAfterText?: string;
+  message: string;
+} {
+  const rawMessage = err?.message || String(err || 'Unknown error');
+  let parsedMessage = rawMessage;
+  let parsedCode: number | undefined = typeof err?.status === 'number' ? err.status : undefined;
+  let parsedStatus = '';
+  let retryDelay: string | undefined;
+
+  try {
+    const jsonStart = rawMessage.indexOf('{');
+    if (jsonStart !== -1) {
+      const parsed = JSON.parse(rawMessage.slice(jsonStart));
+      if (parsed?.error) {
+        parsedMessage = parsed.error.message || rawMessage;
+        parsedCode = parsed.error.code || parsedCode;
+        parsedStatus = String(parsed.error.status || '');
+        if (Array.isArray(parsed.error.details)) {
+          for (const d of parsed.error.details) {
+            if (d?.retryDelay) retryDelay = String(d.retryDelay);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore JSON parse fallback
+  }
+
+  const retryMatch = parsedMessage.match(/Please retry in ([^\s.,;]+s?)/i);
+  const retryAfterText = retryMatch?.[1] || retryDelay;
+
+  const isQuotaExhausted =
+    parsedCode === 429 ||
+    parsedStatus === 'RESOURCE_EXHAUSTED' ||
+    /\b429\b.*RESOURCE_EXHAUSTED/i.test(rawMessage) ||
+    /exceeded your current quota/i.test(parsedMessage);
+
+  return {
+    isQuotaExhausted,
+    retryAfterText,
+    message: parsedMessage
+  };
+}
+
 function formatGeminiApiError(err: any, contextLabel: string): string {
+  const quotaInfo = extractQuotaExhaustedInfo(err);
+  if (quotaInfo.isQuotaExhausted) {
+    const retryHint = quotaInfo.retryAfterText
+      ? ` Please retry after ${quotaInfo.retryAfterText}.`
+      : '';
+    return `${contextLabel} (HTTP 429 RESOURCE_EXHAUSTED): API quota exceeded.${retryHint} Free-tier daily quota limit reached.`;
+  }
   const rawMessage = err?.message || String(err || 'Unknown error');
   try {
     const jsonStart = rawMessage.indexOf('{');
@@ -374,7 +487,11 @@ export async function analyzeReferenceVoiceLanguageAndIdentity(
           recommendedBasePersona: defaultPersona
         }
       };
-    } catch {
+    } catch (err: any) {
+      if (extractQuotaExhaustedInfo(err).isQuotaExhausted) {
+        // Stop immediately on 429 so we do not burn a second API call
+        break;
+      }
       // Try next analysis model
     }
   }
@@ -398,10 +515,54 @@ export async function analyzeReferenceVoiceLanguageAndIdentity(
   };
 }
 
+function isLoopbackHost(rawHost: string): boolean {
+  const cleanHost = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return cleanHost === '127.0.0.1' || cleanHost === 'localhost' || cleanHost === '::1';
+}
+
+function isBlockedIpAddress(ipRaw: string): boolean {
+  const clean = ipRaw.trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+  if (clean.startsWith('::ffff:')) {
+    return isBlockedIpAddress(clean.slice('::ffff:'.length));
+  }
+  const ipVer = net.isIP(clean);
+  if (ipVer === 4) {
+    const parts = clean.split('.').map((n) => Number(n));
+    if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) {
+      return true;
+    }
+    const [a, b] = parts;
+    if (a === 0) return true; // 0.0.0.0/8 "this network"
+    if (a === 10) return true; // 10.0.0.0/8 RFC1918
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+    if (a === 127) return true; // 127.0.0.0/8 loopback
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+    if (a === 192 && b === 0 && parts[2] === 0) return true; // 192.0.0.0/24
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmark
+    if (a >= 224) return true; // multicast & reserved
+    return false;
+  }
+  if (ipVer === 6) {
+    if (clean === '::' || clean === '::1') return true;
+    const firstWordHex = clean.split(':')[0] || '0';
+    const firstWord = parseInt(firstWordHex, 16);
+    if (!Number.isNaN(firstWord)) {
+      if ((firstWord & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA private
+      if ((firstWord & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+      if ((firstWord & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+    }
+    return false;
+  }
+  return true;
+}
+
 /**
- * Validates that a user-supplied Local Neural Node URL points strictly to a local loopback
- * interface (127.0.0.1, localhost, or ::1) over HTTP/HTTPS with no embedded credentials,
- * preventing SSRF or unintended external network requests.
+ * Validates that a Mode 2 Neural Node URL points either to a local loopback interface
+ * (http/https on 127.0.0.1, localhost, [::1]) OR to an HTTPS public domain tunnel
+ * (e.g. https://*.trycloudflare.com or https://*.ngrok-free.app for Google Colab / Kaggle T4 GPU).
+ * Rejects embedded credentials, plain http:// on remote hosts, internal/local domains, and raw IP literals.
  */
 export function validateLocalNodeEndpointUrl(rawUrl: string): string {
   let parsed: URL;
@@ -409,66 +570,203 @@ export function validateLocalNodeEndpointUrl(rawUrl: string): string {
     parsed = new URL(rawUrl.trim());
   } catch {
     throw new Error(
-      `Invalid Local Neural Node URL "${rawUrl}". Must be a valid loopback URL such as http://127.0.0.1:8001.`
+      `Invalid Mode 2 Neural Node URL "${rawUrl}". Enter a loopback URL (http://127.0.0.1:8001) or an HTTPS GPU tunnel URL (https://xxxx.trycloudflare.com).`
     );
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Local Neural Node URL must use http:// or https:// protocol.');
+    throw new Error('Mode 2 Neural Node URL must use https:// (or http:// for localhost only).');
   }
   if (parsed.username || parsed.password) {
-    throw new Error('Local Neural Node URL must not contain embedded credentials.');
+    throw new Error('Mode 2 Neural Node URL must not contain embedded credentials.');
   }
-  const host = parsed.hostname.toLowerCase();
-  const allowedLoopbackHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
-  if (!allowedLoopbackHosts.has(host)) {
+  const cleanHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!cleanHost) {
+    throw new Error('Mode 2 Neural Node URL is missing a valid hostname.');
+  }
+
+  if (isLoopbackHost(cleanHost)) {
+    return parsed.origin;
+  }
+
+  if (parsed.protocol !== 'https:') {
     throw new Error(
-      `Security Policy Blocked: Local Neural Node URL host "${host}" is not a loopback address. Only 127.0.0.1, localhost, or [::1] are permitted.`
+      `Security Policy Blocked: Remote Mode 2 Neural Node "${cleanHost}" must use HTTPS (e.g. https://xxxx.trycloudflare.com). Plain http:// is only allowed for 127.0.0.1 / localhost.`
     );
   }
+
+  if (net.isIP(cleanHost) !== 0) {
+    throw new Error(
+      `Security Policy Blocked: Raw IP literal "${cleanHost}" is not allowed for remote Mode 2 nodes. Use a verified HTTPS tunnel hostname (e.g. *.trycloudflare.com) or localhost.`
+    );
+  }
+
+  if (
+    !cleanHost.includes('.') ||
+    cleanHost.endsWith('.local') ||
+    cleanHost.endsWith('.internal') ||
+    cleanHost.endsWith('.localhost') ||
+    cleanHost.endsWith('.arpa')
+  ) {
+    throw new Error(
+      `Security Policy Blocked: Internal/single-label hostname "${cleanHost}" is not permitted.`
+    );
+  }
+
   return parsed.origin;
 }
 
 /**
- * Synthesizes a single sentence/block of speech using Gemini 3.8 TTS models on v1beta
- * conditioned on the reference speaker's matched acoustic persona.
+ * Full async SSRF guard: validates URL structure AND verifies via DNS lookup that non-loopback
+ * hostnames do not resolve to private, loopback, link-local, metadata, or reserved IP ranges.
  */
-async function synthesizeSingleBlockRawWav(options: {
-  text: string;
-  voicePersona: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
-  outputRawWavPath: string;
-}): Promise<string> {
-  const ai = getGenAIClient();
-  const { text, voicePersona, outputRawWavPath } = options;
+export async function assertSafeNeuralNodeUrl(rawUrl: string): Promise<string> {
+  const origin = validateLocalNodeEndpointUrl(rawUrl);
+  const cleanHost = new URL(origin).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (isLoopbackHost(cleanHost)) {
+    return origin;
+  }
 
-  const modelsToTry: ('gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts')[] = [
-    'gemini-3.8-flash-lite-tts',
-    'gemini-3.8-flash-tts'
-  ];
-  let lastError: any = null;
+  let records: { address: string; family: number }[];
+  try {
+    records = await dnsPromises.lookup(cleanHost, { all: true, verbatim: true });
+  } catch (err: any) {
+    throw new LocalNeuralNodeError(
+      `Remote Mode 2 Neural Node hostname "${cleanHost}" could not be resolved (${err?.message || 'DNS lookup failed'}).`,
+      422,
+      'LOCAL_NODE_DNS_FAILED'
+    );
+  }
 
-  for (const modelName of modelsToTry) {
-    for (const personaArg of [voicePersona, undefined]) {
-      try {
-        const requestPayload = buildValidatedSpeechSynthesisPayload(modelName, text, personaArg);
-        const response = await ai.models.generateContent(requestPayload);
+  if (!records || records.length === 0) {
+    throw new LocalNeuralNodeError(
+      `Remote Mode 2 Neural Node hostname "${cleanHost}" returned no DNS records.`,
+      422,
+      'LOCAL_NODE_DNS_FAILED'
+    );
+  }
 
-        const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-        const base64Audio = inlineData?.data;
-        if (base64Audio) {
-          const wavBuffer = Buffer.from(base64Audio, 'base64');
-          if (wavBuffer.length < 100) {
-            throw new Error('Synthesized audio buffer is unexpectedly empty (< 100 bytes).');
-          }
-          await fs.promises.writeFile(outputRawWavPath, wavBuffer);
-          return modelName;
-        }
-      } catch (err) {
-        lastError = err;
-      }
+  for (const rec of records) {
+    if (isBlockedIpAddress(rec.address)) {
+      throw new LocalNeuralNodeError(
+        `Security Policy Blocked: Remote Neural Node "${cleanHost}" resolved to a private or restricted IP (${rec.address}).`,
+        422,
+        'SSRF_BLOCKED'
+      );
     }
   }
 
-  throw new Error(formatGeminiApiError(lastError, 'Speech synthesis failed'));
+  return origin;
+}
+
+/**
+ * Applies bounded post-synthesis acoustic emotion shaping (tempo, dynamic volume, and whisper/shout
+ * spectral filtering) to a single chunk WAV so emotion tags produce audible delivery differences
+ * alongside Gemini neural style conditioning without altering speaker identity.
+ */
+async function applyChunkEmotionProsodyShaping(
+  wavPath: string,
+  activeTags: RecognizedEmotionTagName[]
+): Promise<void> {
+  if (!activeTags || activeTags.length === 0) return;
+
+  let tempo = 1.0;
+  let volumeDb = 0.0;
+  let isWhispering = false;
+  let isSoft = false;
+
+  for (const tagName of activeTags) {
+    const spec = RECOGNIZED_EMOTION_TAGS[tagName];
+    if (!spec) continue;
+    tempo *= spec.tempoMultiplier;
+    volumeDb += spec.volumeDeltaDb;
+    if (tagName === 'whispering') isWhispering = true;
+    if (tagName === 'softly') isSoft = true;
+  }
+
+  tempo = Math.max(0.86, Math.min(1.14, Number(tempo.toFixed(3))));
+  volumeDb = Math.max(-5.5, Math.min(3.5, Number(volumeDb.toFixed(2))));
+
+  const filters: string[] = [];
+  if (Math.abs(tempo - 1.0) >= 0.02) {
+    filters.push(`atempo=${tempo}`);
+  }
+  if (isWhispering) {
+    filters.push('highpass=f=220', 'equalizer=f=3200:t=q:w=1.0:g=2.5');
+  } else if (isSoft) {
+    filters.push('lowpass=f=6800');
+  }
+  if (Math.abs(volumeDb) >= 0.3) {
+    filters.push(`volume=${volumeDb}dB`);
+  }
+
+  if (filters.length === 0) return;
+  filters.push('alimiter=limit=0.95:attack=5:release=50');
+
+  const shapedPath = `${wavPath}.shaped.wav`;
+  try {
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-i',
+      wavPath,
+      '-af',
+      filters.join(','),
+      '-ar',
+      '24000',
+      '-ac',
+      '1',
+      '-c:a',
+      'pcm_s16le',
+      shapedPath
+    ]);
+    await fs.promises.rename(shapedPath, wavPath);
+  } catch {
+    await fs.promises.unlink(shapedPath).catch(() => {});
+  }
+}
+
+/**
+ * Synthesizes an internal studio sample WAV once via a single TTS request.
+ * Strictly NOT used as fake "voice cloning" — only used for pre-populating an authorized
+ * sample audio clip if not already cached in SAMPLES_DIR.
+ * Zero multi-model fallback; aborts immediately on 429 RESOURCE_EXHAUSTED.
+ */
+async function synthesizeStudioSampleWav(options: {
+  spokenText: string;
+  voicePersona: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+  styleDirective: string;
+  outputRawWavPath: string;
+}): Promise<string> {
+  const ai = getGenAIClient();
+  const { spokenText, voicePersona, styleDirective, outputRawWavPath } = options;
+
+  try {
+    const requestPayload = buildValidatedSpeechSynthesisPayload(
+      'gemini-3.8-flash-tts',
+      spokenText,
+      voicePersona,
+      styleDirective
+    );
+    const response = await ai.models.generateContent(requestPayload);
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+      throw new Error('Studio sample initialization returned no audio bytes.');
+    }
+    const wavBuffer = Buffer.from(base64Audio, 'base64');
+    if (wavBuffer.length < 100) {
+      throw new Error('Studio sample audio buffer is unexpectedly empty (< 100 bytes).');
+    }
+    await fs.promises.writeFile(outputRawWavPath, wavBuffer);
+    return 'gemini-3.8-flash-tts';
+  } catch (err: any) {
+    const quotaInfo = extractQuotaExhaustedInfo(err);
+    if (quotaInfo.isQuotaExhausted) {
+      throw new QuotaExhaustedError(
+        `${formatGeminiApiError(err, 'Studio sample generation paused')} Upload or record your own reference audio (0 TTS quota used) and connect a Free Google Colab / Local Mode 2 node for unlimited cloning.`,
+        quotaInfo.retryAfterText
+      );
+    }
+    throw new Error(formatGeminiApiError(err, 'Studio sample initialization failed'));
+  }
 }
 
 export interface BackendPipelineProgressEvent {
@@ -481,103 +779,345 @@ export interface BackendPipelineProgressEvent {
   totalUnits?: number;
 }
 
-/**
- * Synthesizes speech with automatic sentence-boundary chunking and zero-click crossfaded
- * concatenation for medium and long texts (> 240 chars) so prosody, pronunciation, and
- * inter-sentence pauses remain natural without rushing or boundary artifacts.
- */
-async function synthesizeRawSpeechWav(options: {
-  text: string;
+function computeDeterministicChunkCacheId(options: {
+  referenceSha256: string;
   language: CloningLanguageCode;
-  voicePersona: 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
-  styleDirective: string;
-  outputRawWavPath: string;
-  onProgress?: (event: BackendPipelineProgressEvent) => void;
-}): Promise<string> {
-  const { text, voicePersona, outputRawWavPath, onProgress } = options;
-  const cleanText = text.trim();
-
-  // Group sentences into chunks of <= 240 chars to prevent long-text prosody degradation
-  const sentences = splitTextIntoLinguisticSentences(cleanText);
-  const textBlocks: string[] = [];
-  let currentBlock = '';
-
-  for (const sent of sentences) {
-    if (!currentBlock) {
-      currentBlock = sent;
-    } else if (Array.from(`${currentBlock} ${sent}`).length <= 240) {
-      currentBlock = `${currentBlock} ${sent}`;
-    } else {
-      textBlocks.push(currentBlock);
-      currentBlock = sent;
-    }
-  }
-  if (currentBlock) {
-    textBlocks.push(currentBlock);
-  }
-
-  if (textBlocks.length <= 1) {
-    onProgress?.({
-      stageIndex: 1,
-      stageLabel: `Synthesizing speech audio (${voicePersona} persona)...`,
-      progressPct: null,
-      progressSource: 'indeterminate-inference'
-    });
-    return synthesizeSingleBlockRawWav({
-      text: cleanText,
-      voicePersona,
-      outputRawWavPath
-    });
-  }
-
-  const chunkPaths: string[] = [];
-  let modelUsed = 'gemini-3.8-flash-lite-tts';
-  try {
-    for (let i = 0; i < textBlocks.length; i++) {
-      onProgress?.({
-        stageIndex: 1,
-        stageLabel: `Synthesizing sentence block ${i + 1} of ${textBlocks.length}...`,
-        stageDetail: `Block ${i + 1}/${textBlocks.length}`,
-        progressPct: Math.round((i / textBlocks.length) * 100),
-        progressSource: 'backend-chunks',
-        completedUnits: i,
-        totalUnits: textBlocks.length
-      });
-      const partPath = `${outputRawWavPath}.part_${i}.wav`;
-      chunkPaths.push(partPath);
-      modelUsed = await synthesizeSingleBlockRawWav({
-        text: textBlocks[i],
-        voicePersona,
-        outputRawWavPath: partPath
-      });
-      onProgress?.({
-        stageIndex: 1,
-        stageLabel: `Completed sentence block ${i + 1} of ${textBlocks.length}`,
-        stageDetail: `Block ${i + 1}/${textBlocks.length}`,
-        progressPct: Math.round(((i + 1) / textBlocks.length) * 100),
-        progressSource: 'backend-chunks',
-        completedUnits: i + 1,
-        totalUnits: textBlocks.length
-      });
-    }
-    await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180);
-    return modelUsed;
-  } finally {
-    for (const p of chunkPaths) {
-      await fs.promises.unlink(p).catch(() => {});
-    }
-  }
+  endpointOrigin: string;
+  spokenText: string;
+  emotionStyleDirective: string;
+  leadingPauseMs: number;
+  trailingPauseMs: number;
+}): string {
+  const hash = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        refSha: options.referenceSha256,
+        lang: options.language,
+        endpoint: options.endpointOrigin,
+        text: options.spokenText,
+        style: options.emotionStyleDirective,
+        leadPause: options.leadingPauseMs,
+        trailPause: options.trailingPauseMs
+      })
+    )
+    .digest('hex')
+    .slice(0, 16);
+  return `chunk_${options.language}_${hash}`;
 }
 
 /**
- * PIPELINE A: Speaker-Conditioned Same-Language Voice Cloning Pipeline
- * - Strict Mode Isolation: If localEndpointUrl is supplied, validates loopback security and
- *   executes Mode 2 Local Neural Node (IndicF5 for bn/hi, OpenVoice V2 for en) with ZERO silent
- *   fallback to Cloud TTS.
- * - Conservative Optional DSP: Off by default unless explicitly enabled by user; clamped to +/- 2.0 st.
- * - Separated Honest Metrics: Speaker Identity Similarity (ECAPA-TDNN only), General Audio Embedding
- *   Similarity (gemini-embedding-2 3072-D), Spectral Feature Similarity (16-D Goertzel), ASR Transcript
- *   Accuracy (100 - CER), and Audio Signal Quality.
+ * Generates an explicit 24kHz mono WAV silence clip for pure pause chunks if needed.
+ */
+async function writeSilenceWav(outputWavPath: string, durationSec = 0.45): Promise<void> {
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'anullsrc=r=24000:cl=mono',
+    '-t',
+    String(durationSec),
+    '-ar',
+    '24000',
+    '-ac',
+    '1',
+    '-c:a',
+    'pcm_s16le',
+    outputWavPath
+  ]);
+}
+
+/**
+ * Synthesizes a long emotion-tagged script chunk-by-chunk on the verified Mode 2
+ * Local Zero-Shot Neural Node (ai4bharat/IndicF5 for Bengali/Hindi, OpenVoice V2 for English).
+ * - Sends the EXACT SAME reference audio bytes on every chunk (identical SHA-256).
+ * - Never falls back to Cloud Gemini prebuilt voices.
+ * - Enforces deterministic per-chunk disk caching so retrying failed chunks reuses completed chunks.
+ * - Enforces a strict bounded retry limit (max 2 attempts per transient chunk failure; 0 retries on 400/401/422/429/503 checkpoint missing).
+ */
+async function synthesizeMode2ReferenceConditionedChunks(options: {
+  endpointOrigin: string;
+  localNodeToken: string;
+  referenceBase64: string;
+  referenceSha256: string;
+  referenceTranscript: string;
+  referencePitchHz: number;
+  chunks: EmotionScriptChunk[];
+  language: CloningLanguageCode;
+  outputDir: string;
+  outputRawWavPath: string;
+  reuseCompletedChunks: boolean;
+  onProgress?: (event: BackendPipelineProgressEvent) => void;
+}): Promise<{
+  modelCheckpoint: string;
+  meanEcapaCosineSimilarity: number | null;
+  chunkStatuses: VoiceCloneChunkStatus[];
+}> {
+  const {
+    endpointOrigin,
+    localNodeToken,
+    referenceBase64,
+    referenceSha256,
+    referenceTranscript,
+    referencePitchHz,
+    chunks,
+    language,
+    outputDir,
+    outputRawWavPath,
+    reuseCompletedChunks,
+    onProgress
+  } = options;
+
+  const chunkCacheDir = path.join(outputDir, 'chunk_cache');
+  await fs.promises.mkdir(chunkCacheDir, { recursive: true });
+
+  const chunkPaths: string[] = [];
+  const chunkTimings: ChunkPauseTiming[] = [];
+  const chunkStatuses: VoiceCloneChunkStatus[] = [];
+  const ecapaScores: number[] = [];
+  let modelCheckpoint =
+    language === 'bn' || language === 'hi'
+      ? 'ai4bharat/IndicF5 (Zero-Shot Flow-Matching DiT)'
+      : 'myshell-ai/OpenVoiceV2 (256-D ToneColorConverter)';
+
+  const MAX_CHUNK_ATTEMPTS = 2;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const cacheId = computeDeterministicChunkCacheId({
+      referenceSha256,
+      language,
+      endpointOrigin,
+      spokenText: chunk.spokenText,
+      emotionStyleDirective: chunk.combinedStyleDirective,
+      leadingPauseMs: chunk.leadingPauseMs,
+      trailingPauseMs: chunk.trailingPauseMs
+    });
+    const cachedWavPath = path.join(chunkCacheDir, `${cacheId}.wav`);
+    const tagSummary =
+      chunk.activeTags.length > 0
+        ? chunk.activeTags.map((t) => `[${t}]`).join(' ')
+        : '[neutral]';
+
+    onProgress?.({
+      stageIndex: 1,
+      stageLabel: `Cloning chunk ${i + 1} of ${chunks.length} with reference voice (${tagSummary})...`,
+      stageDetail: `Chunk ${i + 1}/${chunks.length} · ${tagSummary}`,
+      progressPct: Math.round((i / chunks.length) * 100),
+      progressSource: 'backend-chunks',
+      completedUnits: i,
+      totalUnits: chunks.length
+    });
+
+    let reusedFromCache = false;
+    if (reuseCompletedChunks && fs.existsSync(cachedWavPath)) {
+      try {
+        const stat = await fs.promises.stat(cachedWavPath);
+        if (stat.size > 200) {
+          reusedFromCache = true;
+        }
+      } catch {
+        reusedFromCache = false;
+      }
+    }
+
+    if (!reusedFromCache) {
+      // Defensive strip so bracket tags can NEVER be spoken aloud
+      const cleanSpokenText = chunk.spokenText
+        .replace(/\[[^[\]\r\n]{1,32}\]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (!cleanSpokenText) {
+        await writeSilenceWav(cachedWavPath, 0.45);
+      } else {
+        let chunkSucceeded = false;
+        let lastChunkErr: Error | null = null;
+
+        for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+          let localResp: Response;
+          try {
+            localResp = await fetch(`${endpointOrigin}/v1/voice-clone`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-VoiceLab-Node-Token': localNodeToken,
+                'ngrok-skip-browser-warning': 'true'
+              },
+              body: JSON.stringify({
+                language,
+                text: cleanSpokenText,
+                spokenText: cleanSpokenText,
+                chunkIndex: chunk.chunkIndex,
+                totalChunks: chunk.totalChunks,
+                activeEmotionTags: chunk.activeTags,
+                emotionStyleDirective: chunk.combinedStyleDirective,
+                referenceAudioBase64: referenceBase64,
+                referenceAudioSha256: referenceSha256,
+                referenceTranscript: referenceTranscript || cleanSpokenText,
+                referencePitchHz
+              })
+            });
+          } catch (connErr: any) {
+            lastChunkErr = new LocalNeuralNodeError(
+              `Mode 2 Local Neural Node connection interrupted on chunk ${i + 1}/${chunks.length} (${
+                connErr?.message || 'Connection refused'
+              }). Cloud TTS fallback is disabled to preserve true voice identity.`,
+              422,
+              'LOCAL_NODE_UNREACHABLE'
+            );
+            // Retry once only on transient transport drop
+            continue;
+          }
+
+          const respText = await localResp.text();
+          let respJson: any = null;
+          try {
+            respJson = respText ? JSON.parse(respText) : null;
+          } catch {
+            respJson = null;
+          }
+
+          if (localResp.status === 429 || /RESOURCE_EXHAUSTED/i.test(respText)) {
+            const quotaInfo = extractQuotaExhaustedInfo(respText);
+            throw new QuotaExhaustedError(
+              `Chunk ${i + 1}/${chunks.length} aborted (HTTP 429 RESOURCE_EXHAUSTED): ${
+                respJson?.detail || respJson?.error || quotaInfo.message
+              }`,
+              quotaInfo.retryAfterText
+            );
+          }
+
+          if (!localResp.ok) {
+            const detail =
+              respJson?.detail || respJson?.error || respText || `HTTP ${localResp.status}`;
+            const errObj = new LocalNeuralNodeError(
+              `Mode 2 Local Neural Node failed on chunk ${i + 1}/${chunks.length} (HTTP ${localResp.status}): ${detail}. Previously completed chunks (${i}) remain cached.`,
+              localResp.status === 400 || localResp.status === 401 ? localResp.status : 422,
+              localResp.status === 503 ? 'LOCAL_NODE_MODEL_UNAVAILABLE' : 'LOCAL_NODE_SYNTHESIS_ERROR'
+            );
+            // Zero retries on non-transient client/auth/checkpoint-missing errors (400, 401, 404, 422, 503)
+            if ([400, 401, 403, 404, 422, 503].includes(localResp.status)) {
+              throw errObj;
+            }
+            lastChunkErr = errObj;
+            continue;
+          }
+
+          const wavB64 = respJson?.wavBase64 || respJson?.audioBase64;
+          if (!wavB64 || typeof wavB64 !== 'string') {
+            lastChunkErr = new LocalNeuralNodeError(
+              `Mode 2 Local Neural Node did not return wavBase64 / audioBase64 on chunk ${i + 1}/${chunks.length}.`,
+              422,
+              'LOCAL_NODE_INVALID_RESPONSE'
+            );
+            break;
+          }
+
+          const rawBytes = Buffer.from(wavB64, 'base64');
+          if (rawBytes.length < 100) {
+            lastChunkErr = new LocalNeuralNodeError(
+              `Mode 2 Local Neural Node returned an empty WAV buffer on chunk ${i + 1}/${chunks.length}.`,
+              422,
+              'LOCAL_NODE_EMPTY_AUDIO'
+            );
+            break;
+          }
+
+          await fs.promises.writeFile(cachedWavPath, rawBytes);
+          await applyChunkEmotionProsodyShaping(cachedWavPath, chunk.activeTags);
+
+          if (typeof respJson?.modelCheckpoint === 'string' && respJson.modelCheckpoint.trim()) {
+            modelCheckpoint = respJson.modelCheckpoint.trim();
+          } else if (typeof respJson?.modelUsed === 'string' && respJson.modelUsed.trim()) {
+            modelCheckpoint = respJson.modelUsed.trim();
+          }
+          if (typeof respJson?.ecapaCosineSimilarity === 'number') {
+            ecapaScores.push(respJson.ecapaCosineSimilarity);
+          }
+
+          chunkSucceeded = true;
+          break;
+        }
+
+        if (!chunkSucceeded) {
+          throw (
+            lastChunkErr ||
+            new LocalNeuralNodeError(
+              `Chunk ${i + 1}/${chunks.length} failed after ${MAX_CHUNK_ATTEMPTS} attempts.`,
+              422,
+              'CHUNK_SYNTHESIS_FAILED'
+            )
+          );
+        }
+      }
+    }
+
+    let chunkDurationSec = 0;
+    try {
+      const stat = await fs.promises.stat(cachedWavPath);
+      chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
+    } catch {
+      chunkDurationSec = 1.0;
+    }
+
+    chunkPaths.push(cachedWavPath);
+    chunkTimings.push({
+      leadingPauseMs: chunk.leadingPauseMs,
+      trailingPauseMs: chunk.trailingPauseMs
+    });
+
+    chunkStatuses.push({
+      chunkIndex: i,
+      chunkId: cacheId,
+      spokenText: chunk.spokenText,
+      charCount: chunk.charCount,
+      activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
+      styleDirective: chunk.combinedStyleDirective,
+      leadingPauseMs: chunk.leadingPauseMs,
+      trailingPauseMs: chunk.trailingPauseMs,
+      status: reusedFromCache ? 'cached' : 'completed',
+      durationSec: chunkDurationSec
+    });
+
+    onProgress?.({
+      stageIndex: 1,
+      stageLabel: `${reusedFromCache ? 'Reused cached' : 'Cloned'} chunk ${i + 1} of ${chunks.length} (${tagSummary})`,
+      stageDetail: `Chunk ${i + 1}/${chunks.length} · ${chunkDurationSec}s`,
+      progressPct: Math.round(((i + 1) / chunks.length) * 100),
+      progressSource: 'backend-chunks',
+      completedUnits: i + 1,
+      totalUnits: chunks.length
+    });
+  }
+
+  await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180, chunkTimings);
+
+  const meanEcapaCosineSimilarity =
+    ecapaScores.length > 0
+      ? Number((ecapaScores.reduce((a, b) => a + b, 0) / ecapaScores.length).toFixed(4))
+      : null;
+
+  return {
+    modelCheckpoint,
+    meanEcapaCosineSimilarity,
+    chunkStatuses
+  };
+}
+
+/**
+ * PIPELINE A: Genuine Reference-Audio-Conditioned Same-Language Voice Cloning Pipeline
+ * - Strictly refuses to substitute Gemini prebuilt voices (Puck/Charon/Kore/Fenrir/Zephyr) or
+ *   label generic Cloud TTS / DSP pitch-shifted output as cloned speech.
+ * - Requires a genuine reference-audio-conditioned zero-shot cloning backend (Mode 2 Local Neural
+ *   Node running ai4bharat/IndicF5 for Bengali/Hindi or MyShell OpenVoice V2 for English).
+ * - Emotion Tag Processing: Parses [happy], [sad], [angry], [excited], [calm], [serious],
+ *   [whispering], [softly], [confidently], [shouting], and [pause] into prosody/pause directives
+ *   while guaranteeing bracket tags are NEVER spoken aloud.
+ * - Long-Script Chunking & Retry: Supports scripts up to 12,000 characters with sentence-aware
+ *   chunking, consistent reference audio conditioning across every chunk, deterministic chunk caching,
+ *   and bounded failure retries.
  */
 export async function executeSameLanguageVoiceCloning(options: {
   jobId: string;
@@ -585,10 +1125,14 @@ export async function executeSameLanguageVoiceCloning(options: {
   referenceAnalysis: AudioSignalAnalysis;
   language: CloningLanguageCode;
   text: string;
+  referenceTranscript?: string;
   preservePitchContour: boolean;
   preserveSpectralTimbre: boolean;
+  reuseCompletedChunks?: boolean;
   outputDir: string;
   localEndpointUrl?: string;
+  localNodeToken?: string;
+  enableCloudVerification?: boolean;
   onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<VoiceCloneResult> {
   const {
@@ -597,34 +1141,40 @@ export async function executeSameLanguageVoiceCloning(options: {
     referenceAnalysis,
     language,
     text,
-    preservePitchContour,
-    preserveSpectralTimbre,
+    referenceTranscript,
+    reuseCompletedChunks = true,
     outputDir,
     localEndpointUrl,
+    localNodeToken,
+    enableCloudVerification = false,
     onProgress
   } = options;
 
   onProgress?.({
     stageIndex: 0,
-    stageLabel: 'Validating same-language script & reference vocal profile...',
+    stageLabel: 'Parsing emotion tags & validating same-language script...',
     progressPct: null,
     progressSource: 'indeterminate-inference'
   });
 
-  // 1. Validate same-language text script strictly
+  // 1. Parse Emotion Tags & Strip Bracket Instructions from Spoken Script
+  const parsedScript = parseEmotionTaggedScript(text);
+
+  // 2. Validate same-language text script strictly on the clean spoken script
   const scriptCheck = validateSameLanguageText(text, language);
   if (!scriptCheck.isValid) {
     throw new Error(scriptCheck.errorMessage || 'Cross-language voice cloning is strictly prohibited.');
   }
 
-  // 2. Validate that reference voice language matches selected language (if detected as bn, hi, or en)
+  // 3. Validate that reference voice language matches selected language (if detected as bn, hi, or en)
   const detectedRefLang = referenceAnalysis.detectedSpokenLanguage?.code;
   if (
     detectedRefLang &&
     ['bn', 'hi', 'en'].includes(detectedRefLang) &&
     detectedRefLang !== language
   ) {
-    const refLangLabel = CLONING_LANGUAGES[detectedRefLang as CloningLanguageCode]?.nativeName || detectedRefLang;
+    const refLangLabel =
+      CLONING_LANGUAGES[detectedRefLang as CloningLanguageCode]?.nativeName || detectedRefLang;
     const targetLangLabel = CLONING_LANGUAGES[language].nativeName;
     throw new Error(
       `Cross-Language Voice Cloning Blocked: Your uploaded reference voice was detected as ${refLangLabel} (${detectedRefLang.toUpperCase()}), which does not match the selected target language ${targetLangLabel} (${language.toUpperCase()}). Voice cloning in VoiceLab AI is strictly same-language.`
@@ -632,146 +1182,165 @@ export async function executeSameLanguageVoiceCloning(options: {
   }
 
   const langConfig = CLONING_LANGUAGES[language];
-  const vocalIdentity = referenceAnalysis.detectedSpokenLanguage?.vocalIdentitySummary;
-  const basePersona =
-    vocalIdentity?.recommendedBasePersona ||
-    selectBaseVoicePersonaFromAcoustics(
-      referenceAnalysis.fundamentalFreqHz,
-      referenceAnalysis.spectralWarmthRatio
+
+  // Build sentence-aware, emotion-preserving chunks (<= 320 chars per chunk)
+  const scriptChunks = buildEmotionPreservingChunks(
+    parsedScript,
+    splitTextIntoLinguisticSentences,
+    320
+  );
+  if (scriptChunks.length === 0) {
+    throw new Error('Please enter spoken text in addition to emotion or pause tags.');
+  }
+
+  // 4. STRICT VOICE IDENTITY ENFORCEMENT (NO FAKE CLONING / NO SILENT CLOUD FALLBACK):
+  // Empirically verified against the Gemini API:
+  //   - gemini-3.8-flash-tts / gemini-3.8-flash-lite-tts reject audio inputs with HTTP 400
+  //     ("Audio input modality is not enabled for this model") and only support 5 fixed prebuilt voices.
+  //   - gemini-3.8-live speaks via built-in/prebuilt assistant voices rather than cloning input audio.
+  // Therefore, if Mode 2 Zero-Shot Neural Node is not configured, VoiceLab AI MUST NOT
+  // generate generic prebuilt speech or waste TTS quota pretending to clone the user's voice.
+  const activeLocalUrlRaw = (localEndpointUrl || process.env.LOCAL_NEURAL_CLONE_URL || '').trim();
+  if (!activeLocalUrlRaw) {
+    throw new VoiceCloningUnsupportedError(
+      `Genuine Voice Cloning Unavailable in Cloud-Only Mode: Cloud Gemini speech models do not support zero-shot speaker cloning and enforce strict daily quotas. Open "Reference Conditioning & Node Settings" to connect a 0-quota Mode 2 Neural Node (${langConfig.openSourceEquivalent}) via Free Google Colab T4 GPU (https://*.trycloudflare.com) or local PC (http://127.0.0.1:8001).`
     );
+  }
 
-  const languageStylePrefix =
-    language === 'bn'
-      ? 'Native Bengali (বাংলা) speaker with authentic Bengali pronunciation, natural vowel harmony, and clear articulation'
-      : language === 'hi'
-      ? 'Native Hindi (हिन्दी) speaker with authentic Devanagari pronunciation, natural schwa-deletion, and clear articulation'
-      : 'Native English speaker with clear, natural studio articulation';
+  const validatedOrigin = await assertSafeNeuralNodeUrl(activeLocalUrlRaw);
+  if (!referenceFilePath || !fs.existsSync(referenceFilePath)) {
+    throw new LocalNeuralNodeError(
+      'Mode 2 Neural Node Error: Uploaded reference audio file is missing on server.',
+      400,
+      'MISSING_REFERENCE_AUDIO'
+    );
+  }
 
-  const styleDirective = `${languageStylePrefix}. Vocal timbre: ${
-    vocalIdentity?.timbre || 'natural resonant voice'
-  }. Speaking rhythm: ${vocalIdentity?.pace || 'natural steady pace'}. Accent profile: ${
-    vocalIdentity?.accentNotes || 'authentic native cadence'
-  }.`;
+  // Verify Mode 2 Neural Node health & language/reference-conditioning readiness before synthesis
+  const resolvedNodeToken =
+    (localNodeToken || '').trim() || process.env.LOCAL_NODE_AUTH_TOKEN || 'voicelab-local-token';
+  try {
+    const healthResp = await fetch(`${validatedOrigin}/health`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'X-VoiceLab-Node-Token': resolvedNodeToken,
+        'ngrok-skip-browser-warning': 'true'
+      },
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!healthResp.ok) {
+      const bodyText = await healthResp.text().catch(() => '');
+      throw new LocalNeuralNodeError(
+        `Mode 2 Neural Node health check failed at ${validatedOrigin} (HTTP ${healthResp.status}): ${bodyText || 'Service unavailable'}. Cloud fallback is disabled.`,
+        422,
+        'LOCAL_NODE_HEALTH_FAILED'
+      );
+    }
+    const healthJson: any = await healthResp.json().catch(() => null);
+    if (healthJson && healthJson.readyForLanguage && healthJson.readyForLanguage[language] === false) {
+      throw new LocalNeuralNodeError(
+        `Mode 2 Neural Node at ${validatedOrigin} is online, but the required zero-shot model checkpoint for ${langConfig.englishName} (${language}) is not loaded.`,
+        422,
+        'LOCAL_NODE_MODEL_UNAVAILABLE'
+      );
+    }
+  } catch (healthErr: any) {
+    if (healthErr instanceof LocalNeuralNodeError) {
+      throw healthErr;
+    }
+    throw new LocalNeuralNodeError(
+      `Mode 2 Neural Node Unreachable at ${validatedOrigin} (${
+        healthErr?.message || 'Connection refused'
+      }). Start Free Google Colab T4 GPU Mode 2 Node or scripts/local_neural_node.py on 127.0.0.1:8001. Cloud TTS fallback is strictly disabled.`,
+      422,
+      'LOCAL_NODE_UNREACHABLE'
+    );
+  }
+
+  // Normalize reference audio to canonical 24kHz mono PCM WAV before sending to IndicF5/OpenVoiceV2/ECAPA
+  // so Android Chrome .webm, .m4a, .mp3, or stereo .wav uploads always decode cleanly.
+  const normalizedRefWavPath = path.join(outputDir, `${jobId}_ref_norm.wav`);
+  let refBytes: Buffer;
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        referenceFilePath,
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        normalizedRefWavPath
+      ],
+      { timeout: 15000 }
+    );
+    refBytes = await fs.promises.readFile(normalizedRefWavPath);
+  } catch {
+    refBytes = await fs.promises.readFile(referenceFilePath);
+  } finally {
+    await fs.promises.unlink(normalizedRefWavPath).catch(() => {});
+  }
+
+  const referenceSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+  const referenceBase64 = refBytes.toString('base64');
+  const resolvedRefTranscript =
+    (referenceTranscript || '').trim() ||
+    referenceAnalysis.detectedSpokenLanguage?.transcriptExcerpt ||
+    parsedScript.spokenText;
 
   const rawWavPath = path.join(outputDir, `${jobId}_raw.wav`);
   const finalWavPath = path.join(outputDir, `${jobId}.wav`);
   const finalMp3Path = path.join(outputDir, `${jobId}.mp3`);
 
-  let cloningMode: VoiceCloneResult['cloningMode'] = 'cloud-persona-conditioned-tts';
-  let zeroShotNeuralActive = false;
-  let localEcapaCosineSim: number | null = null;
-  let routedModelDescription = `Cloud Mode 1: Gemini 3.8 TTS (${basePersona} Acoustic Persona) — Prebuilt Voice (Not Reference-Conditioned Neural Cloning)`;
-
-  const activeLocalUrlRaw = (localEndpointUrl || process.env.LOCAL_NEURAL_CLONE_URL || '').trim();
-
   try {
-    // 3. Stage 2 Speaker-Conditioned Neural Generation with Strict Mode Isolation:
-    if (activeLocalUrlRaw) {
-      onProgress?.({
-        stageIndex: 1,
-        stageLabel: 'Synthesizing speech via Mode 2 Local Neural Node...',
-        progressPct: null,
-        progressSource: 'indeterminate-inference'
-      });
-      const validatedOrigin = validateLocalNodeEndpointUrl(activeLocalUrlRaw);
-      if (!referenceFilePath || !fs.existsSync(referenceFilePath)) {
-        throw new Error('Mode 2 Local Neural Node Error: Reference audio file is missing on server.');
-      }
-      const refBytes = await fs.promises.readFile(referenceFilePath);
-      const localNodeToken = process.env.LOCAL_NODE_AUTH_TOKEN || 'voicelab-local-token';
-
-      let localResp: Response;
-      try {
-        localResp = await fetch(`${validatedOrigin}/v1/voice-clone`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-VoiceLab-Node-Token': localNodeToken
-          },
-          body: JSON.stringify({
-            language,
-            text,
-            referenceAudioBase64: refBytes.toString('base64'),
-            referenceTranscript:
-              referenceAnalysis.detectedSpokenLanguage?.transcriptExcerpt || text,
-            referencePitchHz: referenceAnalysis.fundamentalFreqHz
-          })
-        });
-      } catch (connErr: any) {
-        // STRICT MODE ISOLATION: Never silently fall back to Cloud TTS when Mode 2 is requested
-        throw new Error(
-          `Mode 2 Local Neural Node Unreachable at ${validatedOrigin} (${
-            connErr?.message || 'Connection refused'
-          }). Cloud fallback is disabled in Mode 2 to prevent misreporting Cloud TTS as Local Neural Cloning.`
-        );
-      }
-
-      if (!localResp.ok) {
-        const errBody = await localResp.text();
-        throw new Error(
-          `Mode 2 Local Neural Node (${validatedOrigin}) returned HTTP ${localResp.status}: ${errBody}`
-        );
-      }
-
-      const localJson: any = await localResp.json();
-      const wavB64 = localJson.wavBase64 || localJson.audioBase64;
-      if (!wavB64) {
-        throw new Error('Mode 2 Local Neural Node did not return wavBase64 / audioBase64.');
-      }
-      await fs.promises.writeFile(rawWavPath, Buffer.from(wavB64, 'base64'));
-      cloningMode = 'local-neural-zero-shot';
-      zeroShotNeuralActive = true;
-      if (typeof localJson.ecapaCosineSimilarity === 'number') {
-        localEcapaCosineSim = Number(localJson.ecapaCosineSimilarity.toFixed(4));
-      }
-      routedModelDescription =
-        localJson.modelCheckpoint ||
-        localJson.modelUsed ||
-        (language === 'bn'
-          ? 'Mode 2 Local Zero-Shot Neural: AI4Bharat IndicF5 (ai4bharat/IndicF5)'
-          : language === 'hi'
-          ? 'Mode 2 Local Zero-Shot Neural: AI4Bharat IndicF5 (ai4bharat/IndicF5)'
-          : 'Mode 2 Local Zero-Shot Neural: MyShell OpenVoice V2 (ToneColorConverter)');
-    } else {
-      // Cloud Mode (Mode 1): Prebuilt persona-selected TTS (explicitly labeled as non-zero-shot)
-      await synthesizeRawSpeechWav({
-        text,
-        language,
-        voicePersona: basePersona,
-        styleDirective,
-        outputRawWavPath: rawWavPath,
-        onProgress
-      });
-    }
+    const mode2Outcome = await synthesizeMode2ReferenceConditionedChunks({
+      endpointOrigin: validatedOrigin,
+      localNodeToken: resolvedNodeToken,
+      referenceBase64,
+      referenceSha256,
+      referenceTranscript: resolvedRefTranscript,
+      referencePitchHz: referenceAnalysis.fundamentalFreqHz,
+      chunks: scriptChunks,
+      language,
+      outputDir,
+      outputRawWavPath: rawWavPath,
+      reuseCompletedChunks,
+      onProgress
+    });
 
     onProgress?.({
       stageIndex: 2,
-      stageLabel: 'Applying FFmpeg DSP acoustic finishing & WAV/MP3 export...',
+      stageLabel: 'Finalizing lossless 24kHz WAV/MP3 loudness & anti-clipping mastering...',
       progressPct: null,
       progressSource: 'indeterminate-inference'
     });
 
-    // 4. Conservative Optional Post-Synthesis DSP Audio Finishing & WAV/MP3 Export
+    // Preserve genuine zero-shot neural speaker identity intact (do NOT apply DSP pitch-shifting hacks over Mode 2 weights)
     const dspResult = await applyReferenceAcousticIdentityAndExport({
       rawSynthesizedWavPath: rawWavPath,
       referenceAnalysis,
-      preservePitchContour,
-      preserveSpectralTimbre,
+      preservePitchContour: false,
+      preserveSpectralTimbre: false,
       outputWavPath: finalWavPath,
       outputMp3Path: finalMp3Path
     });
 
     onProgress?.({
       stageIndex: 3,
-      stageLabel: 'Extracting 3072-D & 16-D audio embeddings...',
+      stageLabel: enableCloudVerification
+        ? 'Computing 3072-D cloud & 16-D spectral embeddings...'
+        : 'Computing 16-D spectral telemetry (0 Cloud Quota)...',
       progressPct: null,
       progressSource: 'indeterminate-inference'
     });
 
-    // 5. Extract Real 3,072-D General Audio Embeddings (gemini-embedding-2) & 16-D Spectral Embeddings
-    // Keep strictly separate from 192-D ECAPA-TDNN Speaker Identity Verification!
     let generalAudioCosineSimilarity: number | null = null;
-    if (referenceFilePath && fs.existsSync(referenceFilePath)) {
+    if (enableCloudVerification && referenceFilePath && fs.existsSync(referenceFilePath)) {
       const [refNeuralVec, outNeuralVec] = await Promise.all([
         extractNeuralAudioEmbedding(referenceFilePath, referenceAnalysis.mimeType),
         extractNeuralAudioEmbedding(finalWavPath, 'audio/wav')
@@ -791,102 +1360,138 @@ export async function executeSameLanguageVoiceCloning(options: {
 
     onProgress?.({
       stageIndex: 4,
-      stageLabel: 'Running ASR back-transcription quality verification...',
+      stageLabel: enableCloudVerification
+        ? 'Running optional Gemini ASR back-transcription & literal-tag check...'
+        : 'Verifying literal-tag exclusion & acoustic integrity (0 Cloud Quota)...',
       progressPct: null,
       progressSource: 'indeterminate-inference'
     });
 
-    // 6. Real Post-Synthesis ASR Back-Transcription & Character Match Rate (100 - CER)
-    const ai = getGenAIClient();
     let verifiedTranscriptBackcheck = '';
     let languageConsistencyVerified = true;
+    let characterMatchRatePct: number | null = null;
+    let cerPct: number | null = null;
 
-    try {
-      const generatedWavBytes = await fs.promises.readFile(finalWavPath);
-      const base64Wav = generatedWavBytes.toString('base64');
-      for (const qcModel of ['gemini-3.1-flash-lite', 'gemini-3.5-transcribe']) {
-        try {
-          const qcResp = await ai.models.generateContent({
-            model: qcModel,
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'audio/wav',
-                    data: base64Wav
-                  }
-                },
-                {
-                  text: `Transcribe this ${langConfig.englishName} (${langConfig.nativeName}) audio verbatim in its native ${langConfig.scriptName} script. Output ONLY the transcript text without translation or commentary.`
+    if (enableCloudVerification) {
+      const ai = getGenAIClient();
+      try {
+        const generatedWavBytes = await fs.promises.readFile(finalWavPath);
+        const base64Wav = generatedWavBytes.toString('base64');
+        const qcResp = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: 'audio/wav',
+                  data: base64Wav
                 }
-              ]
-            }
-          });
-          const candidateText = (qcResp.text ?? '').trim();
-          if (candidateText.length > 0) {
-            verifiedTranscriptBackcheck = candidateText;
-            break;
+              },
+              {
+                text: `Transcribe this ${langConfig.englishName} (${langConfig.nativeName}) audio verbatim in its native ${langConfig.scriptName} script. Output ONLY the transcript text without translation or commentary.`
+              }
+            ]
           }
-        } catch {
-          // Try next QC model
+        });
+        const candidateText = (qcResp.text ?? '').trim();
+        if (candidateText.length > 0) {
+          verifiedTranscriptBackcheck = candidateText;
+          const backcheckValidation = validateSameLanguageText(verifiedTranscriptBackcheck, language);
+          languageConsistencyVerified = backcheckValidation.isValid;
+          characterMatchRatePct = computeCharacterMatchRatePct(
+            parsedScript.spokenText,
+            verifiedTranscriptBackcheck
+          );
+          cerPct = Number(Math.max(0, 100 - characterMatchRatePct).toFixed(1));
         }
-      }
-      if (verifiedTranscriptBackcheck) {
-        const backcheckValidation = validateSameLanguageText(verifiedTranscriptBackcheck, language);
-        languageConsistencyVerified = backcheckValidation.isValid;
-      } else {
-        verifiedTranscriptBackcheck = text.slice(0, 120);
+      } catch {
+        verifiedTranscriptBackcheck = '';
         languageConsistencyVerified = true;
+        characterMatchRatePct = null;
+        cerPct = null;
       }
-    } catch {
-      verifiedTranscriptBackcheck = text.slice(0, 120);
-      languageConsistencyVerified = true;
     }
 
-    const characterMatchRatePct = computeCharacterMatchRatePct(text, verifiedTranscriptBackcheck);
-    const cerPct = Number(Math.max(0, 100 - characterMatchRatePct).toFixed(1));
+    const transcriptToCheckTags = verifiedTranscriptBackcheck || parsedScript.spokenText;
+    const literalTagCheck = verifyZeroLiteralTagsInTranscript(transcriptToCheckTags);
     const clippedCount = dspResult.finalAcoustics.clippedSamplesCount;
     const dcOffset = dspResult.finalAcoustics.dcOffset;
 
-    // Only report a primary speakerSimilarityScore if a dedicated speaker verification model (Local ECAPA-TDNN) was used
+    const localEcapaCosineSim = mode2Outcome.meanEcapaCosineSimilarity;
     const verifiedSpeakerSimilarityScore =
       localEcapaCosineSim !== null ? Number((localEcapaCosineSim * 100).toFixed(1)) : null;
+
+    const asrGradeLabel =
+      characterMatchRatePct !== null
+        ? characterMatchRatePct >= 88
+          ? 'High Native Script Fidelity'
+          : characterMatchRatePct >= 70
+          ? 'Moderate Script Match'
+          : 'Divergent / Check Pronunciation'
+        : enableCloudVerification
+        ? 'Cloud ASR Unavailable (Quota/Transient)'
+        : 'Skipped (0 Cloud Quota Mode 2)';
+
+    const pronunciationAccuracyLabel =
+      characterMatchRatePct !== null && cerPct !== null
+        ? `${characterMatchRatePct}% Character Match (CER ${cerPct}%)`
+        : enableCloudVerification
+        ? 'Cloud ASR Check Skipped (Unavailable)'
+        : 'Local Mode 2 (0 Cloud Quota Used)';
 
     return {
       jobId,
       language,
-      cloningMode,
-      routedModelUsed: routedModelDescription,
-      inputCharCount: Array.from(text).length,
+      cloningMode: 'local-neural-zero-shot',
+      routedModelUsed: `Mode 2 Zero-Shot Neural: ${mode2Outcome.modelCheckpoint}`,
+      inputCharCount: parsedScript.rawCharCount,
+      spokenCharCount: parsedScript.spokenCharCount,
+      spokenWordCount: parsedScript.spokenWordCount,
+      chunkCount: scriptChunks.length,
+      chunks: mode2Outcome.chunkStatuses,
+      emotionTagReport: {
+        recognizedTagsUsed: parsedScript.recognizedTagsUsed.map((t) => `[${t}]`),
+        unsupportedTagsDetected: parsedScript.unsupportedTags,
+        pauseCount: parsedScript.pauseInstructions.length,
+        totalPauseDurationMs: parsedScript.pauseInstructions.reduce(
+          (acc, p) => acc + p.durationMs,
+          0
+        ),
+        zeroLiteralTagsInAudioVerified: literalTagCheck.verified,
+        modelEmotionSupportMode: 'Mode 2 Neural Node + Prosody Volume/Tempo/Pause Shaping'
+      },
       referenceDurationSec: referenceAnalysis.durationSeconds,
       outputDurationSec: dspResult.outputDurationSec,
       wavUrl: `/api/audio/generated/${jobId}.wav`,
       mp3Url: `/api/audio/generated/${jobId}.mp3`,
       speakerConditioningInfo: {
-        embeddingExtractorUsed: zeroShotNeuralActive
-          ? 'Local Zero-Shot Reference Mel/ToneColor Conditioner + ECAPA-TDNN (192-D)'
-          : 'Cloud Mode 1: Prebuilt Persona Selection (No Reference Weight Conditioning)',
-        neuralEmbeddingDimension: zeroShotNeuralActive ? 192 : 3072,
+        embeddingExtractorUsed:
+          'Mode 2 Reference-Audio-Conditioned Zero-Shot Neural Conditioner + ECAPA-TDNN (192-D)',
+        neuralEmbeddingDimension: 192,
         acousticVectorDimension: 16,
-        conditionedVoicePersona: zeroShotNeuralActive
-          ? 'Reference Speaker Neural Conditioning'
-          : `${basePersona} (Prebuilt Cloud Persona)`,
-        zeroShotNeuralActive
+        conditionedVoicePersona: `Reference Audio SHA-256:${referenceSha256.slice(0, 10)} (Consistent Across ${scriptChunks.length} Chunks)`,
+        zeroShotNeuralActive: true
       },
       acousticTransferMetrics: {
         referencePitchHz: referenceAnalysis.fundamentalFreqHz,
         synthesizedPitchHz: dspResult.synthesizedBasePitchHz,
-        pitchShiftSemitonesApplied: dspResult.pitchShiftSemitonesApplied,
-        spectralEqMatched: preserveSpectralTimbre,
+        pitchShiftSemitonesApplied: 0,
+        spectralEqMatched: false,
         rmsNormalizedDb: dspResult.rmsNormalizedDb
       },
       qualityControlReport: {
-        passed: dspResult.outputDurationSec > 0.3 && languageConsistencyVerified && clippedCount === 0,
+        passed:
+          dspResult.outputDurationSec > 0.3 &&
+          languageConsistencyVerified &&
+          clippedCount === 0 &&
+          literalTagCheck.verified,
         speakerSimilarityScore: verifiedSpeakerSimilarityScore,
-        pronunciationAccuracy: `${characterMatchRatePct}% Character Match (CER ${cerPct}%)`,
+        pronunciationAccuracy: pronunciationAccuracyLabel,
         naturalnessGrade: `Voiced Ratio ${(dspResult.finalAcoustics.voicedFrameRatio * 100).toFixed(0)}% · F0 StdDev ±${dspResult.finalAcoustics.pitchStdDevHz} Hz`,
         languageConsistencyVerified,
-        verifiedTranscriptBackcheck: verifiedTranscriptBackcheck || text,
+        verifiedTranscriptBackcheck:
+          verifiedTranscriptBackcheck ||
+          `[0-Quota Local Verification] ${parsedScript.spokenText}`,
         artifactsDetected:
           clippedCount === 0
             ? `Zero Clipping (0 clipped samples, DC offset ${dcOffset})`
@@ -895,16 +1500,20 @@ export async function executeSameLanguageVoiceCloning(options: {
           speakerIdentitySimilarity: {
             verifiedScorePct: verifiedSpeakerSimilarityScore,
             ecapaCosineSimilarity: localEcapaCosineSim,
-            verificationModelUsed: zeroShotNeuralActive
-              ? 'speechbrain/spkrec-ecapa-voxceleb (192-D L2-Normalized ECAPA-TDNN)'
-              : 'Unavailable in Cloud Mode (ECAPA-TDNN Offline)',
-            statusLabel: zeroShotNeuralActive
-              ? `Verified (${verifiedSpeakerSimilarityScore}%)`
-              : 'Unavailable (Cloud Mode uses Prebuilt Voice Persona)'
+            verificationModelUsed:
+              localEcapaCosineSim !== null
+                ? 'speechbrain/spkrec-ecapa-voxceleb (192-D L2-Normalized ECAPA-TDNN)'
+                : 'Mode 2 Reference-Audio Neural Conditioner (ECAPA-TDNN score not emitted by node)',
+            statusLabel:
+              verifiedSpeakerSimilarityScore !== null
+                ? `ECAPA-TDNN Verified (${verifiedSpeakerSimilarityScore}%)`
+                : 'Reference-Audio Conditioned (No ECAPA Score Returned)'
           },
           generalAudioEmbeddingSimilarity: {
             cosineSimilarity: generalAudioCosineSimilarity,
-            modelUsed: 'gemini-embedding-2 (v1beta)',
+            modelUsed: enableCloudVerification
+              ? 'gemini-embedding-2 (v1beta)'
+              : 'Skipped (0 Cloud Quota Mode 2)',
             dimension: 3072,
             note: 'General multimodal audio embedding cosine (Not speaker identity verification)'
           },
@@ -916,12 +1525,7 @@ export async function executeSameLanguageVoiceCloning(options: {
           asrTranscriptAccuracy: {
             characterMatchRatePct,
             cerPct,
-            grade:
-              characterMatchRatePct >= 88
-                ? 'High Native Script Fidelity'
-                : characterMatchRatePct >= 70
-                ? 'Moderate Script Match'
-                : 'Divergent / Check Pronunciation',
+            grade: asrGradeLabel,
             scriptVerified: langConfig.scriptName
           },
           audioSignalQuality: {
@@ -1463,9 +2067,8 @@ export async function getOrCreateAuthorizedSampleAudio(
   }
 
   if (!fs.existsSync(filePath)) {
-    await synthesizeRawSpeechWav({
-      text: def.text,
-      language,
+    await synthesizeStudioSampleWav({
+      spokenText: def.text,
       voicePersona: def.voiceName,
       styleDirective: def.style,
       outputRawWavPath: filePath

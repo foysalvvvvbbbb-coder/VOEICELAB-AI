@@ -1,4 +1,5 @@
 import type { CloningLanguageCode, CloningLanguageConfig, ModelResearchEntry } from '../types/voicelab.ts';
+import { parseEmotionTaggedScript } from '../utils/emotionTagParser.ts';
 
 export const CLONING_LANGUAGES: Record<CloningLanguageCode, CloningLanguageConfig> = {
   bn: {
@@ -14,15 +15,15 @@ export const CLONING_LANGUAGES: Record<CloningLanguageCode, CloningLanguageConfi
     sampleTexts: [
       {
         label: 'সংবাদ পাঠ (News Broadcast)',
-        text: 'আজকের বিশেষ সংবাদে আপনাদের স্বাগতম। কৃত্রিম বুদ্ধিমত্তা ও আধুনিক অডিও প্রযুক্তির মাধ্যমে বাংলা ভাষায় কণ্ঠস্বর সংরক্ষণ ও গবেষণা নতুন দিগন্ত উন্মোচন করেছে।'
+        text: '[serious] আজকের বিশেষ সংবাদে আপনাদের স্বাগতম। [pause] [confidently] কৃত্রিম বুদ্ধিমত্তা ও আধুনিক অডিও প্রযুক্তির মাধ্যমে বাংলা ভাষায় কণ্ঠস্বর সংরক্ষণ ও গবেষণা নতুন দিগন্ত উন্মোচন করেছে।'
+      },
+      {
+        label: 'আবেগপূর্ণ বর্ণনা (Emotional Story)',
+        text: '[sad] শ্রাবণের মেঘলা বিকেলে নদীর ঘাটে দাঁড়িয়ে পুরনো দিনের কথা মনে পড়ছিল। [pause] [softly] বাতাসে ভেসে আসছিল দূর গ্রামের বাঁশির করুণ সুর। [pause] [happy] কিন্তু ভোরের আলো ফুটতেই আবার নতুন আশায় বুক বাঁধল সবাই!'
       },
       {
         label: 'তথ্যচিত্র বর্ণনা (Documentary Narration)',
-        text: 'বাংলার নদী, প্রকৃতি এবং মানুষের কণ্ঠস্বরের নিজস্ব ছন্দ ও মাধুর্য রয়েছে। সঠিক উচ্চারণ এবং স্বাভাবিক স্বরভঙ্গি বজায় রাখা আমাদের প্রধান লক্ষ্য।'
-      },
-      {
-        label: 'শিক্ষামূলক পাঠ (Educational Module)',
-        text: 'বিজ্ঞান ও প্রযুক্তির এই যুগে মাতৃভাষায় স্পষ্ট ও নির্ভুল অডিও কন্টেন্ট তৈরি করা শিক্ষার্থীদের জন্য অত্যন্ত সহায়ক।'
+        text: '[calm] বাংলার নদী, প্রকৃতি এবং মানুষের কণ্ঠস্বরের নিজস্ব ছন্দ ও মাধুর্য রয়েছে। [confidently] সঠিক উচ্চারণ এবং স্বাভাবিক স্বরভঙ্গি বজায় রাখা আমাদের প্রধান লক্ষ্য।'
       }
     ]
   },
@@ -39,15 +40,15 @@ export const CLONING_LANGUAGES: Record<CloningLanguageCode, CloningLanguageConfi
     sampleTexts: [
       {
         label: 'समाचार प्रसारण (News Bulletin)',
-        text: 'नमस्कार, आज के मुख्य समाचारों में आपका स्वागत है। आधुनिक ध्वनि प्रौद्योगिकी और कृत्रिम बुद्धिमत्ता ने भारतीय भाषाओं में संवाद को एक नया आयाम दिया है।'
+        text: '[serious] नमस्कार, आज के मुख्य समाचारों में आपका स्वागत है। [pause] [confidently] आधुनिक ध्वनि प्रौद्योगिकी और कृत्रिम बुद्धिमत्ता ने भारतीय भाषाओं में संवाद को एक नया आयाम दिया है।'
+      },
+      {
+        label: 'भावुक संवाद (Emotional Dialogue)',
+        text: '[sad] उस शाम बारिश की बूँदों में एक अजीब सी उदासी थी। [pause] [softly] हर कोई चुपचाप आने वाले कल की प्रतीक्षा कर रहा था। [pause] [excited] तभी अचानक उम्मीद की एक नई किरण दिखाई दी!'
       },
       {
         label: 'वृत्तचित्र वाचन (Documentary Voiceover)',
-        text: 'आवाज़ की पहचान केवल शब्दों से नहीं, बल्कि उसके उतार-चढ़ाव, लय और प्राकृतिक उच्चारण से होती है। यह प्रणाली मूल वक्ता की शैली को सुरक्षित रखती है।'
-      },
-      {
-        label: 'शैक्षिक संवाद (Educational Narration)',
-        text: 'स्पष्ट उच्चारण और स्वाभाविक गति के साथ हिन्दी भाषा में उच्च गुणवत्ता वाली ऑडियो रिकॉर्डिंग तैयार करना अब अत्यंत सरल और सटीक है।'
+        text: '[calm] आवाज़ की पहचान केवल शब्दों से नहीं, बल्कि उसके उतार-चढ़ाव, लय और प्राकृतिक उच्चारण से होती है। [confidently] यह प्रणाली मूल वक्ता की शैली को सुरक्षित रखती है।'
       }
     ]
   },
@@ -64,15 +65,15 @@ export const CLONING_LANGUAGES: Record<CloningLanguageCode, CloningLanguageConfi
     sampleTexts: [
       {
         label: 'Technical Keynote',
-        text: 'Welcome to VoiceLab AI. Every speaker possesses a distinct acoustic fingerprint defined by fundamental frequency, harmonic warmth, and natural cadence.'
+        text: '[confidently] Welcome to VoiceLab AI. [pause] [calm] Every speaker possesses a distinct acoustic fingerprint defined by fundamental frequency, harmonic warmth, and natural cadence.'
+      },
+      {
+        label: 'Dramatic Monologue',
+        text: '[sad] For years, the old lighthouse stood silent against the winter storm. [pause] [whispering] Nobody believed the signal would ever shine again. [pause] [excited] Yet tonight, the beacon blazed across the harbour!'
       },
       {
         label: 'Documentary Narration',
-        text: 'In broadcast audio engineering, preserving vocal identity requires strict same-language phonetic alignment without artificial cross-lingual distortion.'
-      },
-      {
-        label: 'Studio Audiobook',
-        text: 'The morning mist settled quietly over the harbor as the research vessel prepared its acoustic sensors for the deep ocean survey.'
+        text: '[serious] In broadcast audio engineering, preserving vocal identity requires strict same-language phonetic alignment without artificial cross-lingual distortion.'
       }
     ]
   }
@@ -89,13 +90,15 @@ export interface ScriptValidationResult {
 
 /**
  * Validates that the generation text strictly matches the selected reference voice language.
- * Prevents accidental or forced cross-language voice cloning.
+ * Strips bracketed emotion/delivery/timing tags (e.g. [sad], [happy], [pause]) BEFORE counting
+ * script characters so English tag names never trigger false cross-language errors on Bengali or Hindi text.
  */
 export function validateSameLanguageText(
   text: string,
   expectedLang: CloningLanguageCode
 ): ScriptValidationResult {
-  const trimmed = text.trim();
+  const parsed = parseEmotionTaggedScript(text);
+  const trimmed = parsed.spokenText.trim();
   if (!trimmed) {
     return {
       isValid: false,
@@ -103,7 +106,7 @@ export function validateSameLanguageText(
       bengaliCharCount: 0,
       hindiCharCount: 0,
       latinCharCount: 0,
-      errorMessage: 'Please enter text in the selected language before generating speech.'
+      errorMessage: 'Please enter spoken text in the selected language (tags alone cannot be synthesized).'
     };
   }
 
@@ -162,8 +165,8 @@ export function validateSameLanguageText(
         latinCharCount,
         errorMessage:
           hindiCharCount > 0
-            ? 'Cross-Language Blocked: Bengali (বাংলা) reference voice selected, but Hindi (Devanagari) script was detected in the text input. Same-language voice cloning requires Bengali script.'
-            : 'Cross-Language Blocked: Bengali (বাংলা) reference voice selected, but English (Latin) text was detected. Never mix reference voice and text languages.'
+            ? 'Cross-Language Blocked: Bengali (বাংলা) reference voice selected, but Hindi (Devanagari) script was detected in the spoken text. Same-language voice cloning requires Bengali script.'
+            : 'Cross-Language Blocked: Bengali (বাংলা) reference voice selected, but English (Latin) words were detected in the spoken text. Never mix reference voice and text languages.'
       };
     }
     if (bengaliCharCount < 2) {
@@ -188,8 +191,8 @@ export function validateSameLanguageText(
         latinCharCount,
         errorMessage:
           bengaliCharCount > 0
-            ? 'Cross-Language Blocked: Hindi (हिन्दी) reference voice selected, but Bengali (বাংলা) script was detected in the text input. Same-language voice cloning requires Hindi Devanagari script.'
-            : 'Cross-Language Blocked: Hindi (हिन्दी) reference voice selected, but English (Latin) text was detected. Never mix reference voice and text languages.'
+            ? 'Cross-Language Blocked: Hindi (हिन्दी) reference voice selected, but Bengali (বাংলা) script was detected in the spoken text. Same-language voice cloning requires Hindi Devanagari script.'
+            : 'Cross-Language Blocked: Hindi (हिन्दी) reference voice selected, but English (Latin) words were detected in the spoken text. Never mix reference voice and text languages.'
       };
     }
     if (hindiCharCount < 2) {
@@ -214,7 +217,7 @@ export function validateSameLanguageText(
         latinCharCount,
         errorMessage: `Cross-Language Blocked: English reference voice selected, but ${
           bengaliCharCount > 0 ? 'Bengali (বাংলা)' : 'Hindi (हिन्दी)'
-        } script was detected in the text input. Same-language voice cloning requires English text.`
+        } script was detected in the spoken text. Same-language voice cloning requires English text.`
       };
     }
   }

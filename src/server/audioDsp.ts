@@ -362,27 +362,39 @@ export async function inspectAndValidateAudioFile(
  * Optional post-synthesis DSP audio finishing (F0 register alignment, parametric EQ warmth, -16 LUFS normalization)
  * and WAV/MP3 export. Explicitly separated from neural speech synthesis.
  */
+export interface ChunkPauseTiming {
+  leadingPauseMs?: number;
+  trailingPauseMs?: number;
+}
+
 /**
  * Concatenates multiple 24kHz mono WAV sentence chunks into a single continuous WAV file
- * with 6ms zero-crossing linear fade-in/fade-out and a natural 180ms inter-sentence pause
- * to eliminate boundary clicks and preserve natural sentence cadence on long texts.
+ * with 6ms zero-crossing linear fade-in/fade-out, natural 180ms inter-sentence pause,
+ * and exact millisecond support for explicit [pause] instructions at chunk boundaries.
  */
 export async function concatenateWavChunksWithCrossfade(
   chunkWavPaths: string[],
   outputWavPath: string,
-  interSentencePauseMs = 180
+  interSentencePauseMs = 180,
+  perChunkPauses?: ChunkPauseTiming[]
 ): Promise<void> {
   if (chunkWavPaths.length === 0) {
     throw new Error('No audio chunks provided for concatenation.');
   }
-  if (chunkWavPaths.length === 1) {
+
+  const hasExplicitPauses = Boolean(
+    perChunkPauses &&
+      perChunkPauses.some((p) => (p.leadingPauseMs || 0) > 0 || (p.trailingPauseMs || 0) > 0)
+  );
+
+  if (chunkWavPaths.length === 1 && !hasExplicitPauses) {
     await fs.promises.copyFile(chunkWavPaths[0], outputWavPath);
     return;
   }
 
   const sampleRate = 24000;
   const fadeSamples = Math.round((sampleRate * 6) / 1000); // 6ms anti-click fade (144 samples)
-  const pauseSamples = Math.round((sampleRate * interSentencePauseMs) / 1000);
+  const defaultPauseSamples = Math.round((sampleRate * interSentencePauseMs) / 1000);
   const pcmBuffers: Buffer[] = [];
 
   for (let idx = 0; idx < chunkWavPaths.length; idx++) {
@@ -436,9 +448,35 @@ export async function concatenateWavChunksWithCrossfade(
         trimmedBuf.writeInt16LE(Math.max(-32768, Math.min(32767, sOut)), outIdx * 2);
       }
 
+      // Leading explicit [pause] on the very first chunk
+      if (idx === 0) {
+        const leadMs = perChunkPauses?.[0]?.leadingPauseMs || 0;
+        if (leadMs > 0) {
+          const leadSamples = Math.round((sampleRate * leadMs) / 1000);
+          pcmBuffers.push(Buffer.alloc(leadSamples * 2, 0));
+        }
+      }
+
       pcmBuffers.push(trimmedBuf);
-      if (idx < chunkWavPaths.length - 1 && pauseSamples > 0) {
-        pcmBuffers.push(Buffer.alloc(pauseSamples * 2, 0));
+
+      if (idx < chunkWavPaths.length - 1) {
+        const currTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
+        const nextLeadMs = perChunkPauses?.[idx + 1]?.leadingPauseMs || 0;
+        const explicitBoundaryMs = currTrailMs + nextLeadMs;
+        const effectivePauseSamples =
+          explicitBoundaryMs > 0
+            ? Math.round((sampleRate * explicitBoundaryMs) / 1000)
+            : defaultPauseSamples;
+        if (effectivePauseSamples > 0) {
+          pcmBuffers.push(Buffer.alloc(effectivePauseSamples * 2, 0));
+        }
+      } else {
+        // Trailing explicit [pause] on the final chunk
+        const finalTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
+        if (finalTrailMs > 0) {
+          const trailSamples = Math.round((sampleRate * finalTrailMs) / 1000);
+          pcmBuffers.push(Buffer.alloc(trailSamples * 2, 0));
+        }
       }
     } finally {
       await fs.promises.unlink(rawPath).catch(() => {});

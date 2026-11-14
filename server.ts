@@ -11,9 +11,12 @@ import type { AudioSignalAnalysis, CloningLanguageCode } from './src/types/voice
 import { inspectAndValidateAudioFile } from './src/server/audioDsp.ts';
 import {
   analyzeReferenceVoiceLanguageAndIdentity,
+  assertSafeNeuralNodeUrl,
   executeMultilingualSrtPipeline,
   executeSameLanguageVoiceCloning,
+  extractQuotaExhaustedInfo,
   getOrCreateAuthorizedSampleAudio,
+  QuotaExhaustedError,
   resolveRuntimeGeminiApiKey
 } from './src/server/aiPipelines.ts';
 
@@ -845,7 +848,7 @@ async function startServer() {
         sessionSecretSource: SESSION_CONFIG.source,
         sessionSecretEntropyBits: SESSION_CONFIG.entropyBits,
         apiRoutingMode: 'same-origin-relative (/api/*)',
-        localNeuralNodeMode: 'loopback-on-demand (127.0.0.1 / localhost)',
+        localNeuralNodeMode: 'loopback-or-https-tunnel (127.0.0.1 / Colab T4 / Kaggle GPU)',
         sameLanguageCloningLanguages: ['bn', 'hi', 'en'],
         multilingualSrtTranscription: true
       },
@@ -970,6 +973,9 @@ async function startServer() {
 
       res.status(200).type('application/json').json({ analysis });
     } catch (err: any) {
+      const quotaInfo = extractQuotaExhaustedInfo(err);
+      const status =
+        err instanceof QuotaExhaustedError || quotaInfo.isQuotaExhausted ? 429 : 400;
       emitServerOperationProgress(operationId, {
         stageIndex: 1,
         stageLabel: err?.message || 'Failed to load sample reference',
@@ -977,8 +983,10 @@ async function startServer() {
         progressSource: 'indeterminate-inference',
         status: 'failed'
       });
-      res.status(400).type('application/json').json({
-        error: err?.message || 'Failed to prepare authorized sample reference recording.'
+      res.status(status).type('application/json').json({
+        error: err?.message || 'Failed to prepare authorized sample reference recording.',
+        code: status === 429 ? 'RESOURCE_EXHAUSTED' : 'SAMPLE_LOAD_FAILED',
+        retryAfterText: err?.retryAfterText || quotaInfo.retryAfterText
       });
     }
   });
@@ -1149,6 +1157,66 @@ async function startServer() {
     fs.createReadStream(fullPath).pipe(res);
   });
 
+  // 6b. Check Mode 2 Zero-Shot Neural Node Readiness (Loopback or SSRF-guarded HTTPS GPU tunnel)
+  app.post(
+    '/api/voice-clone/node-health',
+    requireAuthenticatedSession,
+    async (req, res) => {
+      try {
+        const rawUrl = String(
+          req.body?.localEndpointUrl || process.env.LOCAL_NEURAL_CLONE_URL || ''
+        ).trim();
+        if (!rawUrl) {
+          res.status(200).type('application/json').json({
+            configured: false,
+            reachable: false,
+            error: 'No Mode 2 Neural Node URL configured.'
+          });
+          return;
+        }
+        const origin = await assertSafeNeuralNodeUrl(rawUrl);
+        const rawToken =
+          typeof req.body?.localNodeToken === 'string' ? req.body.localNodeToken.trim() : '';
+        const token = rawToken || process.env.LOCAL_NODE_AUTH_TOKEN || 'voicelab-local-token';
+        const resp = await fetch(`${origin}/health`, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+            'X-VoiceLab-Node-Token': token,
+            'ngrok-skip-browser-warning': 'true'
+          },
+          signal: AbortSignal.timeout(7000)
+        });
+        const bodyText = await resp.text();
+        let parsed: any = null;
+        try {
+          parsed = bodyText ? JSON.parse(bodyText) : null;
+        } catch {
+          parsed = null;
+        }
+        res.status(200).type('application/json').json({
+          configured: true,
+          origin,
+          reachable: resp.ok,
+          httpStatus: resp.status,
+          health: parsed,
+          error: resp.ok
+            ? undefined
+            : parsed?.detail ||
+              parsed?.error ||
+              bodyText ||
+              `Node responded with HTTP ${resp.status}`
+        });
+      } catch (err: any) {
+        res.status(422).type('application/json').json({
+          configured: true,
+          reachable: false,
+          error: err?.message || 'Mode 2 Neural Node unreachable.'
+        });
+      }
+    }
+  );
+
   // 7. WORKSPACE A — Same-Language AI Voice Cloning Generation
   app.post(
     '/api/voice-clone/generate',
@@ -1160,10 +1228,14 @@ async function startServer() {
           referenceFileId,
           language,
           text,
-          preservePitchContour = false,
-          preserveSpectralTimbre = false,
+          referenceTranscript,
+          preservePitchContour = true,
+          preserveSpectralTimbre = true,
+          reuseCompletedChunks = true,
           consentConfirmed = false,
-          localEndpointUrl
+          localEndpointUrl,
+          localNodeToken,
+          enableCloudVerification = false
         } = req.body || {};
 
         if (!consentConfirmed) {
@@ -1200,10 +1272,15 @@ async function startServer() {
           referenceAnalysis: refEntry.analysis,
           language: language as CloningLanguageCode,
           text: String(text || ''),
+          referenceTranscript:
+            typeof referenceTranscript === 'string' ? referenceTranscript : undefined,
           preservePitchContour: Boolean(preservePitchContour),
           preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
+          reuseCompletedChunks: Boolean(reuseCompletedChunks),
           outputDir: GENERATED_DIR,
           localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
+          localNodeToken: typeof localNodeToken === 'string' ? localNodeToken : undefined,
+          enableCloudVerification: Boolean(enableCloudVerification),
           onProgress: (ev) => {
             emitServerOperationProgress(operationId, {
               ...ev,
@@ -1223,6 +1300,15 @@ async function startServer() {
         res.status(200).type('application/json').json({ result });
       } catch (err: any) {
         const operationId = extractOperationIdFromReq(req);
+        const quotaInfo = extractQuotaExhaustedInfo(err);
+        const rawStatus =
+          typeof err?.httpStatus === 'number'
+            ? err.httpStatus
+            : quotaInfo.isQuotaExhausted
+            ? 429
+            : 400;
+        const safeStatus = rawStatus === 403 ? 401 : rawStatus;
+
         emitServerOperationProgress(operationId, {
           stageIndex: 1,
           stageLabel: err?.message || 'Voice cloning failed',
@@ -1230,8 +1316,10 @@ async function startServer() {
           progressSource: 'indeterminate-inference',
           status: 'failed'
         });
-        res.status(400).type('application/json').json({
-          error: err?.message || 'Voice cloning pipeline failed.'
+        res.status(safeStatus).type('application/json').json({
+          error: err?.message || 'Voice cloning pipeline failed.',
+          code: err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED'),
+          retryAfterText: err?.retryAfterText || quotaInfo.retryAfterText
         });
       }
     }

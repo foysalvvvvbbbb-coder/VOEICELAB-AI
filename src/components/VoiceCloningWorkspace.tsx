@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Upload,
   Mic,
@@ -14,7 +14,15 @@ import {
   Lock,
   ChevronDown,
   ChevronUp,
-  Cpu
+  Cpu,
+  Sparkles,
+  Maximize2,
+  Minimize2,
+  X,
+  Layers,
+  Copy,
+  Check,
+  Terminal
 } from 'lucide-react';
 import {
   AudioSignalAnalysis,
@@ -25,6 +33,15 @@ import {
   CLONING_LANGUAGES,
   validateSameLanguageText
 } from '../data/researchAndConfigs';
+import { buildColabOneCellSetupScript } from '../data/colabSetupScript';
+import {
+  ALL_RECOGNIZED_TAG_LIST,
+  buildEmotionPreservingChunks,
+  MAX_SUPPORTED_CLONING_SCRIPT_CHARS,
+  parseEmotionTaggedScript,
+  RECOGNIZED_EMOTION_TAGS,
+  tokenizeScriptForLiveEditor
+} from '../utils/emotionTagParser';
 import { fetchApiJson } from '../utils/apiClient';
 import {
   completeOperation,
@@ -47,11 +64,18 @@ interface VoiceCloningWorkspaceProps {
 
 const PIPELINE_A_STEPS = [
   '01. Reference Audio Validation & Signal Check',
-  '02. Speaker Embedding & Acoustic Extraction',
-  '03. Same-Language Script & Identity Verification',
-  '04. Neural Speech Synthesis',
-  '05. Quality Control & WAV/MP3 Export'
+  '02. Emotion Tag Parsing & Same-Language Script Guard',
+  '03. Reference Speaker Identity & Emotion-Scoped Chunk Synthesis',
+  '04. Reference F0 & 16-Band Spectral Acoustic Transfer',
+  '05. ASR Back-Transcription & Zero-Literal-Tag Verification'
 ];
+
+function splitPreviewSentences(text: string): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const rawParts = clean.split(/(?<=[.!?।॥\n])\s+/u);
+  return rawParts.map((s) => s.trim()).filter(Boolean);
+}
 
 export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   onActivityComplete
@@ -65,20 +89,33 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   const [inputText, setInputText] = useState<string>(
     CLONING_LANGUAGES.bn.sampleTexts[0].text
   );
-  const [preservePitchContour, setPreservePitchContour] = useState(false);
-  const [preserveSpectralTimbre, setPreserveSpectralTimbre] = useState(false);
+  const preservePitchContour = false;
+  const preserveSpectralTimbre = false;
   const [localEndpointUrl, setLocalEndpointUrl] = useState<string>('');
+  const [localNodeToken, setLocalNodeToken] = useState<string>('voicelab-local-token');
+  const [enableCloudVerification, setEnableCloudVerification] = useState<boolean>(false);
+  const [showColabGuide, setShowColabGuide] = useState<boolean>(false);
+  const [copiedColabScript, setCopiedColabScript] = useState<boolean>(false);
   const [consentConfirmed, setConsentConfirmed] = useState(true);
+
+  // Script Editor UI states
+  const [isFullscreenEditor, setIsFullscreenEditor] = useState(false);
 
   // Collapsible progressive disclosure states
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [showSignalDetails, setShowSignalDetails] = useState(false);
   const [showDetailedMetrics, setShowDetailedMetrics] = useState(false);
+  const [showChunkBreakdown, setShowChunkBreakdown] = useState(false);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [activePipelineStep, setActivePipelineStep] = useState(0);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [cloneResult, setCloneResult] = useState<VoiceCloneResult | null>(null);
+  const [nodeHealthStatus, setNodeHealthStatus] = useState<{
+    checking: boolean;
+    message?: string;
+    ok?: boolean;
+  }>({ checking: false });
 
   // Microphone recording state
   const [isRecording, setIsRecording] = useState(false);
@@ -88,9 +125,38 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   const recordingTimerRef = useRef<number | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const scriptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const highlightMirrorRef = useRef<HTMLDivElement | null>(null);
 
   const currentLangConfig = CLONING_LANGUAGES[selectedLang];
-  const scriptValidation = validateSameLanguageText(inputText, selectedLang);
+
+  // Live emotion tag parsing, tokenizing, and chunk preview
+  const liveTokens = useMemo(() => tokenizeScriptForLiveEditor(inputText), [inputText]);
+  const parsedScript = useMemo(() => parseEmotionTaggedScript(inputText), [inputText]);
+  const previewChunks = useMemo(
+    () => buildEmotionPreservingChunks(parsedScript, splitPreviewSentences, 320),
+    [parsedScript]
+  );
+  const scriptValidation = useMemo(
+    () => validateSameLanguageText(inputText, selectedLang),
+    [inputText, selectedLang]
+  );
+
+  // Estimate spoken duration (~12.5 chars/sec for Indic/English speech + explicit [pause] tags)
+  const estimatedDurationSec = useMemo(() => {
+    const speechSec = parsedScript.spokenCharCount / 12.5;
+    const pauseSec =
+      parsedScript.pauseInstructions.reduce((sum, p) => sum + p.durationMs, 0) / 1000;
+    return Math.max(0, Math.round(speechSec + pauseSec));
+  }, [parsedScript]);
+
+  const activeScriptTagTokens = useMemo(
+    () =>
+      liveTokens.filter(
+        (tok) => tok.type === 'recognized-tag' || tok.type === 'unknown-tag'
+      ),
+    [liveTokens]
+  );
 
   const detectedRefCode = referenceAnalysis?.detectedSpokenLanguage?.code;
   const isReferenceLanguageMismatch = Boolean(
@@ -98,6 +164,52 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       ['bn', 'hi', 'en'].includes(detectedRefCode) &&
       detectedRefCode !== selectedLang
   );
+
+  const syncEditorScroll = () => {
+    if (scriptTextareaRef.current && highlightMirrorRef.current) {
+      highlightMirrorRef.current.scrollTop = scriptTextareaRef.current.scrollTop;
+      highlightMirrorRef.current.scrollLeft = scriptTextareaRef.current.scrollLeft;
+    }
+  };
+
+  const handleInsertEmotionTagAtCursor = (tagToken: string) => {
+    const textarea = scriptTextareaRef.current;
+    if (!textarea) {
+      setInputText((prev) => `${prev}${prev.endsWith(' ') || !prev ? '' : ' '}${tagToken} `);
+      return;
+    }
+
+    const start = textarea.selectionStart ?? inputText.length;
+    const end = textarea.selectionEnd ?? inputText.length;
+    const before = inputText.slice(0, start);
+    const after = inputText.slice(end);
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before);
+    const needsTrailingSpace = after.length === 0 || !/^\s/.test(after);
+    const insertion = `${needsLeadingSpace ? ' ' : ''}${tagToken}${needsTrailingSpace ? ' ' : ''}`;
+    const nextValue = `${before}${insertion}${after}`;
+    setInputText(nextValue);
+
+    const nextCursorPos = start + insertion.length;
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(nextCursorPos, nextCursorPos);
+    });
+  };
+
+  const handleRemoveTagTokenAtRange = (startIndex: number, endIndex: number) => {
+    const before = inputText.slice(0, startIndex);
+    const after = inputText.slice(endIndex);
+    // Collapse double space left behind when removing an inline tag without touching words
+    const cleaned =
+      before.endsWith(' ') && after.startsWith(' ')
+        ? `${before}${after.slice(1)}`
+        : `${before}${after}`;
+    setInputText(cleaned);
+  };
+
+  const handleStripAllBracketTags = () => {
+    setInputText(parsedScript.spokenText);
+  };
 
   const handleSelectLanguage = (lang: CloningLanguageCode) => {
     setSelectedLang(lang);
@@ -158,7 +270,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         stageLabel: 'Applying reference vocal profile & alignment transcript...'
       });
       setReferenceAnalysis(data.analysis);
-      setReferenceTranscript(CLONING_LANGUAGES[lang].sampleTexts[0].text);
+      setReferenceTranscript(
+        parseEmotionTaggedScript(CLONING_LANGUAGES[lang].sampleTexts[0].text).spokenText
+      );
       if (selectedLang !== lang) {
         setSelectedLang(lang);
         const checkExisting = validateSameLanguageText(inputText, lang);
@@ -299,7 +413,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     };
   }, []);
 
-  const handleGenerateClonedVoice = async () => {
+  const handleGenerateClonedVoice = async (reuseCompletedChunks = true) => {
     if (!referenceAnalysis) {
       setGenerationError('Please upload or load an authorized reference voice first.');
       return;
@@ -325,13 +439,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
     const op = startOperation({
       feature: 'voice-cloning',
-      title: `${currentLangConfig.englishName} (${currentLangConfig.nativeName}) Synthesis`,
+      title: `${currentLangConfig.englishName} (${currentLangConfig.nativeName}) Synthesis (${previewChunks.length} chunk${previewChunks.length === 1 ? '' : 's'})`,
       stages: [
-        'Validating same-language script & reference vocal profile',
-        'Synthesizing speech audio (Gemini TTS / Local Neural Node)',
-        'Applying FFmpeg DSP acoustic finishing & WAV/MP3 export',
-        'Extracting 3072-D & 16-D audio embeddings',
-        'Running ASR back-transcription quality verification'
+        'Parsing emotion tags & verifying genuine cloning capability',
+        `Synthesizing ${previewChunks.length} emotion-scoped chunk(s) conditioned on reference audio`,
+        'Finalizing lossless 24kHz WAV/MP3 loudness & anti-clipping mastering',
+        'Computing 3072-D & 16-D audio embeddings',
+        'Running single-pass ASR back-transcription & zero-literal-tag check'
       ],
       initialProgressPct: null,
       progressSource: 'indeterminate-inference',
@@ -359,7 +473,10 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             referenceTranscript: referenceTranscript.trim() || undefined,
             preservePitchContour,
             preserveSpectralTimbre,
+            reuseCompletedChunks,
             localEndpointUrl: localEndpointUrl.trim() || undefined,
+            localNodeToken: localNodeToken.trim() || undefined,
+            enableCloudVerification,
             consentConfirmed
           })
         }
@@ -370,9 +487,11 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       const resObj: VoiceCloneResult = data.result;
       setCloneResult(resObj);
       setActivePipelineStep(PIPELINE_A_STEPS.length - 1);
+      const matchPct =
+        resObj.qualityControlReport.separatedMetrics.asrTranscriptAccuracy.characterMatchRatePct;
       completeOperation(
         op.operationId,
-        `${currentLangConfig.englishName} speech ready (${resObj.outputDurationSec}s · ${resObj.qualityControlReport.separatedMetrics.asrTranscriptAccuracy.characterMatchRatePct}% ASR match)`
+        `${currentLangConfig.englishName} speech ready (${resObj.outputDurationSec}s · ${resObj.chunkCount} chunk${resObj.chunkCount === 1 ? '' : 's'} · ${matchPct !== null ? `${matchPct}% ASR match` : '0-Quota Mode 2'})`
       );
 
       if (onActivityComplete) {
@@ -415,6 +534,72 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   };
 
+  const handleVerifyLocalNode = async () => {
+    const raw = localEndpointUrl.trim();
+    if (!raw) {
+      setNodeHealthStatus({
+        checking: false,
+        ok: false,
+        message:
+          'Enter your Mode 2 Neural Node URL first (e.g. https://xxxx.trycloudflare.com from Colab T4 or http://127.0.0.1:8001).'
+      });
+      return;
+    }
+    setNodeHealthStatus({ checking: true });
+    try {
+      const resp = await fetchApiJson<{
+        reachable: boolean;
+        origin?: string;
+        health?: { readyForLanguage?: Record<string, boolean> };
+        error?: string;
+      }>('/api/voice-clone/node-health', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          localEndpointUrl: raw,
+          localNodeToken: localNodeToken.trim() || undefined
+        })
+      });
+      if (!resp.reachable) {
+        setNodeHealthStatus({
+          checking: false,
+          ok: false,
+          message: resp.error || `Node unreachable at ${resp.origin || raw}.`
+        });
+        return;
+      }
+      const langReady = resp.health?.readyForLanguage?.[selectedLang];
+      setNodeHealthStatus({
+        checking: false,
+        ok: langReady !== false,
+        message:
+          langReady === false
+            ? `Node reachable at ${resp.origin}, but ${currentLangConfig.englishName} (${selectedLang}) checkpoint is not loaded.`
+            : `Verified Mode 2 Neural Node online at ${resp.origin} (${currentLangConfig.englishName} ready · 0 Cloud Quota).`
+      });
+    } catch (err: any) {
+      setNodeHealthStatus({
+        checking: false,
+        ok: false,
+        message: err?.message || 'Failed to verify Mode 2 Neural Node.'
+      });
+    }
+  };
+
+  const handleCopyColabScript = async () => {
+    const scriptText = buildColabOneCellSetupScript(localNodeToken);
+    try {
+      await navigator.clipboard.writeText(scriptText);
+      setCopiedColabScript(true);
+      window.setTimeout(() => setCopiedColabScript(false), 2500);
+    } catch {
+      setShowColabGuide(true);
+    }
+  };
+
+  const scriptFontClass =
+    selectedLang === 'bn' ? 'font-bengali' : selectedLang === 'hi' ? 'font-hindi' : 'font-sans';
+
   return (
     <div className="space-y-5">
       {/* Compact Workspace Header + Language Lock + Mode Status Panel */}
@@ -424,7 +609,8 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             Voice Cloning Studio
           </h1>
           <p className="text-xs text-[#A2B5AA]">
-            Same-language speech synthesis for Bengali, Hindi, and English.
+            Reference-conditioned same-language voice synthesis with inline emotion &amp; delivery
+            tags and automatic multi-chunk long-script generation.
           </p>
         </div>
 
@@ -441,8 +627,8 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             <Cpu className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
             <span className="text-[#A2B5AA] font-mono whitespace-nowrap">
               {localEndpointUrl.trim()
-                ? `Mode 2: Local (${currentLangConfig.openSourceEquivalent.split(' ')[0]})`
-                : `Mode 1: Cloud Persona`}
+                ? `Mode 2: Zero-Shot Neural (${currentLangConfig.openSourceEquivalent.split(' ')[0]})`
+                : 'No Mode 2 Node (Cloud Models Do Not Clone)'}
             </span>
           </div>
         </div>
@@ -490,7 +676,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
       {/* Main Two-Column Studio Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-        {/* Left Column (5 cols): Reference Audio Upload, Recording & Reference Transcript */}
+        {/* Left Column (5 cols): Reference Audio Upload, Recording & Reference Vocal Identity */}
         <div className="lg:col-span-5 space-y-4">
           <div className="bg-[#12231D] border border-[#19352A] rounded-2xl p-4 sm:p-5 space-y-4">
             <div className="flex items-center justify-between gap-2">
@@ -569,7 +755,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               </div>
             )}
 
-            {/* Compact Reference Audio Card */}
+            {/* Compact Reference Audio Card + Vocal Identity Lock Summary */}
             {referenceAnalysis && (
               <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3.5 space-y-3">
                 <div className="flex items-center justify-between gap-2">
@@ -589,6 +775,36 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   src={referenceAnalysis.previewUrl}
                   className="w-full h-9 rounded-lg"
                 />
+
+                {/* Reference Speaker Conditioning Status Badge */}
+                <div className="bg-[#12231D] border border-[#19352A] rounded-lg p-2.5 text-[11px] space-y-1">
+                  <div className="flex items-center justify-between text-[#42D9A0] font-semibold">
+                    <span>Reference Speaker Conditioning</span>
+                    <span className="font-mono">
+                      {localEndpointUrl.trim() ? 'Mode 2 Zero-Shot' : 'Mode 2 Required'}
+                    </span>
+                  </div>
+                  <p className="text-[#A2B5AA] leading-relaxed">
+                    {localEndpointUrl.trim() ? (
+                      <>
+                        Mode 2 Local Zero-Shot Neural Node configured (
+                        <span className="text-[#F4F8F5] font-mono">
+                          {currentLangConfig.openSourceEquivalent}
+                        </span>
+                        ). Every chunk receives your exact uploaded reference audio bytes for
+                        consistent speaker identity.
+                      </>
+                    ) : (
+                      <>
+                        Cloud Gemini speech models only provide 5 fixed prebuilt voices and cannot
+                        clone uploaded reference audio. VoiceLab AI will not substitute a generic
+                        Gemini voice—connect Mode 2 Local Neural Node (
+                        <span className="text-[#F4F8F5] font-mono">http://127.0.0.1:8001</span>)
+                        under settings to synthesize true reference-conditioned speech.
+                      </>
+                    )}
+                  </p>
+                </div>
 
                 {/* Cross-Language Mismatch Alert */}
                 {isReferenceLanguageMismatch && (
@@ -673,31 +889,53 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                 value={referenceTranscript}
                 onChange={(e) => setReferenceTranscript(e.target.value)}
                 placeholder={`Optional spoken transcript of the ${currentLangConfig.nativeName} reference audio...`}
-                className={`w-full rounded-xl bg-[#0B1512] border border-[#19352A] focus:border-[#16A36A] p-2.5 text-xs text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none ${
-                  selectedLang === 'bn'
-                    ? 'font-bengali'
-                    : selectedLang === 'hi'
-                    ? 'font-hindi'
-                    : ''
-                }`}
+                className={`w-full rounded-xl bg-[#0B1512] border border-[#19352A] focus:border-[#16A36A] p-2.5 text-xs text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none ${scriptFontClass}`}
               />
             </div>
           </div>
         </div>
 
-        {/* Right Column (7 cols): Target Text, Collapsible Settings, Action & Compact Result */}
+        {/* Right Column (7 cols): Emotion-Tagged Script Editor, Long-Script Telemetry, Settings & Output */}
         <div className="lg:col-span-7 space-y-4">
-          <div className="bg-[#12231D] border border-[#19352A] rounded-2xl p-4 sm:p-5 space-y-4">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold text-[#F4F8F5]">
-                02. Target Synthesis Text ({currentLangConfig.nativeName})
-              </h2>
-              <span className="text-xs font-mono tabular-nums text-[#A2B5AA]">
-                {Array.from(inputText).length} / 1,000
-              </span>
+          <div
+            className={`${
+              isFullscreenEditor
+                ? 'fixed inset-3 z-50 overflow-y-auto bg-[#0B1512] border-2 border-[#16A36A] shadow-2xl'
+                : 'bg-[#12231D] border border-[#19352A]'
+            } rounded-2xl p-4 sm:p-5 space-y-4`}
+          >
+            {/* Header + Expand Toggle */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-[#F4F8F5]">
+                  02. Emotion-Tagged Synthesis Script ({currentLangConfig.nativeName})
+                </h2>
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-[#0B1512] border border-[#19352A] text-[#42D9A0]">
+                  Long-Script Auto-Chunking
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-mono tabular-nums text-[#A2B5AA]">
+                  {parsedScript.rawCharCount.toLocaleString()} /{' '}
+                  {MAX_SUPPORTED_CLONING_SCRIPT_CHARS.toLocaleString()} chars
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsFullscreenEditor((prev) => !prev)}
+                  title={isFullscreenEditor ? 'Exit Expanded Editor' : 'Expand Script Editor'}
+                  className="p-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-[#A2B5AA] hover:text-[#F4F8F5] transition-colors cursor-pointer"
+                >
+                  {isFullscreenEditor ? (
+                    <Minimize2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <Maximize2 className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
             </div>
 
-            {/* Compact Sample Presets */}
+            {/* Sample Presets */}
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-[11px] text-[#A2B5AA] mr-1">Presets:</span>
               {currentLangConfig.sampleTexts.map((preset, idx) => (
@@ -712,42 +950,200 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               ))}
             </div>
 
-            {/* Target Textarea */}
-            <div>
-              <textarea
-                rows={4}
-                maxLength={1000}
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                placeholder={`Enter ${currentLangConfig.nativeName} (${currentLangConfig.englishName}) text to synthesize...`}
-                className={`w-full rounded-xl bg-[#0B1512] border ${
-                  !scriptValidation.isValid && inputText.trim().length > 0
-                    ? 'border-red-500/70 focus:border-red-400'
-                    : 'border-[#19352A] focus:border-[#16A36A]'
-                } p-3.5 text-sm text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none transition-colors leading-relaxed ${
-                  selectedLang === 'bn'
-                    ? 'font-bengali'
-                    : selectedLang === 'hi'
-                    ? 'font-hindi'
-                    : ''
-                }`}
-              />
+            {/* Interactive Emotion, Delivery & Timing Tag Palette (Click to Insert at Cursor) */}
+            <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <span className="text-[#A2B5AA] flex items-center gap-1.5 font-medium">
+                  <Sparkles className="w-3.5 h-3.5 text-[#42D9A0]" />
+                  <span>
+                    Insert Emotion / Delivery Tag at Cursor (Never spoken aloud — controls prosody):
+                  </span>
+                </span>
+                {activeScriptTagTokens.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleStripAllBracketTags}
+                    className="text-[11px] text-[#A2B5AA] hover:text-red-300 underline cursor-pointer whitespace-nowrap"
+                  >
+                    Strip All Tags
+                  </button>
+                )}
+              </div>
 
+              <div className="flex flex-wrap gap-1.5">
+                {ALL_RECOGNIZED_TAG_LIST.map((tagSpec) => (
+                  <button
+                    key={tagSpec.name}
+                    type="button"
+                    onClick={() => handleInsertEmotionTagAtCursor(tagSpec.token)}
+                    title={`Insert ${tagSpec.token} (${tagSpec.label})`}
+                    className={`px-2 py-0.5 rounded-md border text-[11px] font-mono transition-transform active:scale-95 cursor-pointer ${tagSpec.badgeColorClass}`}
+                  >
+                    {tagSpec.token}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Live Syntax-Highlighted Script Editor (Overlay Mirror + Native Textarea) */}
+            <div className="space-y-2">
+              <div
+                className={`relative w-full rounded-xl bg-[#0B1512] border transition-colors ${
+                  !scriptValidation.isValid && inputText.trim().length > 0
+                    ? 'border-red-500/70 focus-within:border-red-400'
+                    : 'border-[#19352A] focus-within:border-[#16A36A]'
+                }`}
+              >
+                {/* Highlighted Backdrop Mirror Layer */}
+                <div
+                  ref={highlightMirrorRef}
+                  aria-hidden="true"
+                  className={`pointer-events-none w-full p-3.5 text-sm leading-relaxed whitespace-pre-wrap break-words overflow-y-auto ${
+                    isFullscreenEditor ? 'min-h-[340px] max-h-[520px]' : 'min-h-[150px] max-h-[300px]'
+                  } ${scriptFontClass}`}
+                >
+                  {liveTokens.map((tok, i) => {
+                    if (tok.type === 'recognized-tag' && tok.recognizedName) {
+                      const spec = RECOGNIZED_EMOTION_TAGS[tok.recognizedName];
+                      return (
+                        <mark
+                          key={`${tok.startIndex}_${i}`}
+                          className={`bg-transparent rounded px-0.5 font-mono ${spec.inlineHighlightClass}`}
+                        >
+                          {tok.raw}
+                        </mark>
+                      );
+                    }
+                    if (tok.type === 'unknown-tag') {
+                      return (
+                        <mark
+                          key={`${tok.startIndex}_${i}`}
+                          className="bg-red-500/30 text-red-200 underline decoration-wavy decoration-red-400 rounded px-0.5 font-mono"
+                        >
+                          {tok.raw}
+                        </mark>
+                      );
+                    }
+                    return (
+                      <span key={`${tok.startIndex}_${i}`} className="text-[#F4F8F5]">
+                        {tok.raw}
+                      </span>
+                    );
+                  })}
+                  {inputText.endsWith('\n') ? '\n ' : ''}
+                </div>
+
+                {/* Transparent-Text Native Textarea Layer (Preserves Cursor, Undo/Redo, Copy/Paste & Mobile Input) */}
+                <textarea
+                  ref={scriptTextareaRef}
+                  rows={isFullscreenEditor ? 14 : 6}
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onScroll={syncEditorScroll}
+                  spellCheck={false}
+                  placeholder={`Type or paste ${currentLangConfig.nativeName} (${currentLangConfig.englishName}) script with tags like [sad], [happy], [whispering], [confidently], [pause]...`}
+                  className={`absolute inset-0 w-full h-full resize-none bg-transparent p-3.5 text-sm leading-relaxed text-transparent caret-[#42D9A0] selection:bg-[#16A36A]/35 placeholder-[#A2B5AA]/50 focus:outline-none overflow-y-auto ${scriptFontClass}`}
+                />
+              </div>
+
+              {/* Active Tag Chips Strip (Interactive Removable Chips) */}
+              {activeScriptTagTokens.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                  <span className="text-[11px] text-[#A2B5AA] mr-1">
+                    Active tags in script ({activeScriptTagTokens.length}):
+                  </span>
+                  {activeScriptTagTokens.map((tok, idx) => {
+                    const spec =
+                      tok.type === 'recognized-tag' && tok.recognizedName
+                        ? RECOGNIZED_EMOTION_TAGS[tok.recognizedName]
+                        : null;
+                    return (
+                      <span
+                        key={`${tok.startIndex}_${idx}`}
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-mono ${
+                          spec
+                            ? spec.badgeColorClass
+                            : 'bg-red-500/20 border-red-400/50 text-red-200'
+                        }`}
+                      >
+                        <span>{tok.raw}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveTagTokenAtRange(tok.startIndex, tok.endIndex)}
+                          title={`Remove ${tok.raw} from script`}
+                          className="hover:opacity-100 opacity-75 cursor-pointer"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Unsupported Tag Warning Banner */}
+              {parsedScript.unsupportedTags.length > 0 && (
+                <div className="bg-amber-950/60 border border-amber-500/50 rounded-xl p-2.5 text-xs text-amber-200 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    Unrecognized bracket tag(s) detected:{' '}
+                    <span className="font-mono font-semibold">
+                      {parsedScript.unsupportedTags.join(', ')}
+                    </span>
+                    . Unrecognized tags are automatically stripped before synthesis so they are{' '}
+                    <span className="font-semibold underline">never spoken aloud</span>. Supported
+                    tags: [happy], [sad], [angry], [excited], [calm], [serious], [whispering],
+                    [softly], [confidently], [shouting], [pause].
+                  </div>
+                </div>
+              )}
+
+              {/* Live Long-Script Telemetry Bar */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-[11px] font-mono">
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                  <span className="text-[#A2B5AA]">Spoken Chars</span>
+                  <span className="text-[#F4F8F5] font-semibold tabular-nums">
+                    {parsedScript.spokenCharCount.toLocaleString()}
+                  </span>
+                </div>
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                  <span className="text-[#A2B5AA]">Words</span>
+                  <span className="text-[#F4F8F5] font-semibold tabular-nums">
+                    {parsedScript.spokenWordCount.toLocaleString()}
+                  </span>
+                </div>
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                  <span className="text-[#A2B5AA]">Est. Duration</span>
+                  <span className="text-[#42D9A0] font-semibold tabular-nums">
+                    ~{estimatedDurationSec}s
+                  </span>
+                </div>
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg px-2.5 py-1.5 flex items-center justify-between">
+                  <span className="text-[#A2B5AA]">Auto-Chunks</span>
+                  <span className="text-[#42D9A0] font-semibold tabular-nums">
+                    {previewChunks.length} chunk{previewChunks.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Script Guard Status */}
               {!scriptValidation.isValid && inputText.trim().length > 0 ? (
                 <div className="mt-2 bg-red-950/60 border border-red-500/50 rounded-xl p-3 text-xs text-red-200 flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
                   <span>{scriptValidation.errorMessage}</span>
                 </div>
               ) : (
-                <div className="mt-1.5 flex items-center justify-between text-[11px] text-[#A2B5AA]">
+                <div className="mt-1 flex items-center justify-between text-[11px] text-[#A2B5AA]">
                   <span>
                     Script Guard:{' '}
                     <span className="text-[#42D9A0] font-medium">
-                      Valid {currentLangConfig.nativeName} ({currentLangConfig.scriptName})
+                      Valid {currentLangConfig.nativeName} ({currentLangConfig.scriptName}) ·
+                      Bracket tags excluded from speech
                     </span>
                   </span>
                   <span className="font-mono tabular-nums">
-                    bn:{scriptValidation.bengaliCharCount} · hi:{scriptValidation.hindiCharCount} · en:{scriptValidation.latinCharCount}
+                    bn:{scriptValidation.bengaliCharCount} · hi:{scriptValidation.hindiCharCount} ·
+                    en:{scriptValidation.latinCharCount}
                   </span>
                 </div>
               )}
@@ -762,12 +1158,11 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               >
                 <span className="flex items-center gap-2">
                   <Sliders className="w-3.5 h-3.5 text-[#42D9A0]" />
-                  <span>Advanced Execution Mode &amp; DSP Settings</span>
+                  <span>Reference Conditioning &amp; DSP Settings</span>
                 </span>
                 <span className="flex items-center gap-1.5 text-[11px] font-mono text-[#A2B5AA]">
                   <span>
-                    {localEndpointUrl.trim() ? 'Mode 2 Local' : 'Mode 1 Cloud'} · DSP{' '}
-                    {preservePitchContour || preserveSpectralTimbre ? 'On' : 'Off'}
+                    {localEndpointUrl.trim() ? 'Mode 2 Local Connected' : 'Configure Mode 2 Node'}
                   </span>
                   {showAdvancedSettings ? (
                     <ChevronUp className="w-4 h-4" />
@@ -779,53 +1174,125 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
               {showAdvancedSettings && (
                 <div className="p-3.5 pt-2 border-t border-[#19352A] space-y-3 text-xs">
-                  <div className="space-y-1">
+                  <div className="space-y-1.5">
                     <label className="block font-medium text-[#F4F8F5]">
-                      Local Neural Node URL (Mode 2 · IndicF5 / OpenVoice V2)
+                      Mode 2 Neural Node URL (Free Colab T4 HTTPS Tunnel or Local 127.0.0.1:8001)
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        value={localEndpointUrl}
+                        onChange={(e) => {
+                          setLocalEndpointUrl(e.target.value);
+                          setNodeHealthStatus({ checking: false });
+                        }}
+                        placeholder="https://xxxx.trycloudflare.com or http://127.0.0.1:8001"
+                        className="flex-1 rounded-lg bg-[#12231D] border border-[#19352A] focus:border-[#16A36A] px-3 py-1.5 text-xs font-mono text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleVerifyLocalNode}
+                        disabled={nodeHealthStatus.checking}
+                        className="px-3 py-1.5 rounded-lg bg-[#19352A] hover:bg-[#16A36A] text-xs font-medium text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {nodeHealthStatus.checking ? 'Checking...' : 'Verify Node'}
+                      </button>
+                    </div>
+                    {nodeHealthStatus.message && (
+                      <div
+                        className={`text-[11px] px-2.5 py-1.5 rounded-lg border ${
+                          nodeHealthStatus.ok
+                            ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                            : 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+                        }`}
+                      >
+                        {nodeHealthStatus.message}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block font-medium text-[#F4F8F5]">
+                      Node Auth Token (<span className="font-mono text-[#42D9A0]">X-VoiceLab-Node-Token</span>)
                     </label>
                     <input
-                      type="url"
-                      value={localEndpointUrl}
-                      onChange={(e) => setLocalEndpointUrl(e.target.value)}
-                      placeholder="Leave blank for Cloud Mode 1, or enter http://127.0.0.1:8001"
+                      type="text"
+                      value={localNodeToken}
+                      onChange={(e) => {
+                        setLocalNodeToken(e.target.value);
+                        setNodeHealthStatus({ checking: false });
+                      }}
+                      placeholder="voicelab-local-token"
                       className="w-full rounded-lg bg-[#12231D] border border-[#19352A] focus:border-[#16A36A] px-3 py-1.5 text-xs font-mono text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none"
                     />
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                    <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-[#12231D] border border-[#19352A] cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={preservePitchContour}
-                        onChange={(e) => setPreservePitchContour(e.target.checked)}
-                        className="mt-0.5 accent-[#16A36A]"
-                      />
-                      <div>
-                        <div className="font-medium text-[#F4F8F5]">
-                          Conservative F0 Pitch Alignment
-                        </div>
-                        <div className="text-[11px] text-[#A2B5AA]">
-                          Bounded ±2.0 semitones max toward reference F0.
-                        </div>
-                      </div>
-                    </label>
+                  <label className="flex items-start gap-2 text-[11px] text-[#A2B5AA] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={enableCloudVerification}
+                      onChange={(e) => setEnableCloudVerification(e.target.checked)}
+                      className="accent-[#16A36A] mt-0.5 shrink-0"
+                    />
+                    <span>
+                      Run optional Gemini Cloud ASR &amp; 3072-D Embedding check (uses 3 Gemini API calls per generation; keep unchecked for <strong className="text-[#42D9A0]">0 Cloud Quota unlimited cloning</strong>).
+                    </span>
+                  </label>
 
-                    <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-[#12231D] border border-[#19352A] cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={preserveSpectralTimbre}
-                        onChange={(e) => setPreserveSpectralTimbre(e.target.checked)}
-                        className="mt-0.5 accent-[#16A36A]"
-                      />
-                      <div>
-                        <div className="font-medium text-[#F4F8F5]">
-                          Gentle Spectral EQ (±2 dB)
-                        </div>
-                        <div className="text-[11px] text-[#A2B5AA]">
-                          220 Hz &amp; 3.2 kHz shelf + -1.0 dBFS peak limiter.
-                        </div>
+                  {/* 1-Click Free Google Colab T4 GPU Setup */}
+                  <div className="rounded-lg bg-[#12231D] border border-[#19352A] p-2.5 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowColabGuide((prev) => !prev)}
+                        className="flex items-center gap-1.5 text-xs font-semibold text-[#42D9A0] hover:underline cursor-pointer"
+                      >
+                        <Terminal className="w-3.5 h-3.5" />
+                        <span>Free Google Colab T4 GPU Setup (৳0 Unlimited Cloning)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCopyColabScript}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#19352A] hover:bg-[#16A36A] text-[11px] font-medium text-[#F4F8F5] transition-colors cursor-pointer"
+                      >
+                        {copiedColabScript ? (
+                          <>
+                            <Check className="w-3 h-3 text-[#42D9A0]" />
+                            <span>Copied Colab Cell!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            <span>Copy 1-Cell Colab Script</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {showColabGuide && (
+                      <div className="space-y-2 pt-1 border-t border-[#19352A] text-[11px] text-[#A2B5AA]">
+                        <ol className="list-decimal list-inside space-y-1 text-[#F4F8F5]/90">
+                          <li>
+                            Open <span className="font-mono text-[#42D9A0]">colab.research.google.com</span> → Runtime → Change runtime type → <strong className="text-[#F4F8F5]">T4 GPU</strong> (Free).
+                          </li>
+                          <li>
+                            Copy the 1-Cell script above, paste it into a Colab cell, and run it.
+                          </li>
+                          <li>
+                            Copy the printed <span className="font-mono text-[#42D9A0]">https://*.trycloudflare.com</span> URL into the box above and click <strong className="text-[#F4F8F5]">Verify Node</strong>.
+                          </li>
+                        </ol>
+                        <pre className="max-h-40 overflow-y-auto rounded-lg bg-[#0B1512] border border-[#19352A] p-2 text-[10px] font-mono text-[#A2B5AA] whitespace-pre">
+                          {buildColabOneCellSetupScript(localNodeToken)}
+                        </pre>
                       </div>
-                    </label>
+                    )}
+                  </div>
+
+                  <div className="text-[11px] text-[#A2B5AA] bg-[#12231D] border border-[#19352A] rounded-lg p-2.5 leading-relaxed">
+                    Speaker identity is preserved directly by Mode 2 neural weights (without DSP pitch
+                    shifting over synthesized output). Output audio uses lossless 24kHz loudness
+                    normalization and anti-clipping limiting only.
                   </div>
                 </div>
               )}
@@ -846,16 +1313,29 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             </label>
 
             {generationError && (
-              <div className="bg-red-950/60 border border-red-500/50 rounded-xl p-3 text-xs text-red-200 flex items-start gap-2">
-                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                <span>{generationError}</span>
+              <div className="bg-red-950/60 border border-red-500/50 rounded-xl p-3 text-xs text-red-200 space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                  <span>{generationError}</span>
+                </div>
+                {previewChunks.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => handleGenerateClonedVoice(true)}
+                    disabled={isGenerating}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-900/60 hover:bg-red-800 border border-red-400/40 text-xs font-semibold text-red-100 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Retry Failed Chunks (Reuse Completed Cached Chunks)</span>
+                  </button>
+                )}
               </div>
             )}
 
             {/* Primary Generate Action */}
             <button
               type="button"
-              onClick={handleGenerateClonedVoice}
+              onClick={() => handleGenerateClonedVoice(true)}
               disabled={
                 isGenerating ||
                 !referenceAnalysis ||
@@ -868,12 +1348,18 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               {isGenerating ? (
                 <>
                   <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
-                  <span>Synthesizing {currentLangConfig.nativeName} Speech...</span>
+                  <span>
+                    Synthesizing {currentLangConfig.nativeName} Speech ({previewChunks.length}{' '}
+                    chunk{previewChunks.length === 1 ? '' : 's'})...
+                  </span>
                 </>
               ) : (
                 <>
                   <Volume2 className="w-4 h-4 shrink-0" />
-                  <span>Generate {currentLangConfig.nativeName} Speech</span>
+                  <span>
+                    Generate {currentLangConfig.nativeName} Speech ({previewChunks.length} chunk
+                    {previewChunks.length === 1 ? '' : 's'})
+                  </span>
                 </>
               )}
             </button>
@@ -889,7 +1375,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             )}
           </div>
 
-          {/* Compact Output Audio Player & Quality Metrics */}
+          {/* Output Audio Player, Emotion & Chunk Verification, & Quality Metrics */}
           {cloneResult && (
             <div className="bg-[#12231D] border border-[#16A36A]/50 rounded-2xl p-4 sm:p-5 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -897,7 +1383,8 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <CheckCircle2 className="w-4 h-4 text-[#42D9A0] shrink-0" />
                   <h3 className="text-sm sm:text-base font-bold text-[#F4F8F5] truncate">
                     {CLONING_LANGUAGES[cloneResult.language].nativeName} Output Ready (
-                    {cloneResult.outputDurationSec}s)
+                    {cloneResult.outputDurationSec}s · {cloneResult.chunkCount || 1} chunk
+                    {(cloneResult.chunkCount || 1) === 1 ? '' : 's'})
                   </h3>
                 </div>
 
@@ -938,38 +1425,81 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                 <audio controls src={cloneResult.wavUrl} className="w-full h-9" />
               </div>
 
+              {/* Emotion & Speaker Identity Verification Banner */}
+              {cloneResult.emotionTagReport && (
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 text-xs space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-semibold text-[#F4F8F5] flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-[#42D9A0]" />
+                      <span>Emotion &amp; Speaker Consistency Verification</span>
+                    </span>
+                    <span className="font-mono text-[11px] text-[#42D9A0]">
+                      {cloneResult.emotionTagReport.zeroLiteralTagsInAudioVerified
+                        ? '0 Literal Tags Spoken (Verified)'
+                        : 'Check Transcript'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#A2B5AA]">
+                    <span>
+                      Persona:{' '}
+                      <strong className="text-[#F4F8F5] font-mono">
+                        {cloneResult.speakerConditioningInfo.conditionedVoicePersona}
+                      </strong>
+                    </span>
+                    <span>·</span>
+                    <span>
+                      Tags Applied:{' '}
+                      <strong className="text-[#42D9A0] font-mono">
+                        {cloneResult.emotionTagReport.recognizedTagsUsed.length > 0
+                          ? cloneResult.emotionTagReport.recognizedTagsUsed.join(' ')
+                          : 'Neutral studio delivery'}
+                      </strong>
+                    </span>
+                    {cloneResult.emotionTagReport.pauseCount > 0 && (
+                      <>
+                        <span>·</span>
+                        <span>
+                          Explicit Pauses:{' '}
+                          <strong className="text-[#F4F8F5] font-mono">
+                            {cloneResult.emotionTagReport.pauseCount} (
+                            {cloneResult.emotionTagReport.totalPauseDurationMs}ms)
+                          </strong>
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Compact Summary Metrics Strip */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                 <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
                   <div className="text-[11px] text-[#A2B5AA]">ASR Match</div>
                   <div className="font-mono tabular-nums font-semibold text-[#42D9A0]">
-                    {
-                      cloneResult.qualityControlReport.separatedMetrics.asrTranscriptAccuracy
-                        .characterMatchRatePct
-                    }
+                    {cloneResult.qualityControlReport.separatedMetrics.asrTranscriptAccuracy
+                      .characterMatchRatePct !== null
+                      ? `${cloneResult.qualityControlReport.separatedMetrics.asrTranscriptAccuracy.characterMatchRatePct}%`
+                      : '0 Quota (Mode 2)'}
+                  </div>
+                </div>
+                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
+                  <div className="text-[11px] text-[#A2B5AA]">Spectral Match</div>
+                  <div className="font-mono tabular-nums font-semibold text-[#F4F8F5]">
+                    {(
+                      cloneResult.qualityControlReport.separatedMetrics.spectralFeatureSimilarity
+                        .cosineSimilarity16D * 100
+                    ).toFixed(1)}
                     %
                   </div>
                 </div>
                 <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
-                  <div className="text-[11px] text-[#A2B5AA]">Audio Cosine</div>
-                  <div className="font-mono tabular-nums font-semibold text-[#F4F8F5]">
-                    {cloneResult.qualityControlReport.separatedMetrics
-                      .generalAudioEmbeddingSimilarity.cosineSimilarity !== null
-                      ? `${(
-                          cloneResult.qualityControlReport.separatedMetrics
-                            .generalAudioEmbeddingSimilarity.cosineSimilarity * 100
-                        ).toFixed(1)}%`
-                      : 'N/A'}
-                  </div>
-                </div>
-                <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
-                  <div className="text-[11px] text-[#A2B5AA]">SNR / RMS</div>
+                  <div className="text-[11px] text-[#A2B5AA]">SNR / Pitch Shift</div>
                   <div className="font-mono tabular-nums font-semibold text-[#F4F8F5]">
                     {
                       cloneResult.qualityControlReport.separatedMetrics.audioSignalQuality
                         .estimatedSnrDb
                     }{' '}
-                    dB
+                    dB · {cloneResult.acousticTransferMetrics.pitchShiftSemitonesApplied} st
                   </div>
                 </div>
                 <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
@@ -983,6 +1513,57 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   </div>
                 </div>
               </div>
+
+              {/* Collapsible Per-Chunk Synthesis Breakdown */}
+              {cloneResult.chunks && cloneResult.chunks.length > 0 && (
+                <div className="border-t border-[#19352A] pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowChunkBreakdown((prev) => !prev)}
+                    className="w-full flex items-center justify-between text-xs text-[#A2B5AA] hover:text-[#F4F8F5] cursor-pointer py-1"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5 text-[#42D9A0]" />
+                      <span>
+                        Synthesized Chunk Breakdown ({cloneResult.chunks.length} chunk
+                        {cloneResult.chunks.length === 1 ? '' : 's'} · Deterministic Cache Enabled)
+                      </span>
+                    </span>
+                    {showChunkBreakdown ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </button>
+
+                  {showChunkBreakdown && (
+                    <div className="mt-2 space-y-2 max-h-60 overflow-y-auto pr-1">
+                      {cloneResult.chunks.map((chk) => (
+                        <div
+                          key={chk.chunkId}
+                          className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5 text-xs space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2 font-mono text-[11px]">
+                            <span className="text-[#42D9A0] font-semibold">
+                              Chunk #{chk.chunkIndex + 1} ({chk.durationSec ?? 0}s · {chk.charCount}{' '}
+                              chars)
+                            </span>
+                            <span className="text-[#A2B5AA]">
+                              {chk.activeEmotionTags.length > 0
+                                ? chk.activeEmotionTags.join(' ')
+                                : '[neutral]'}{' '}
+                              · {chk.status.toUpperCase()}
+                            </span>
+                          </div>
+                          <div className={`text-[#F4F8F5] ${scriptFontClass}`}>
+                            {chk.spokenText}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Collapsible Detailed 5-Category Quality Report */}
               <div className="border-t border-[#19352A] pt-2">
@@ -1006,7 +1587,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5 space-y-0.5">
                         <div className="text-[11px] font-mono text-[#42D9A0]">
-                          1. Speaker Identity (ECAPA-TDNN)
+                          1. Speaker Conditioning &amp; Identity
                         </div>
                         <div className="text-[#F4F8F5] font-mono">
                           {
@@ -1067,7 +1648,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
                     <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5">
                       <div className="text-[11px] text-[#A2B5AA] mb-1">
-                        5. ASR Back-Transcription Verification:
+                        5. ASR Back-Transcription Verification (Clean Spoken Output):
                       </div>
                       <div
                         className={`text-[#F4F8F5] ${
@@ -1091,3 +1672,4 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     </div>
   );
 };
+
