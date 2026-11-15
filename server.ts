@@ -841,26 +841,40 @@ async function startServer() {
     const startMs = Date.now();
     res.setHeader('Cache-Control', 'no-store');
 
-    const clientIp = String(req.ip || req.socket.remoteAddress || '127.0.0.1');
-    const rateStatus = checkSlidingRateLimit(generalRateBuckets, clientIp, 120, 60_000);
-    res.setHeader('X-RateLimit-Limit', '120');
-    res.setHeader('X-RateLimit-Remaining', String(rateStatus.remaining));
-    res.setHeader('X-RateLimit-Reset', String(rateStatus.resetSeconds));
+    const safePath = req.originalUrl.split('?')[0];
+    const isExemptReadPath =
+      (req.method === 'GET' || req.method === 'HEAD') &&
+      (safePath.startsWith('/api/operations/') ||
+        safePath.startsWith('/api/voice-clone/jobs/') ||
+        safePath.startsWith('/api/audio/') ||
+        safePath === '/api/health' ||
+        safePath === '/api/auth/session');
 
-    if (!rateStatus.allowed) {
-      res.status(429).type('application/json').json({
-        error: 'Rate limit exceeded. Please wait before sending additional API requests.',
-        retryAfterSeconds: rateStatus.resetSeconds
-      });
-      return;
+    if (!isExemptReadPath) {
+      const clientIp = String(req.ip || req.socket.remoteAddress || '127.0.0.1');
+      const sess = (req as any).voicelabSession as VerifiedSessionState | undefined;
+      const bucketKey = `${clientIp}::${sess?.sessionId || 'anon'}`;
+      const rateStatus = checkSlidingRateLimit(generalRateBuckets, bucketKey, 360, 60_000);
+      res.setHeader('X-RateLimit-Limit', '360');
+      res.setHeader('X-RateLimit-Remaining', String(rateStatus.remaining));
+      res.setHeader('X-RateLimit-Reset', String(rateStatus.resetSeconds));
+
+      if (!rateStatus.allowed) {
+        res.status(429).type('application/json').json({
+          error: 'Rate limit exceeded. Please wait before sending additional API requests.',
+          retryAfterSeconds: rateStatus.resetSeconds
+        });
+        return;
+      }
     }
 
     res.on('finish', () => {
       const elapsedMs = Date.now() - startMs;
-      const safePath = req.originalUrl.split('?')[0];
-      console.log(
-        `[VoiceLab API] ${req.method} ${safePath} -> HTTP ${res.statusCode} (${elapsedMs}ms)`
-      );
+      if (!safePath.startsWith('/api/operations/') && !safePath.startsWith('/api/voice-clone/jobs/')) {
+        console.log(
+          `[VoiceLab API] ${req.method} ${safePath} -> HTTP ${res.statusCode} (${elapsedMs}ms)`
+        );
+      }
     });
 
     next();
@@ -4504,8 +4518,8 @@ async function startServer() {
     );
   });
 
-  // Production timeout configuration (5 minutes for long-form audio processing)
-  server.requestTimeout = 5 * 60 * 1000;
+  // Extended timeout configuration (30 minutes for long-form multi-chunk CPU/GPU audio processing)
+  server.requestTimeout = 30 * 60 * 1000;
   server.headersTimeout = 65 * 1000;
   server.keepAliveTimeout = 60 * 1000;
 

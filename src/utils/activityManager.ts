@@ -521,6 +521,7 @@ export function connectBackendOperationStream(operationId: string): () => void {
   let closed = false;
   let eventSource: EventSource | null = null;
   let pollInterval: number | null = null;
+  let lastSseEventAtMs = 0;
 
   const applyBackendSnapshot = (data: any) => {
     if (closed || !data) return;
@@ -548,7 +549,11 @@ export function connectBackendOperationStream(operationId: string): () => void {
     if (typeof EventSource !== 'undefined') {
       const sseUrl = resolveApiUrl(`/api/operations/${encodeURIComponent(operationId)}/events`);
       eventSource = new EventSource(sseUrl, { withCredentials: true });
+      eventSource.onopen = () => {
+        lastSseEventAtMs = Date.now();
+      };
       eventSource.onmessage = (ev) => {
+        lastSseEventAtMs = Date.now();
         try {
           const parsed = JSON.parse(ev.data);
           applyBackendSnapshot(parsed);
@@ -567,12 +572,15 @@ export function connectBackendOperationStream(operationId: string): () => void {
     // Fallback to polling below
   }
 
-  // Lightweight fallback poll every 650ms in case reverse proxy buffers SSE frames
+  // Fallback poll every 2500ms ONLY if EventSource is closed or hasn't received an update recently
   pollInterval = window.setInterval(async () => {
     if (closed) return;
     const op = operationsMap.get(operationId);
     if (!op || op.status !== 'running') {
       cleanup();
+      return;
+    }
+    if (eventSource && Date.now() - lastSseEventAtMs < 3500) {
       return;
     }
     try {
@@ -591,7 +599,7 @@ export function connectBackendOperationStream(operationId: string): () => void {
     } catch {
       // Ignore transient poll errors
     }
-  }, 650);
+  }, 2500);
 
   const cleanup = () => {
     if (closed) return;

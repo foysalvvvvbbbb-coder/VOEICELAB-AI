@@ -350,17 +350,17 @@ export function resolveNaturalStageDirectionTag(rawInner: string): ResolvedStage
   let matchedDelivery: RecognizedEmotionTagName | null = null;
 
   // Emotion cues (priority ordered for nuance)
-  if (/বিষণ্ণ|দুঃখ|হতাশ|কান্না|করুণ|অসহায়|বেদনা|কষ্ট|ম্লান|উদাস|ব্যথিত|দুঃখিত|melanchol|sorrow|grief|sad|unhappy|heartbreak|उदास|दुख|करुण/i.test(normalized)) {
+  if (/বিষণ্ণ|দুঃখ|হতাশ|কান্না|করুণ|অসহায়|বেদনা|কষ্ট|ম্লান|উদাস|ব্যথিত|দুঃখিত|অভিমান|আক্ষেপ|কাতর|মন\s*খারাপ|মনখারাপ|নিরুপায়|melanchol|sorrow|grief|sad|unhappy|heartbreak|उदास|दुख|करुण/i.test(normalized)) {
     matchedEmotion = 'sad';
-  } else if (/ব্যঙ্গ|অনিচ্ছুক|বিরক্তি|রাগ|ক্ষোভ|অবিশ্বাস|ঠাট্টা|অবজ্ঞা|কঠোর|নাক\s*সিটকানো|irritat|annoy|sarcas|angry|furious|indignant|scorn|गुस्सा|क्रोध|व्यंग्य/i.test(normalized)) {
+  } else if (/ব্যঙ্গ|অনিচ্ছুক|বিরক্তি|রাগ|ক্ষোভ|অবিশ্বাস|ঠাট্টা|অবজ্ঞা|কঠোর|তিক্ত|বিদ্রূপ|কটাক্ষ|ঝাঁঝ|রুক্ষ|নাক\s*সিটকানো|irritat|annoy|sarcas|angry|furious|indignant|scorn|bitter|गुस्सा|क्रोध|व्यंग्य/i.test(normalized)) {
     matchedEmotion = 'angry';
   } else if (/উৎসাহ|উত্তেজনা|বিস্ময়|বিস্মিত|তাড়াহুড়ো|আগ্রহ|কৌতূহল|চমক|excit|eager|surpris|amazed|enthusiast|उत्साह|आश्चर्य/i.test(normalized)) {
     matchedEmotion = 'excited';
   } else if (/হাসি|মুচকি|মজার|আনন্দ|খুশি|দুষ্টুমি|কৌতুক|আশাবাদী|উৎফুল্ল|প্রশংসা|মিষ্টি|smile|cheerful|laugh|playful|happy|joy|warm|खुश|मुस्कान|हंसी/i.test(normalized)) {
     matchedEmotion = 'happy';
-  } else if (/গম্ভীর|গুরুত্ব|বিচারক|সমালোচন|কর্তৃত্ব|সতর্ক|চিন্তিত|ভারী|গভীর|সংবাদ|শক্ত|serious|grave|solemn|authority|thoughtful|heavy|गंभीर/i.test(normalized)) {
+  } else if (/গম্ভীর|গুরুত্ব|বিচারক|সমালোচন|কর্তৃত্ব|সতর্ক|চিন্তিত|চিন্তাশীল|উদ্দিগ্ন|উদ্বিগ্ন|দুশ্চিন্তা|ভয়|আতঙ্ক|শঙ্কা|অস্থির|ভারী|গভীর|সংবাদ|শক্ত|serious|grave|solemn|authority|thoughtful|anxious|worried|heavy|गंभीर/i.test(normalized)) {
     matchedEmotion = 'serious';
-  } else if (/স্বাভাবিক|শান্ত|স্থির|চুপচাপ|নিরব|নীরব|গল্প|বর্ণনা|অভিনয়|পর্যবেক্ষণ|ভদ্র|বিনীত|calm|peaceful|storytell|narration|neutral|normal|gentle|शांत|सामान्य/i.test(normalized)) {
+  } else if (/স্বাভাবিক|শান্ত|স্থির|চুপচাপ|নিরব|নীরব|গল্প|বর্ণনা|অভিনয়|পর্যবেক্ষণ|ভদ্র|বিনীত|বয়স্ক|প্রবীণ|সহজ|calm|peaceful|storytell|narration|neutral|normal|gentle|शांत|सामान्य/i.test(normalized)) {
     matchedEmotion = 'calm';
   }
 
@@ -369,7 +369,7 @@ export function resolveNaturalStageDirectionTag(rawInner: string): ResolvedStage
     matchedDelivery = 'whispering';
   } else if (/চিৎকার|উচ্চস্বরে|উচ্চ\s*স্বরে|চেঁচিয়ে|হাঁক|দমক|shout|yell|loud|चिल्ला/i.test(normalized)) {
     matchedDelivery = 'shouting';
-  } else if (/আত্মবিশ্বাস|জোর\s*দিয়ে|স্পষ্ট|দৃঢ়|সাবলীল|তাল\s*মিলিয়ে|confident|firm|assertive|decisive|आत्मविश्वास/i.test(normalized)) {
+  } else if (/আত্মবিশ্বাস|জোর\s*দিয়ে|স্পষ্ট|দৃঢ়|সাবলীল|তাল\s*মিলিয়ে|নিশ্চিত|প্রতিজ্ঞা|শপথ|আশ্বাস|অবিচল|confident|firm|assertive|decisive|certain|आत्मविश्वास/i.test(normalized)) {
     matchedDelivery = 'confidently';
   } else if (/নরম|কোমল|নম্র|আবেগ|ধীরে|ধীর|অনুরোধ|মৃদু|আস্তে|সাবধানে|চাপা\s*রেখে|soft|tender|slowly|polite|pleading|delicate|कोमल|नम्र/i.test(normalized)) {
     matchedDelivery = 'softly';

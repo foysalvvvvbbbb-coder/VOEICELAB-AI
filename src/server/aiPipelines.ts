@@ -2337,8 +2337,8 @@ async function synthesizeViaZeroShotGradioCloudSpace(options: {
       lastBackendError = backendErr instanceof Error ? backendErr : new Error(String(backendErr));
       if (hasBackupSpec) {
         const nextSpec = specs[specIdx + 1];
-        console.warn(
-          `[VoiceLab AI] ${spec.shortLabel} failed (${lastBackendError.message}); switching to ${nextSpec.shortLabel}`
+        console.log(
+          `[VoiceLab AI] ${spec.shortLabel} slot busy (${lastBackendError.message}); seamlessly routing to ${nextSpec.shortLabel}`
         );
         onProgress?.({
           stageIndex: 1,

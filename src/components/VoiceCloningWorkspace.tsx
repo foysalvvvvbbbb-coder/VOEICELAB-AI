@@ -898,7 +898,8 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
           }
 
           await new Promise<void>((resolve) => {
-            const t = window.setTimeout(resolve, 700);
+            const delayMs = transientPollErrors > 0 ? Math.min(5000, 1600 + transientPollErrors * 900) : 1600;
+            const t = window.setTimeout(resolve, delayMs);
             const onWake = () => {
               window.clearTimeout(t);
               resolve();
@@ -953,7 +954,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               break;
             }
             if (pollResp.status === 'failed') {
-              throw new Error(pollResp.error || 'Voice cloning pipeline failed.');
+              const terminalErr: any = new Error(pollResp.error || 'Voice cloning pipeline failed.');
+              terminalErr.isJobTerminalFailure = true;
+              throw terminalErr;
             }
             if (pollResp.status === 'cancelled') {
               const cancelErr = new Error('Voice cloning job was cancelled.');
@@ -964,13 +967,15 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             if (pollErr?.name === 'AbortError' || op.signal.aborted || op.isStale()) {
               throw pollErr;
             }
+            if (pollErr?.isJobTerminalFailure) {
+              throw pollErr;
+            }
             transientPollErrors += 1;
             const msg = String(pollErr?.message || '');
             const isFatal =
-              transientPollErrors >= 5 ||
+              transientPollErrors >= 15 ||
               msg.includes('JOB_NOT_FOUND') ||
               msg.includes('not found') ||
-              msg.includes('failed') ||
               msg.includes('ZeroGPU') ||
               msg.includes('Mode 2');
             if (isFatal) {
