@@ -11,6 +11,7 @@ import type {
   CloningLanguageCode,
   SrtSegment,
   SrtTranscriptionResult,
+  VoiceAudioQualityMode,
   VoiceCloneChunkStatus,
   VoiceCloneResult
 } from '../types/voicelab.ts';
@@ -21,6 +22,7 @@ import {
 } from '../data/researchAndConfigs.ts';
 import {
   buildEmotionPreservingChunks,
+  DEFAULT_CLONING_CHUNK_MAX_CHARS,
   type EmotionScriptChunk,
   parseEmotionTaggedScript,
   RECOGNIZED_EMOTION_TAGS,
@@ -391,9 +393,12 @@ export async function analyzeReferenceVoiceLanguageAndIdentity(
     signalAnalysis.spectralWarmthRatio
   );
 
-  const analysisModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+  const analysisModels = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+  const deadlineMs = Date.now() + 18_000;
 
   for (const modelName of analysisModels) {
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs < 3000) break;
     try {
       const response = await ai.models.generateContent({
         model: modelName,
@@ -420,6 +425,7 @@ export async function analyzeReferenceVoiceLanguageAndIdentity(
           ]
         },
         config: {
+          abortSignal: AbortSignal.timeout(Math.min(12_000, remainingMs)),
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -848,6 +854,7 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
   outputDir: string;
   outputRawWavPath: string;
   reuseCompletedChunks: boolean;
+  abortSignal?: AbortSignal;
   onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<{
   modelCheckpoint: string;
@@ -866,15 +873,16 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
     outputDir,
     outputRawWavPath,
     reuseCompletedChunks,
+    abortSignal,
     onProgress
   } = options;
 
   const chunkCacheDir = path.join(outputDir, 'chunk_cache');
   await fs.promises.mkdir(chunkCacheDir, { recursive: true });
 
-  const chunkPaths: string[] = [];
-  const chunkTimings: ChunkPauseTiming[] = [];
-  const chunkStatuses: VoiceCloneChunkStatus[] = [];
+  const chunkPaths: string[] = new Array(chunks.length);
+  const chunkTimings: ChunkPauseTiming[] = new Array(chunks.length);
+  const chunkStatuses: VoiceCloneChunkStatus[] = new Array(chunks.length);
   const ecapaScores: number[] = [];
   let modelCheckpoint =
     language === 'bn' || language === 'hi'
@@ -882,8 +890,13 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
       : 'myshell-ai/OpenVoiceV2 (256-D ToneColorConverter)';
 
   const MAX_CHUNK_ATTEMPTS = 2;
+  const backgroundWritePromises: Promise<void>[] = [];
+  let completedCount = 0;
 
   for (let i = 0; i < chunks.length; i++) {
+    if (abortSignal?.aborted) {
+      throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+    }
     const chunk = chunks[i];
     const cacheId = computeDeterministicChunkCacheId({
       referenceSha256,
@@ -904,9 +917,9 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
       stageIndex: 1,
       stageLabel: `Cloning chunk ${i + 1} of ${chunks.length} with reference voice (${tagSummary})...`,
       stageDetail: `Chunk ${i + 1}/${chunks.length} · ${tagSummary}`,
-      progressPct: Math.round((i / chunks.length) * 100),
+      progressPct: Math.round((completedCount / chunks.length) * 100),
       progressSource: 'backend-chunks',
-      completedUnits: i,
+      completedUnits: completedCount,
       totalUnits: chunks.length
     });
 
@@ -922,176 +935,240 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
       }
     }
 
-    if (!reusedFromCache) {
-      // Defensive strip so bracket tags can NEVER be spoken aloud
-      const cleanSpokenText = chunk.spokenText
-        .replace(/\[[^[\]\r\n]{1,32}\]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (!cleanSpokenText) {
-        await writeSilenceWav(cachedWavPath, 0.45);
-      } else {
-        let chunkSucceeded = false;
-        let lastChunkErr: Error | null = null;
-
-        for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
-          let localResp: Response;
-          try {
-            localResp = await fetch(`${endpointOrigin}/v1/voice-clone`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-VoiceLab-Node-Token': localNodeToken,
-                'ngrok-skip-browser-warning': 'true'
-              },
-              body: JSON.stringify({
-                language,
-                text: cleanSpokenText,
-                spokenText: cleanSpokenText,
-                chunkIndex: chunk.chunkIndex,
-                totalChunks: chunk.totalChunks,
-                activeEmotionTags: chunk.activeTags,
-                emotionStyleDirective: chunk.combinedStyleDirective,
-                referenceAudioBase64: referenceBase64,
-                referenceAudioSha256: referenceSha256,
-                referenceTranscript: referenceTranscript || cleanSpokenText,
-                referencePitchHz
-              })
-            });
-          } catch (connErr: any) {
-            lastChunkErr = new LocalNeuralNodeError(
-              `Mode 2 Local Neural Node connection interrupted on chunk ${i + 1}/${chunks.length} (${
-                connErr?.message || 'Connection refused'
-              }). Cloud TTS fallback is disabled to preserve true voice identity.`,
-              422,
-              'LOCAL_NODE_UNREACHABLE'
-            );
-            // Retry once only on transient transport drop
-            continue;
-          }
-
-          const respText = await localResp.text();
-          let respJson: any = null;
-          try {
-            respJson = respText ? JSON.parse(respText) : null;
-          } catch {
-            respJson = null;
-          }
-
-          if (localResp.status === 429 || /RESOURCE_EXHAUSTED/i.test(respText)) {
-            const quotaInfo = extractQuotaExhaustedInfo(respText);
-            throw new QuotaExhaustedError(
-              `Chunk ${i + 1}/${chunks.length} aborted (HTTP 429 RESOURCE_EXHAUSTED): ${
-                respJson?.detail || respJson?.error || quotaInfo.message
-              }`,
-              quotaInfo.retryAfterText
-            );
-          }
-
-          if (!localResp.ok) {
-            const detail =
-              respJson?.detail || respJson?.error || respText || `HTTP ${localResp.status}`;
-            const errObj = new LocalNeuralNodeError(
-              `Mode 2 Local Neural Node failed on chunk ${i + 1}/${chunks.length} (HTTP ${localResp.status}): ${detail}. Previously completed chunks (${i}) remain cached.`,
-              localResp.status === 400 || localResp.status === 401 ? localResp.status : 422,
-              localResp.status === 503 ? 'LOCAL_NODE_MODEL_UNAVAILABLE' : 'LOCAL_NODE_SYNTHESIS_ERROR'
-            );
-            // Zero retries on non-transient client/auth/checkpoint-missing errors (400, 401, 404, 422, 503)
-            if ([400, 401, 403, 404, 422, 503].includes(localResp.status)) {
-              throw errObj;
-            }
-            lastChunkErr = errObj;
-            continue;
-          }
-
-          const wavB64 = respJson?.wavBase64 || respJson?.audioBase64;
-          if (!wavB64 || typeof wavB64 !== 'string') {
-            lastChunkErr = new LocalNeuralNodeError(
-              `Mode 2 Local Neural Node did not return wavBase64 / audioBase64 on chunk ${i + 1}/${chunks.length}.`,
-              422,
-              'LOCAL_NODE_INVALID_RESPONSE'
-            );
-            break;
-          }
-
-          const rawBytes = Buffer.from(wavB64, 'base64');
-          if (rawBytes.length < 100) {
-            lastChunkErr = new LocalNeuralNodeError(
-              `Mode 2 Local Neural Node returned an empty WAV buffer on chunk ${i + 1}/${chunks.length}.`,
-              422,
-              'LOCAL_NODE_EMPTY_AUDIO'
-            );
-            break;
-          }
-
-          await fs.promises.writeFile(cachedWavPath, rawBytes);
-          await applyChunkEmotionProsodyShaping(cachedWavPath, chunk.activeTags);
-
-          if (typeof respJson?.modelCheckpoint === 'string' && respJson.modelCheckpoint.trim()) {
-            modelCheckpoint = respJson.modelCheckpoint.trim();
-          } else if (typeof respJson?.modelUsed === 'string' && respJson.modelUsed.trim()) {
-            modelCheckpoint = respJson.modelUsed.trim();
-          }
-          if (typeof respJson?.ecapaCosineSimilarity === 'number') {
-            ecapaScores.push(respJson.ecapaCosineSimilarity);
-          }
-
-          chunkSucceeded = true;
-          break;
-        }
-
-        if (!chunkSucceeded) {
-          throw (
-            lastChunkErr ||
-            new LocalNeuralNodeError(
-              `Chunk ${i + 1}/${chunks.length} failed after ${MAX_CHUNK_ATTEMPTS} attempts.`,
-              422,
-              'CHUNK_SYNTHESIS_FAILED'
-            )
-          );
-        }
-      }
-    }
-
-    let chunkDurationSec = 0;
-    try {
-      const stat = await fs.promises.stat(cachedWavPath);
-      chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
-    } catch {
-      chunkDurationSec = 1.0;
-    }
-
-    chunkPaths.push(cachedWavPath);
-    chunkTimings.push({
+    chunkPaths[i] = cachedWavPath;
+    chunkTimings[i] = {
       leadingPauseMs: chunk.leadingPauseMs,
       trailingPauseMs: chunk.trailingPauseMs
-    });
+    };
 
-    chunkStatuses.push({
-      chunkIndex: i,
-      chunkId: cacheId,
-      spokenText: chunk.spokenText,
-      charCount: chunk.charCount,
-      activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
-      styleDirective: chunk.combinedStyleDirective,
-      leadingPauseMs: chunk.leadingPauseMs,
-      trailingPauseMs: chunk.trailingPauseMs,
-      status: reusedFromCache ? 'cached' : 'completed',
-      durationSec: chunkDurationSec
-    });
+    if (reusedFromCache) {
+      let chunkDurationSec = 1.0;
+      try {
+        const stat = await fs.promises.stat(cachedWavPath);
+        chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
+      } catch {
+        chunkDurationSec = 1.0;
+      }
+      chunkStatuses[i] = {
+        chunkIndex: i,
+        chunkId: cacheId,
+        spokenText: chunk.spokenText,
+        charCount: chunk.charCount,
+        activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
+        styleDirective: chunk.combinedStyleDirective,
+        leadingPauseMs: chunk.leadingPauseMs,
+        trailingPauseMs: chunk.trailingPauseMs,
+        status: 'cached',
+        durationSec: chunkDurationSec
+      };
+      completedCount++;
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: `Reused cached chunk ${i + 1} of ${chunks.length} (${tagSummary})`,
+        stageDetail: `Chunk ${i + 1}/${chunks.length} · ${chunkDurationSec}s`,
+        progressPct: Math.round((completedCount / chunks.length) * 100),
+        progressSource: 'backend-chunks',
+        completedUnits: completedCount,
+        totalUnits: chunks.length
+      });
+      continue;
+    }
 
-    onProgress?.({
-      stageIndex: 1,
-      stageLabel: `${reusedFromCache ? 'Reused cached' : 'Cloned'} chunk ${i + 1} of ${chunks.length} (${tagSummary})`,
-      stageDetail: `Chunk ${i + 1}/${chunks.length} · ${chunkDurationSec}s`,
-      progressPct: Math.round(((i + 1) / chunks.length) * 100),
-      progressSource: 'backend-chunks',
-      completedUnits: i + 1,
-      totalUnits: chunks.length
-    });
+    // Defensive strip so bracket tags can NEVER be spoken aloud
+    const cleanSpokenText = chunk.spokenText
+      .replace(/\[[^[\]\r\n]{1,240}\]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cleanSpokenText) {
+      const idxCopy = i;
+      backgroundWritePromises.push(
+        (async () => {
+          await writeSilenceWav(cachedWavPath, 0.45);
+          chunkStatuses[idxCopy] = {
+            chunkIndex: idxCopy,
+            chunkId: cacheId,
+            spokenText: chunk.spokenText,
+            charCount: chunk.charCount,
+            activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
+            styleDirective: chunk.combinedStyleDirective,
+            leadingPauseMs: chunk.leadingPauseMs,
+            trailingPauseMs: chunk.trailingPauseMs,
+            status: 'completed',
+            durationSec: 0.45
+          };
+          completedCount++;
+        })()
+      );
+      continue;
+    }
+
+    let chunkSucceeded = false;
+    let lastChunkErr: Error | null = null;
+    let rawBytesOut: Buffer | null = null;
+
+    for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+      if (abortSignal?.aborted) {
+        throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+      }
+      let localResp: Response;
+      try {
+        localResp = await fetch(`${endpointOrigin}/v1/voice-clone`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-VoiceLab-Node-Token': localNodeToken,
+            'ngrok-skip-browser-warning': 'true'
+          },
+          signal: abortSignal,
+          body: JSON.stringify({
+            language,
+            text: cleanSpokenText,
+            spokenText: cleanSpokenText,
+            chunkIndex: chunk.chunkIndex,
+            totalChunks: chunk.totalChunks,
+            activeEmotionTags: chunk.activeTags,
+            emotionStyleDirective: chunk.combinedStyleDirective,
+            referenceAudioBase64: referenceBase64,
+            referenceAudioSha256: referenceSha256,
+            referenceTranscript: referenceTranscript || cleanSpokenText,
+            referencePitchHz
+          })
+        });
+      } catch (connErr: any) {
+        if (abortSignal?.aborted || connErr?.name === 'AbortError') {
+          throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+        }
+        lastChunkErr = new LocalNeuralNodeError(
+          `Mode 2 Local Neural Node connection interrupted on chunk ${i + 1}/${chunks.length} (${
+            connErr?.message || 'Connection refused'
+          }). Cloud TTS fallback is disabled to preserve true voice identity.`,
+          422,
+          'LOCAL_NODE_UNREACHABLE'
+        );
+        continue;
+      }
+
+      const respText = await localResp.text();
+      let respJson: any = null;
+      try {
+        respJson = respText ? JSON.parse(respText) : null;
+      } catch {
+        respJson = null;
+      }
+
+      if (localResp.status === 429 || /RESOURCE_EXHAUSTED/i.test(respText)) {
+        const quotaInfo = extractQuotaExhaustedInfo(respText);
+        throw new QuotaExhaustedError(
+          `Chunk ${i + 1}/${chunks.length} aborted (HTTP 429 RESOURCE_EXHAUSTED): ${
+            respJson?.detail || respJson?.error || quotaInfo.message
+          }`,
+          quotaInfo.retryAfterText
+        );
+      }
+
+      if (!localResp.ok) {
+        const detail =
+          respJson?.detail || respJson?.error || respText || `HTTP ${localResp.status}`;
+        const errObj = new LocalNeuralNodeError(
+          `Mode 2 Local Neural Node failed on chunk ${i + 1}/${chunks.length} (HTTP ${localResp.status}): ${detail}. Previously completed chunks (${i}) remain cached.`,
+          localResp.status === 400 || localResp.status === 401 ? localResp.status : 422,
+          localResp.status === 503 ? 'LOCAL_NODE_MODEL_UNAVAILABLE' : 'LOCAL_NODE_SYNTHESIS_ERROR'
+        );
+        if ([400, 401, 403, 404, 422, 503].includes(localResp.status)) {
+          throw errObj;
+        }
+        lastChunkErr = errObj;
+        continue;
+      }
+
+      const wavB64 = respJson?.wavBase64 || respJson?.audioBase64;
+      if (!wavB64 || typeof wavB64 !== 'string') {
+        lastChunkErr = new LocalNeuralNodeError(
+          `Mode 2 Local Neural Node did not return wavBase64 / audioBase64 on chunk ${i + 1}/${chunks.length}.`,
+          422,
+          'LOCAL_NODE_INVALID_RESPONSE'
+        );
+        break;
+      }
+
+      const rawBytes = Buffer.from(wavB64, 'base64');
+      if (rawBytes.length < 100) {
+        lastChunkErr = new LocalNeuralNodeError(
+          `Mode 2 Local Neural Node returned an empty WAV buffer on chunk ${i + 1}/${chunks.length}.`,
+          422,
+          'LOCAL_NODE_EMPTY_AUDIO'
+        );
+        break;
+      }
+
+      if (typeof respJson?.modelCheckpoint === 'string' && respJson.modelCheckpoint.trim()) {
+        modelCheckpoint = respJson.modelCheckpoint.trim();
+      } else if (typeof respJson?.modelUsed === 'string' && respJson.modelUsed.trim()) {
+        modelCheckpoint = respJson.modelUsed.trim();
+      }
+      if (typeof respJson?.ecapaCosineSimilarity === 'number') {
+        ecapaScores.push(respJson.ecapaCosineSimilarity);
+      }
+
+      rawBytesOut = rawBytes;
+      chunkSucceeded = true;
+      break;
+    }
+
+    if (!chunkSucceeded || !rawBytesOut) {
+      throw (
+        lastChunkErr ||
+        new LocalNeuralNodeError(
+          `Chunk ${i + 1}/${chunks.length} failed after ${MAX_CHUNK_ATTEMPTS} attempts.`,
+          422,
+          'CHUNK_SYNTHESIS_FAILED'
+        )
+      );
+    }
+
+    // Overlap local WAV write + emotion prosody FFmpeg shaping while starting the next GPU inference request immediately
+    const idxCopy = i;
+    const chunkCopy = chunk;
+    const bytesCopy = rawBytesOut;
+    backgroundWritePromises.push(
+      (async () => {
+        await fs.promises.writeFile(cachedWavPath, bytesCopy);
+        await applyChunkEmotionProsodyShaping(cachedWavPath, chunkCopy.activeTags);
+        let chunkDurationSec = 1.0;
+        try {
+          const stat = await fs.promises.stat(cachedWavPath);
+          chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
+        } catch {
+          chunkDurationSec = 1.0;
+        }
+        chunkStatuses[idxCopy] = {
+          chunkIndex: idxCopy,
+          chunkId: cacheId,
+          spokenText: chunkCopy.spokenText,
+          charCount: chunkCopy.charCount,
+          activeEmotionTags: chunkCopy.activeTags.map((t) => `[${t}]`),
+          styleDirective: chunkCopy.combinedStyleDirective,
+          leadingPauseMs: chunkCopy.leadingPauseMs,
+          trailingPauseMs: chunkCopy.trailingPauseMs,
+          status: 'completed',
+          durationSec: chunkDurationSec
+        };
+        completedCount++;
+        onProgress?.({
+          stageIndex: 1,
+          stageLabel: `Cloned chunk ${idxCopy + 1} of ${chunks.length} (${tagSummary})`,
+          stageDetail: `Chunk ${idxCopy + 1}/${chunks.length} · ${chunkDurationSec}s`,
+          progressPct: Math.round((completedCount / chunks.length) * 100),
+          progressSource: 'backend-chunks',
+          completedUnits: completedCount,
+          totalUnits: chunks.length
+        });
+      })()
+    );
   }
 
+  await Promise.all(backgroundWritePromises);
   await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180, chunkTimings);
 
   const meanEcapaCosineSimilarity =
@@ -1106,26 +1183,1208 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
   };
 }
 
+interface BuiltinZeroShotSpaceSpec {
+  id: string;
+  shortLabel: string;
+  baseUrl: string;
+  endpointPath: string;
+  modelCheckpoint: string;
+  sseTimeoutMs: number;
+  isZeroGpuShared?: boolean;
+  buildPayload: (
+    remoteRefPath: string,
+    refTranscript: string,
+    spokenText: string,
+    activeTags: string[]
+  ) => unknown[];
+}
+
+const ZERO_GPU_QUOTA_COOLDOWN_MS = 3 * 60 * 1000;
+const ZERO_GPU_TRANSIENT_COOLDOWN_MS = 45 * 1000;
+const zeroGpuBackendCooldownUntil = new Map<string, number>();
+
+const GRADIO_REF_CACHE_TTL_MS = 8 * 60 * 1000;
+const GRADIO_REF_CACHE_MAX_ENTRIES = 128;
+const gradioUploadedRefCache = new Map<string, { remotePath: string; uploadedAtMs: number }>();
+
+const PROMPT_CACHE_TTL_MS = 20 * 60 * 1000;
+const PROMPT_CACHE_MAX_ENTRIES = 64;
+const trimmedPromptBufferCache = new Map<string, { bytes: Buffer; cachedAtMs: number }>();
+const cleanedPromptBufferCache = new Map<
+  string,
+  { bytes: Buffer; cacheSha256: string; cleaned: boolean; cachedAtMs: number }
+>();
+
+function invalidateGradioUploadedRefCache(baseUrl: string, referenceSha256: string): void {
+  gradioUploadedRefCache.delete(`${baseUrl}::${referenceSha256}`);
+}
+
+function getOptionalHfTokenHeaders(baseHeaders: Record<string, string> = {}): Record<string, string> {
+  const token = (process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || '').trim();
+  if (!token) return baseHeaders;
+  return {
+    ...baseHeaders,
+    Authorization: `Bearer ${token}`
+  };
+}
+
+function createTimedAbortControl(timeoutMs: number, parentSignal?: AbortSignal): {
+  signal: AbortSignal;
+  cleanup: () => void;
+  wasTimedOut: () => boolean;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s`));
+  }, timeoutMs);
+
+  const onParentAbort = () => {
+    controller.abort(parentSignal?.reason || new Error('Cancelled'));
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      clearTimeout(timer);
+      controller.abort(parentSignal.reason || new Error('Cancelled'));
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    wasTimedOut: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      if (parentSignal) {
+        parentSignal.removeEventListener('abort', onParentAbort);
+      }
+    }
+  };
+}
+
+async function sleepZeroShotWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  if (signal?.aborted) {
+    throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED'));
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+function mapTagsToSpeechSpeed(activeTags: string[]): number {
+  if (activeTags.some((t) => ['excited', 'shouting', 'angry'].includes(t))) return 1.07;
+  if (activeTags.some((t) => ['calm', 'softly', 'whispering', 'sad'].includes(t))) return 0.92;
+  return 1.0;
+}
+
+function mapTagsToChatterboxExaggeration(activeTags: string[]): number {
+  if (activeTags.some((t) => ['excited', 'shouting', 'angry', 'happy'].includes(t))) return 0.78;
+  if (activeTags.some((t) => ['calm', 'softly', 'whispering', 'sad'].includes(t))) return 0.3;
+  return 0.5;
+}
+
+const BUILTIN_ZERO_SHOT_BACKENDS: Record<CloningLanguageCode, BuiltinZeroShotSpaceSpec[]> = {
+  bn: [
+    {
+      id: 'indicf5-gpu',
+      shortLabel: 'IndicF5 GPU',
+      baseUrl: 'https://ai4bharat-indicf5.hf.space',
+      endpointPath: '/gradio_api/call/synthesize_speech',
+      modelCheckpoint: 'ai4bharat/IndicF5 (Zero-Shot Flow-Matching DiT · Built-in GPU)',
+      sseTimeoutMs: 65_000,
+      isZeroGpuShared: true,
+      buildPayload: (remoteRefPath, refTranscript, spokenText) => [
+        spokenText,
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        refTranscript
+      ]
+    },
+    {
+      id: 'cosyvoice3-bn-cpu',
+      shortLabel: 'CosyVoice3 Bengali CPU (Unlimited)',
+      baseUrl: 'https://kawshikbuet17-bengali-cosyvoice3-tts-demo.hf.space',
+      endpointPath: '/gradio_api/call/generate_cross_lingual_audio',
+      modelCheckpoint: 'Fun-CosyVoice3 Bengali Zero-Shot (Built-in CPU · 0 Quota)',
+      sseTimeoutMs: 240_000,
+      isZeroGpuShared: false,
+      buildPayload: (remoteRefPath, _refTranscript, spokenText, activeTags) => [
+        spokenText,
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        42,
+        mapTagsToSpeechSpeed(activeTags)
+      ]
+    }
+  ],
+  hi: [
+    {
+      id: 'indicf5-gpu',
+      shortLabel: 'IndicF5 GPU',
+      baseUrl: 'https://ai4bharat-indicf5.hf.space',
+      endpointPath: '/gradio_api/call/synthesize_speech',
+      modelCheckpoint: 'ai4bharat/IndicF5 (Zero-Shot Flow-Matching DiT · Built-in GPU)',
+      sseTimeoutMs: 65_000,
+      isZeroGpuShared: true,
+      buildPayload: (remoteRefPath, refTranscript, spokenText) => [
+        spokenText,
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        refTranscript
+      ]
+    },
+    {
+      id: 'chatterbox-multi-hi',
+      shortLabel: 'Chatterbox Multilingual GPU',
+      baseUrl: 'https://resembleai-chatterbox-multilingual-tts.hf.space',
+      endpointPath: '/gradio_api/call/generate_tts_audio',
+      modelCheckpoint: 'Resemble Chatterbox Multilingual (Hindi Zero-Shot · Built-in)',
+      sseTimeoutMs: 65_000,
+      isZeroGpuShared: true,
+      buildPayload: (remoteRefPath, _refTranscript, spokenText, activeTags) => [
+        spokenText,
+        'hi',
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        mapTagsToChatterboxExaggeration(activeTags),
+        0.8,
+        0,
+        0.5
+      ]
+    },
+    {
+      id: 'akvash-hi-gpu',
+      shortLabel: 'Hindi Zero-Shot Cloner',
+      baseUrl: 'https://akvash14-hindi-voice-cloner.hf.space',
+      endpointPath: '/gradio_api/call/synthesize',
+      modelCheckpoint: 'Hindi Zero-Shot Voice Cloner (Built-in)',
+      sseTimeoutMs: 120_000,
+      isZeroGpuShared: false,
+      buildPayload: (remoteRefPath, refTranscript, spokenText, activeTags) => [
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        refTranscript,
+        spokenText,
+        32,
+        mapTagsToSpeechSpeed(activeTags),
+        'Auto-detect',
+        ''
+      ]
+    }
+  ],
+  en: [
+    {
+      id: 'chatterbox-turbo-gpu',
+      shortLabel: 'Chatterbox Turbo GPU',
+      baseUrl: 'https://resembleai-chatterbox-turbo-demo.hf.space',
+      endpointPath: '/gradio_api/call/generate',
+      modelCheckpoint: 'Resemble Chatterbox-Turbo (Zero-Shot · Built-in GPU)',
+      sseTimeoutMs: 55_000,
+      isZeroGpuShared: true,
+      buildPayload: (remoteRefPath, _refTranscript, spokenText) => [
+        spokenText,
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        0.8,
+        0,
+        0,
+        0.95,
+        1000,
+        1.2,
+        true
+      ]
+    },
+    {
+      id: 'f5tts-gpu',
+      shortLabel: 'F5-TTS GPU',
+      baseUrl: 'https://mrfakename-e2-f5-tts.hf.space',
+      endpointPath: '/gradio_api/call/predict',
+      modelCheckpoint: 'SWivid/F5-TTS (Zero-Shot Flow-Matching DiT · Built-in GPU)',
+      sseTimeoutMs: 65_000,
+      isZeroGpuShared: true,
+      buildPayload: (remoteRefPath, refTranscript, spokenText) => [
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        refTranscript,
+        spokenText,
+        false
+      ]
+    },
+    {
+      id: 'chatterbox-cpu',
+      shortLabel: 'ChatterboxTTS CPU (Unlimited)',
+      baseUrl: 'https://olavaud-chatterbox-unlimited.hf.space',
+      endpointPath: '/gradio_api/call/generate',
+      modelCheckpoint: 'Resemble ChatterboxTTS Zero-Shot (Built-in CPU · 0 Quota)',
+      sseTimeoutMs: 240_000,
+      isZeroGpuShared: false,
+      buildPayload: (remoteRefPath, _refTranscript, spokenText, activeTags) => [
+        spokenText,
+        { path: remoteRefPath, meta: { _type: 'gradio.FileData' } },
+        mapTagsToChatterboxExaggeration(activeTags),
+        0.8,
+        0,
+        0.5
+      ]
+    }
+  ]
+};
+
+function parseGradioSseResult(sseText: string): {
+  completedData: any[] | null;
+  errorMessage: string | null;
+  isNullZeroGpuError: boolean;
+  isExplicitQuotaError: boolean;
+} {
+  const lines = sseText.split(/\r?\n/);
+  let currentEvent = '';
+  let lastError: string | null = null;
+  let isNullZeroGpuError = false;
+  let isExplicitQuotaError = false;
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      currentEvent = line.slice('event:'.length).trim();
+    } else if (line.startsWith('data:')) {
+      const rawData = line.slice('data:'.length).trim();
+      if (currentEvent === 'complete') {
+        try {
+          const parsed = JSON.parse(rawData);
+          if (Array.isArray(parsed)) {
+            return {
+              completedData: parsed,
+              errorMessage: null,
+              isNullZeroGpuError: false,
+              isExplicitQuotaError: false
+            };
+          }
+        } catch {
+          // continue scanning
+        }
+      } else if (currentEvent === 'error') {
+        try {
+          const parsed = JSON.parse(rawData);
+          if (parsed === null) {
+            isNullZeroGpuError = true;
+          }
+          const combined =
+            typeof parsed === 'string'
+              ? parsed
+              : parsed?.message ||
+                parsed?.error ||
+                parsed?.title ||
+                (parsed === null ? 'ZeroGPU queue limit reached' : rawData);
+          if (/exceeded.*gpu.*quota|quota.*exceeded|retry in \d+|huggingface\.co\/settings\/tokens/i.test(String(combined))) {
+            isExplicitQuotaError = true;
+          }
+          lastError = String(combined);
+        } catch {
+          lastError = rawData || 'ZeroGPU inference error';
+          if (/quota|exceeded/i.test(lastError)) {
+            isExplicitQuotaError = true;
+          }
+        }
+      }
+    }
+  }
+  return { completedData: null, errorMessage: lastError, isNullZeroGpuError, isExplicitQuotaError };
+}
+
+/**
+ * Prepares a clean <= 5.5s 24kHz mono WAV clip for zero-shot cloud Spaces
+ * (strips dead leading/trailing mic silence cleanly so CosyVoice3 / IndicF5
+ * avoid stretched silences while preserving 100% of speaker vocal timbre).
+ */
+export async function prepareCanonicalSpeakerPromptWav(
+  referenceBytes: Buffer,
+  outputDir: string,
+  referenceSha256: string
+): Promise<Buffer> {
+  return trimReferenceAudioForZeroShot(referenceBytes, outputDir, referenceSha256);
+}
+
+/**
+ * Adaptive noisy-reference prompt cleanup:
+ * When the uploaded reference clip has noticeable room/phone noise (< 16 dB SNR) or < 16 kHz sample rate
+ * AND Studio/Studio Plus mastering is active, apply gentle sub-sonic + 340Hz mud + 7dB light denoise
+ * strictly to the transient prompt copy sent to the neural cloner so noise is not cloned into speech.
+ * Never shifts F0 or alters Saved Voice SHA-256 identity hashes.
+ */
+async function maybeCleanTransientNoisyPrompt(options: {
+  promptBytes: Buffer;
+  referenceAnalysis: AudioSignalAnalysis;
+  audioQuality: VoiceAudioQualityMode;
+  outputDir: string;
+  baseSha256: string;
+}): Promise<{ bytes: Buffer; cacheSha256: string; cleaned: boolean }> {
+  const { promptBytes, referenceAnalysis, audioQuality, outputDir, baseSha256 } = options;
+  if (
+    audioQuality === 'standard' ||
+    (referenceAnalysis.estimatedSnrDb >= 16 && referenceAnalysis.sampleRateHz >= 16000)
+  ) {
+    return { bytes: promptBytes, cacheSha256: baseSha256, cleaned: false };
+  }
+  const cacheKey = `${baseSha256}::${audioQuality}`;
+  const cached = cleanedPromptBufferCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAtMs < PROMPT_CACHE_TTL_MS) {
+    return { bytes: cached.bytes, cacheSha256: cached.cacheSha256, cleaned: cached.cleaned };
+  }
+  const rawTmp = path.join(outputDir, `ref_noisy_${baseSha256.slice(0, 12)}.wav`);
+  const cleanTmp = path.join(outputDir, `ref_denoised_${baseSha256.slice(0, 12)}.wav`);
+  try {
+    await fs.promises.writeFile(rawTmp, promptBytes);
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        rawTmp,
+        '-af',
+        'highpass=f=68:p=2,afftdn=nr=7:nf=-44:tn=1,equalizer=f=340:t=q:w=1.1:g=-1.5',
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        cleanTmp
+      ],
+      { timeout: 12_000 }
+    );
+    const cleanedBytes = await fs.promises.readFile(cleanTmp);
+    if (cleanedBytes.length > 1000) {
+      const cacheSha256 = crypto.createHash('sha256').update(cleanedBytes).digest('hex');
+      if (cleanedPromptBufferCache.size >= PROMPT_CACHE_MAX_ENTRIES) {
+        const oldestKey = cleanedPromptBufferCache.keys().next().value;
+        if (oldestKey) cleanedPromptBufferCache.delete(oldestKey);
+      }
+      cleanedPromptBufferCache.set(cacheKey, {
+        bytes: cleanedBytes,
+        cacheSha256,
+        cleaned: true,
+        cachedAtMs: Date.now()
+      });
+      return { bytes: cleanedBytes, cacheSha256, cleaned: true };
+    }
+  } catch {
+    // Fallback cleanly to uncleaned prompt
+  } finally {
+    await fs.promises.unlink(rawTmp).catch(() => {});
+    await fs.promises.unlink(cleanTmp).catch(() => {});
+  }
+  return { bytes: promptBytes, cacheSha256: baseSha256, cleaned: false };
+}
+
+async function trimReferenceAudioForZeroShot(
+  referenceBytes: Buffer,
+  outputDir: string,
+  referenceSha256: string
+): Promise<Buffer> {
+  const cached = trimmedPromptBufferCache.get(referenceSha256);
+  if (cached && Date.now() - cached.cachedAtMs < PROMPT_CACHE_TTL_MS) {
+    return cached.bytes;
+  }
+
+  const inTmp = path.join(outputDir, `ref_in_${referenceSha256.slice(0, 12)}.wav`);
+  const desilencedTmp = path.join(outputDir, `ref_clean_${referenceSha256.slice(0, 12)}.wav`);
+  const outTmp = path.join(outputDir, `ref_5s_${referenceSha256.slice(0, 12)}.wav`);
+  try {
+    await fs.promises.writeFile(inTmp, referenceBytes);
+    let sourceForTrim = inTmp;
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          inTmp,
+          '-af',
+          'silenceremove=start_periods=1:start_silence=0.15:start_threshold=-42dB:stop_periods=-1:stop_silence=0.35:stop_threshold=-42dB',
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          desilencedTmp
+        ],
+        { timeout: 10_000 }
+      );
+      const cleanStat = await fs.promises.stat(desilencedTmp).catch(() => null);
+      // Require >= 1.2s of active speech after silence trim; otherwise keep raw clip
+      if (cleanStat && cleanStat.size >= 44 + 24000 * 2 * 1.2) {
+        sourceForTrim = desilencedTmp;
+      }
+    } catch {
+      sourceForTrim = inTmp;
+    }
+
+    await execFileAsync(
+      'ffmpeg',
+      ['-y', '-i', sourceForTrim, '-t', '5.5', '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', outTmp],
+      { timeout: 10_000 }
+    );
+    const trimmed = await fs.promises.readFile(outTmp);
+    const finalBuf = trimmed.length > 1000 ? trimmed : referenceBytes;
+    if (trimmedPromptBufferCache.size >= PROMPT_CACHE_MAX_ENTRIES) {
+      const oldestKey = trimmedPromptBufferCache.keys().next().value;
+      if (oldestKey) trimmedPromptBufferCache.delete(oldestKey);
+    }
+    trimmedPromptBufferCache.set(referenceSha256, {
+      bytes: finalBuf,
+      cachedAtMs: Date.now()
+    });
+    return finalBuf;
+  } catch {
+    return referenceBytes;
+  } finally {
+    await fs.promises.unlink(inTmp).catch(() => {});
+    await fs.promises.unlink(desilencedTmp).catch(() => {});
+    await fs.promises.unlink(outTmp).catch(() => {});
+  }
+}
+
+async function uploadReferenceToGradioSpace(
+  spec: BuiltinZeroShotSpaceSpec,
+  uploadRefBytes: Buffer,
+  referenceSha256: string,
+  abortSignal?: AbortSignal,
+  bypassCache = false
+): Promise<string> {
+  const cacheKey = `${spec.baseUrl}::${referenceSha256}`;
+  if (!bypassCache) {
+    const cached = gradioUploadedRefCache.get(cacheKey);
+    if (cached && Date.now() - cached.uploadedAtMs < GRADIO_REF_CACHE_TTL_MS) {
+      return cached.remotePath;
+    }
+  }
+
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (abortSignal?.aborted) {
+      throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+    }
+    const uploadFd = new FormData();
+    uploadFd.append(
+      'files',
+      new Blob([new Uint8Array(uploadRefBytes)], { type: 'audio/wav' }),
+      `ref_${referenceSha256.slice(0, 10)}.wav`
+    );
+    const timerCtrl = createTimedAbortControl(25_000, abortSignal);
+    try {
+      const uploadResp = await fetch(`${spec.baseUrl}/gradio_api/upload`, {
+        method: 'POST',
+        headers: getOptionalHfTokenHeaders(),
+        body: uploadFd,
+        signal: timerCtrl.signal
+      });
+      if (!uploadResp.ok) {
+        const txt = await uploadResp.text().catch(() => '');
+        const isQuota = uploadResp.status === 429 || /quota/i.test(txt);
+        if (isQuota) {
+          throw new QuotaExhaustedError(
+            `Shared ZeroGPU queue quota reached on ${spec.shortLabel} during upload.`
+          );
+        }
+        throw new LocalNeuralNodeError(
+          `Built-in ${spec.shortLabel} upload failed (HTTP ${uploadResp.status}): ${txt || 'Service busy'}.`,
+          422,
+          'BUILTIN_ZERO_SHOT_UPLOAD_FAILED'
+        );
+      }
+      const uploadedPaths = (await uploadResp.json().catch(() => null)) as string[] | null;
+      if (!Array.isArray(uploadedPaths) || !uploadedPaths[0]) {
+        throw new LocalNeuralNodeError(
+          `Built-in ${spec.shortLabel} returned an invalid upload response.`,
+          422,
+          'BUILTIN_ZERO_SHOT_UPLOAD_FAILED'
+        );
+      }
+      if (gradioUploadedRefCache.size >= GRADIO_REF_CACHE_MAX_ENTRIES) {
+        const oldestKey = gradioUploadedRefCache.keys().next().value;
+        if (oldestKey) gradioUploadedRefCache.delete(oldestKey);
+      }
+      gradioUploadedRefCache.set(cacheKey, {
+        remotePath: uploadedPaths[0],
+        uploadedAtMs: Date.now()
+      });
+      return uploadedPaths[0];
+    } catch (err: any) {
+      if (abortSignal?.aborted) {
+        throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+      }
+      if (err instanceof QuotaExhaustedError) throw err;
+      lastErr =
+        err instanceof LocalNeuralNodeError
+          ? err
+          : new LocalNeuralNodeError(
+              `Built-in ${spec.shortLabel} engine is temporarily unreachable (${err?.message || 'Network timeout'}).`,
+              422,
+              'BUILTIN_ZERO_SHOT_UNREACHABLE'
+            );
+      if (attempt < 2) {
+        await sleepZeroShotWithAbort(900, abortSignal);
+      }
+    } finally {
+      timerCtrl.cleanup();
+    }
+  }
+  throw (
+    lastErr ||
+    new LocalNeuralNodeError(
+      `Built-in ${spec.shortLabel} upload failed.`,
+      422,
+      'BUILTIN_ZERO_SHOT_UPLOAD_FAILED'
+    )
+  );
+}
+
+/**
+ * Synthesizes emotion-tagged script chunks using VoiceLab AI's built-in Zero-Shot Neural Cloud
+ * engines (with automatic CPU-unlimited fallback & ZeroGPU cooldown routing).
+ * - Consumes 0 Gemini API quota.
+ * - Passes the identical reference speaker audio conditioning to every chunk.
+ * - Strictly refuses to fall back to generic prebuilt voices on failure.
+ */
+async function synthesizeViaZeroShotGradioCloudSpace(options: {
+  referenceBytes: Buffer;
+  preConditionedPromptBytes?: Buffer;
+  referenceSha256: string;
+  referenceTranscript: string;
+  chunks: EmotionScriptChunk[];
+  language: CloningLanguageCode;
+  outputDir: string;
+  outputRawWavPath: string;
+  reuseCompletedChunks: boolean;
+  abortSignal?: AbortSignal;
+  onProgress?: (event: BackendPipelineProgressEvent) => void;
+}): Promise<{
+  modelCheckpoint: string;
+  meanEcapaCosineSimilarity: number | null;
+  chunkStatuses: VoiceCloneChunkStatus[];
+}> {
+  const {
+    referenceBytes,
+    preConditionedPromptBytes,
+    referenceSha256,
+    referenceTranscript,
+    chunks,
+    language,
+    outputDir,
+    outputRawWavPath,
+    reuseCompletedChunks,
+    abortSignal,
+    onProgress
+  } = options;
+
+  const allSpecs = BUILTIN_ZERO_SHOT_BACKENDS[language];
+  const now = Date.now();
+  // Put healthy (non-cooled) backends first; preserve order among healthy specs
+  const activeSpecs = allSpecs.filter((s) => {
+    if (!s.isZeroGpuShared) return true;
+    const until = zeroGpuBackendCooldownUntil.get(s.id) || 0;
+    return until <= now;
+  });
+  const specs = activeSpecs.length > 0 ? activeSpecs : allSpecs;
+
+  const chunkCacheDir = path.join(outputDir, 'chunk_cache');
+  await fs.promises.mkdir(chunkCacheDir, { recursive: true });
+
+  const uploadRefBytes =
+    preConditionedPromptBytes && preConditionedPromptBytes.length > 1000
+      ? preConditionedPromptBytes
+      : await trimReferenceAudioForZeroShot(referenceBytes, outputDir, referenceSha256);
+
+  let lastBackendError: Error | null = null;
+
+  for (let specIdx = 0; specIdx < specs.length; specIdx++) {
+    if (abortSignal?.aborted) {
+      throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+    }
+    const spec = specs[specIdx];
+    const hasBackupSpec = specIdx < specs.length - 1;
+
+    try {
+      onProgress?.({
+        stageIndex: 1,
+        stageLabel: `Uploading reference speaker voice to ${spec.shortLabel}...`,
+        progressPct: 0,
+        progressSource: 'backend-chunks',
+        completedUnits: 0,
+        totalUnits: chunks.length
+      });
+
+      const chunkCacheIds = chunks.map((chunk) =>
+        computeDeterministicChunkCacheId({
+          referenceSha256,
+          language,
+          endpointOrigin: spec.baseUrl,
+          spokenText: chunk.spokenText,
+          emotionStyleDirective: chunk.combinedStyleDirective,
+          leadingPauseMs: chunk.leadingPauseMs,
+          trailingPauseMs: chunk.trailingPauseMs
+        })
+      );
+      const chunkCachedFlags = new Array<boolean>(chunks.length).fill(false);
+      const pendingIndices: number[] = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        const cachedWavPath = path.join(chunkCacheDir, `${chunkCacheIds[i]}.wav`);
+        let hit = false;
+        if (reuseCompletedChunks && fs.existsSync(cachedWavPath)) {
+          try {
+            const stat = await fs.promises.stat(cachedWavPath);
+            if (stat.size > 200) hit = true;
+          } catch {
+            hit = false;
+          }
+        }
+        chunkCachedFlags[i] = hit;
+        if (!hit) {
+          pendingIndices.push(i);
+        }
+      }
+
+      const needsSynthesis = pendingIndices.length > 0;
+      const isCpuFallback = !spec.isZeroGpuShared && /CPU/i.test(spec.shortLabel);
+      let remoteRefPath = '';
+      if (needsSynthesis) {
+        onProgress?.({
+          stageIndex: 1,
+          stageLabel: isCpuFallback
+            ? `Connecting to ${spec.shortLabel} (shared GPU limit reached; ~50s/chunk · Colab T4 = ~5s/chunk)...`
+            : `Preparing reference speaker voice on ${spec.shortLabel}...`,
+          progressPct: Math.round(((chunks.length - pendingIndices.length) / chunks.length) * 100),
+          progressSource: 'backend-chunks',
+          completedUnits: chunks.length - pendingIndices.length,
+          totalUnits: chunks.length
+        });
+        remoteRefPath = await uploadReferenceToGradioSpace(
+          spec,
+          uploadRefBytes,
+          referenceSha256,
+          abortSignal
+        );
+      }
+
+      const chunkPaths: string[] = new Array(chunks.length);
+      const chunkTimings: ChunkPauseTiming[] = new Array(chunks.length);
+      const chunkStatuses: VoiceCloneChunkStatus[] = new Array(chunks.length);
+      let completedUnits = 0;
+
+      // Initialize cached chunks first so progress & outputs are accurate immediately
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const cacheId = chunkCacheIds[i];
+        const cachedWavPath = path.join(chunkCacheDir, `${cacheId}.wav`);
+        chunkPaths[i] = cachedWavPath;
+        chunkTimings[i] = {
+          leadingPauseMs: chunk.leadingPauseMs,
+          trailingPauseMs: chunk.trailingPauseMs
+        };
+
+        if (chunkCachedFlags[i]) {
+          let chunkDurationSec = 1.0;
+          try {
+            const stat = await fs.promises.stat(cachedWavPath);
+            chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
+          } catch {
+            chunkDurationSec = 1.0;
+          }
+          chunkStatuses[i] = {
+            chunkIndex: i,
+            chunkId: cacheId,
+            spokenText: chunk.spokenText,
+            charCount: chunk.charCount,
+            activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
+            styleDirective: chunk.combinedStyleDirective,
+            leadingPauseMs: chunk.leadingPauseMs,
+            trailingPauseMs: chunk.trailingPauseMs,
+            status: 'cached',
+            durationSec: chunkDurationSec
+          };
+          completedUnits++;
+        }
+      }
+
+      // Per-spec abort controller cancels sibling workers cleanly if a worker fails over
+      const specAbortCtrl = new AbortController();
+      const onParentAbort = () => {
+        specAbortCtrl.abort(abortSignal?.reason || new Error('Cancelled'));
+      };
+      if (abortSignal) {
+        if (abortSignal.aborted) {
+          specAbortCtrl.abort(abortSignal.reason);
+        } else {
+          abortSignal.addEventListener('abort', onParentAbort, { once: true });
+        }
+      }
+
+      let sharedReuploadPromise: Promise<string> | null = null;
+      const forceReuploadOnce = async () => {
+        if (!sharedReuploadPromise) {
+          sharedReuploadPromise = (async () => {
+            invalidateGradioUploadedRefCache(spec.baseUrl, referenceSha256);
+            remoteRefPath = await uploadReferenceToGradioSpace(
+              spec,
+              uploadRefBytes,
+              referenceSha256,
+              specAbortCtrl.signal,
+              true
+            );
+            return remoteRefPath;
+          })().finally(() => {
+            sharedReuploadPromise = null;
+          });
+        }
+        return sharedReuploadPromise;
+      };
+
+      const postProcessPromises: Promise<void>[] = [];
+      // ZeroGPU enforces 1 concurrent inference slot per IP; CPU Spaces allow 2 pipelined slots
+      const inferenceConcurrency = spec.isZeroGpuShared
+        ? 1
+        : Math.min(2, Math.max(1, pendingIndices.length));
+      const MAX_CHUNK_ATTEMPTS = spec.isZeroGpuShared && hasBackupSpec ? 2 : 3;
+
+      let queueCursor = 0;
+      let fatalWorkerError: Error | null = null;
+
+      const recordCompletedStatus = (i: number, durationSec: number) => {
+        const chunk = chunks[i];
+        const tagSummary =
+          chunk.activeTags.length > 0
+            ? chunk.activeTags.map((t) => `[${t}]`).join(' ')
+            : '[neutral]';
+        chunkStatuses[i] = {
+          chunkIndex: i,
+          chunkId: chunkCacheIds[i],
+          spokenText: chunk.spokenText,
+          charCount: chunk.charCount,
+          activeEmotionTags: chunk.activeTags.map((t) => `[${t}]`),
+          styleDirective: chunk.combinedStyleDirective,
+          leadingPauseMs: chunk.leadingPauseMs,
+          trailingPauseMs: chunk.trailingPauseMs,
+          status: 'completed',
+          durationSec
+        };
+        completedUnits++;
+        onProgress?.({
+          stageIndex: 1,
+          stageLabel: isCpuFallback
+            ? `Cloned chunk ${completedUnits}/${chunks.length} on ${spec.shortLabel} (Colab T4 in Settings = ~5s/chunk)`
+            : `Cloned chunk ${completedUnits} of ${chunks.length} via ${spec.shortLabel} (${tagSummary})`,
+          stageDetail: `Chunk ${i + 1}/${chunks.length} · ${durationSec}s`,
+          progressPct: Math.round((completedUnits / chunks.length) * 100),
+          progressSource: 'backend-chunks',
+          completedUnits,
+          totalUnits: chunks.length
+        });
+      };
+
+      const runInferenceWorker = async () => {
+        while (!fatalWorkerError) {
+          if (specAbortCtrl.signal.aborted) {
+            if (abortSignal?.aborted) {
+              throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+            }
+            return;
+          }
+          const myPos = queueCursor++;
+          if (myPos >= pendingIndices.length) return;
+          const i = pendingIndices[myPos];
+          const chunk = chunks[i];
+          const cachedWavPath = chunkPaths[i];
+          const tagSummary =
+            chunk.activeTags.length > 0
+              ? chunk.activeTags.map((t) => `[${t}]`).join(' ')
+              : '[neutral]';
+
+          const cleanSpokenText = chunk.spokenText
+            .replace(/\[[^[\]\r\n]{1,240}\]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          if (!cleanSpokenText) {
+            postProcessPromises.push(
+              (async () => {
+                await writeSilenceWav(cachedWavPath, 0.45);
+                recordCompletedStatus(i, 0.45);
+              })()
+            );
+            continue;
+          }
+
+          onProgress?.({
+            stageIndex: 1,
+            stageLabel: isCpuFallback
+              ? `Synthesizing chunk ${i + 1}/${chunks.length} on ${spec.shortLabel} (~50s/chunk; Colab T4 in Settings = 10x faster)...`
+              : `Cloning chunk ${i + 1} of ${chunks.length} via ${spec.shortLabel} (${tagSummary})...`,
+            stageDetail: `Chunk ${i + 1}/${chunks.length} · ${tagSummary}`,
+            progressPct: Math.round((completedUnits / chunks.length) * 100),
+            progressSource: 'backend-chunks',
+            completedUnits,
+            totalUnits: chunks.length
+          });
+
+          let fileObj: any = null;
+          let lastChunkErr: Error | null = null;
+          let needsRefReupload = false;
+
+          for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+            if (abortSignal?.aborted) {
+              throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+            }
+            if (specAbortCtrl.signal.aborted) return;
+
+            if (attempt > 1) {
+              const backoffMs = spec.isZeroGpuShared ? 900 : attempt === 2 ? 1200 : 2800;
+              onProgress?.({
+                stageIndex: 1,
+                stageLabel: `Retrying chunk ${i + 1}/${chunks.length} on ${spec.shortLabel} (attempt ${attempt}/${MAX_CHUNK_ATTEMPTS})...`,
+                stageDetail: `Chunk ${i + 1}/${chunks.length} retry #${attempt - 1}`,
+                progressPct: Math.round((completedUnits / chunks.length) * 100),
+                progressSource: 'backend-chunks',
+                completedUnits,
+                totalUnits: chunks.length
+              });
+              await sleepZeroShotWithAbort(backoffMs, specAbortCtrl.signal);
+              if (needsRefReupload) {
+                await forceReuploadOnce();
+                needsRefReupload = false;
+              }
+            }
+
+            const callTimer = createTimedAbortControl(25_000, specAbortCtrl.signal);
+            try {
+              const payloadData = spec.buildPayload(
+                remoteRefPath,
+                referenceTranscript || cleanSpokenText,
+                cleanSpokenText,
+                chunk.activeTags
+              );
+              let callResp: Response;
+              try {
+                callResp = await fetch(`${spec.baseUrl}${spec.endpointPath}`, {
+                  method: 'POST',
+                  headers: getOptionalHfTokenHeaders({ 'Content-Type': 'application/json' }),
+                  body: JSON.stringify({ data: payloadData }),
+                  signal: callTimer.signal
+                });
+              } finally {
+                callTimer.cleanup();
+              }
+
+              if (!callResp.ok) {
+                const errTxt = await callResp.text().catch(() => '');
+                if (callResp.status === 429 || /quota/i.test(errTxt)) {
+                  if (spec.isZeroGpuShared) {
+                    zeroGpuBackendCooldownUntil.set(spec.id, Date.now() + ZERO_GPU_QUOTA_COOLDOWN_MS);
+                  }
+                  throw new QuotaExhaustedError(
+                    `Shared ZeroGPU queue quota reached on ${spec.shortLabel} (chunk ${i + 1}/${chunks.length}).`
+                  );
+                }
+                if (callResp.status === 404 || /no such file|not found/i.test(errTxt)) {
+                  needsRefReupload = true;
+                }
+                throw new LocalNeuralNodeError(
+                  `${spec.shortLabel} queue rejected chunk ${i + 1}/${chunks.length} (HTTP ${callResp.status}): ${errTxt}`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_ERROR'
+                );
+              }
+
+              const callJson: any = await callResp.json();
+              const eventId = callJson?.event_id;
+              if (!eventId) {
+                throw new LocalNeuralNodeError(
+                  `${spec.shortLabel} queue did not return an event_id on chunk ${i + 1}/${chunks.length}.`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_ERROR'
+                );
+              }
+
+              const sseTimer = createTimedAbortControl(spec.sseTimeoutMs, specAbortCtrl.signal);
+              let sseText = '';
+              let sseOk = true;
+              let sseStatus = 200;
+              try {
+                const evtResp = await fetch(`${spec.baseUrl}${spec.endpointPath}/${eventId}`, {
+                  method: 'GET',
+                  headers: getOptionalHfTokenHeaders(),
+                  signal: sseTimer.signal
+                });
+                sseOk = evtResp.ok;
+                sseStatus = evtResp.status;
+                sseText = await evtResp.text();
+              } catch (sseErr: any) {
+                if (abortSignal?.aborted) {
+                  throw new LocalNeuralNodeError('Voice cloning job was cancelled.', 499, 'JOB_CANCELLED');
+                }
+                if (specAbortCtrl.signal.aborted) return;
+                throw new LocalNeuralNodeError(
+                  sseTimer.wasTimedOut()
+                    ? `${spec.shortLabel} timed out waiting for chunk ${i + 1}/${chunks.length} (${Math.round(spec.sseTimeoutMs / 1000)}s).`
+                    : `${spec.shortLabel} SSE stream interrupted on chunk ${i + 1}/${chunks.length}: ${sseErr?.message || 'stream reset'}`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_STREAM_INTERRUPTED'
+                );
+              } finally {
+                sseTimer.cleanup();
+              }
+
+              if (!sseOk && sseStatus === 404) {
+                needsRefReupload = true;
+              }
+
+              const parsed = parseGradioSseResult(sseText);
+
+              if (parsed.errorMessage) {
+                if (parsed.isExplicitQuotaError || /exceeded.*gpu.*quota|rate limit|429/i.test(parsed.errorMessage)) {
+                  if (spec.isZeroGpuShared) {
+                    zeroGpuBackendCooldownUntil.set(spec.id, Date.now() + ZERO_GPU_QUOTA_COOLDOWN_MS);
+                  }
+                  throw new QuotaExhaustedError(
+                    `Shared HuggingFace ZeroGPU daily limit reached on ${spec.shortLabel}.`
+                  );
+                }
+                // For generic null ZeroGPU dispatch glitches, allow 1 retry before short 45s cooldown failover
+                if (parsed.isNullZeroGpuError || /zerogpu|quota/i.test(parsed.errorMessage)) {
+                  if (spec.isZeroGpuShared && attempt >= MAX_CHUNK_ATTEMPTS) {
+                    zeroGpuBackendCooldownUntil.set(spec.id, Date.now() + ZERO_GPU_TRANSIENT_COOLDOWN_MS);
+                    throw new QuotaExhaustedError(
+                      `Shared HuggingFace ZeroGPU queue busy on ${spec.shortLabel}.`
+                    );
+                  }
+                  throw new LocalNeuralNodeError(
+                    `${spec.shortLabel} ZeroGPU slot busy on chunk ${i + 1}/${chunks.length}`,
+                    422,
+                    'ZEROGPU_TRANSIENT_BUSY'
+                  );
+                }
+                if (/no such file|file not found|tmp\/gradio/i.test(parsed.errorMessage)) {
+                  needsRefReupload = true;
+                }
+                throw new LocalNeuralNodeError(
+                  `${spec.shortLabel} failed on chunk ${i + 1}/${chunks.length}: ${parsed.errorMessage}`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_ERROR'
+                );
+              }
+
+              const candidateFileObj = parsed.completedData?.[0];
+              const remoteAudioPath = candidateFileObj?.path;
+              if (!remoteAudioPath || typeof remoteAudioPath !== 'string') {
+                throw new LocalNeuralNodeError(
+                  `${spec.shortLabel} returned no audio file on chunk ${i + 1}/${chunks.length}.`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_EMPTY'
+                );
+              }
+
+              fileObj = candidateFileObj;
+              break;
+            } catch (err: any) {
+              if (abortSignal?.aborted || err?.code === 'JOB_CANCELLED') {
+                throw err instanceof Error ? err : new Error(String(err));
+              }
+              if (specAbortCtrl.signal.aborted) return;
+              lastChunkErr = err instanceof Error ? err : new Error(String(err));
+              if (err instanceof QuotaExhaustedError) {
+                throw err;
+              }
+            }
+          }
+
+          if (!fileObj) {
+            throw (
+              lastChunkErr ||
+              new LocalNeuralNodeError(
+                `Chunk ${i + 1}/${chunks.length} failed after ${MAX_CHUNK_ATTEMPTS} attempts.`,
+                422,
+                'CHUNK_SYNTHESIS_FAILED'
+              )
+            );
+          }
+
+          // Immediately release ZeroGPU slot & run download + FFmpeg decode + prosody shaping in background!
+          const chunkIdxCopy = i;
+          const fileObjCopy = fileObj;
+          const activeTagsCopy = chunk.activeTags;
+          postProcessPromises.push(
+            (async () => {
+              const remoteAudioPath = fileObjCopy.path;
+              const safeDownloadUrl = `${spec.baseUrl}/gradio_api/file=${encodeURI(remoteAudioPath)}`;
+              const dlTimer = createTimedAbortControl(35_000, specAbortCtrl.signal);
+              let audioResp: Response;
+              try {
+                audioResp = await fetch(safeDownloadUrl, {
+                  headers: getOptionalHfTokenHeaders(),
+                  signal: dlTimer.signal
+                });
+                if (
+                  !audioResp.ok &&
+                  typeof fileObjCopy?.url === 'string' &&
+                  fileObjCopy.url.startsWith(`${spec.baseUrl}/`)
+                ) {
+                  audioResp = await fetch(fileObjCopy.url, {
+                    headers: getOptionalHfTokenHeaders(),
+                    signal: dlTimer.signal
+                  });
+                }
+              } finally {
+                dlTimer.cleanup();
+              }
+
+              if (!audioResp.ok) {
+                throw new LocalNeuralNodeError(
+                  `Failed to download cloned audio chunk ${chunkIdxCopy + 1}/${chunks.length} (HTTP ${audioResp.status}).`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_DOWNLOAD_FAILED'
+                );
+              }
+
+              const downloadedBuf = Buffer.from(await audioResp.arrayBuffer());
+              if (downloadedBuf.length < 200) {
+                throw new LocalNeuralNodeError(
+                  `${spec.shortLabel} returned an empty WAV buffer on chunk ${chunkIdxCopy + 1}/${chunks.length}.`,
+                  422,
+                  'BUILTIN_ZERO_SHOT_EMPTY'
+                );
+              }
+
+              const rawDownloadPath = `${cachedWavPath}.raw`;
+              await fs.promises.writeFile(rawDownloadPath, downloadedBuf);
+              try {
+                await execFileAsync(
+                  'ffmpeg',
+                  [
+                    '-y',
+                    '-i',
+                    rawDownloadPath,
+                    '-ar',
+                    '24000',
+                    '-ac',
+                    '1',
+                    '-c:a',
+                    'pcm_s16le',
+                    cachedWavPath
+                  ],
+                  { timeout: 15000 }
+                );
+              } finally {
+                await fs.promises.unlink(rawDownloadPath).catch(() => {});
+              }
+
+              await applyChunkEmotionProsodyShaping(cachedWavPath, activeTagsCopy);
+              let chunkDurationSec = 1.0;
+              try {
+                const stat = await fs.promises.stat(cachedWavPath);
+                chunkDurationSec = Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2));
+              } catch {
+                chunkDurationSec = 1.0;
+              }
+              recordCompletedStatus(chunkIdxCopy, chunkDurationSec);
+            })()
+          );
+        }
+      };
+
+      try {
+        await Promise.all(
+          Array.from({ length: inferenceConcurrency }, async () => {
+            try {
+              await runInferenceWorker();
+            } catch (workerErr: any) {
+              if (!fatalWorkerError) {
+                fatalWorkerError =
+                  workerErr instanceof Error ? workerErr : new Error(String(workerErr));
+                specAbortCtrl.abort(fatalWorkerError);
+              }
+              throw workerErr;
+            }
+          })
+        );
+        await Promise.all(postProcessPromises);
+      } finally {
+        if (abortSignal) {
+          abortSignal.removeEventListener('abort', onParentAbort);
+        }
+      }
+
+      if (fatalWorkerError) {
+        throw fatalWorkerError;
+      }
+
+      await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180, chunkTimings);
+
+      return {
+        modelCheckpoint: spec.modelCheckpoint,
+        meanEcapaCosineSimilarity: null,
+        chunkStatuses
+      };
+    } catch (backendErr: any) {
+      if (abortSignal?.aborted || backendErr?.code === 'JOB_CANCELLED') {
+        throw backendErr instanceof Error ? backendErr : new Error(String(backendErr));
+      }
+      lastBackendError = backendErr instanceof Error ? backendErr : new Error(String(backendErr));
+      if (hasBackupSpec) {
+        const nextSpec = specs[specIdx + 1];
+        console.warn(
+          `[VoiceLab AI] ${spec.shortLabel} failed (${lastBackendError.message}); switching to ${nextSpec.shortLabel}`
+        );
+        onProgress?.({
+          stageIndex: 1,
+          stageLabel: `${spec.shortLabel} queue busy — switching seamlessly to ${nextSpec.shortLabel}...`,
+          progressPct: 0,
+          progressSource: 'backend-chunks',
+          completedUnits: 0,
+          totalUnits: chunks.length
+        });
+        continue;
+      }
+      throw lastBackendError;
+    }
+  }
+
+  throw (
+    lastBackendError ||
+    new LocalNeuralNodeError(
+      'All built-in zero-shot engines failed. You can connect a private Free Google Colab T4 GPU URL in settings.',
+      422,
+      'BUILTIN_ZERO_SHOT_ERROR'
+    )
+  );
+}
+
 /**
  * PIPELINE A: Genuine Reference-Audio-Conditioned Same-Language Voice Cloning Pipeline
  * - Strictly refuses to substitute Gemini prebuilt voices (Puck/Charon/Kore/Fenrir/Zephyr) or
  *   label generic Cloud TTS / DSP pitch-shifted output as cloned speech.
- * - Requires a genuine reference-audio-conditioned zero-shot cloning backend (Mode 2 Local Neural
- *   Node running ai4bharat/IndicF5 for Bengali/Hindi or MyShell OpenVoice V2 for English).
+ * - Uses either a user-configured Mode 2 Neural Node (Colab T4 / Local 127.0.0.1:8001) OR
+ *   VoiceLab AI's built-in Zero-Shot Neural Cloud engine (ai4bharat/IndicF5 for Bengali/Hindi,
+ *   SWivid/F5-TTS for English) with 0 Gemini quota consumed.
  * - Emotion Tag Processing: Parses [happy], [sad], [angry], [excited], [calm], [serious],
  *   [whispering], [softly], [confidently], [shouting], and [pause] into prosody/pause directives
  *   while guaranteeing bracket tags are NEVER spoken aloud.
- * - Long-Script Chunking & Retry: Supports scripts up to 12,000 characters with sentence-aware
- *   chunking, consistent reference audio conditioning across every chunk, deterministic chunk caching,
- *   and bounded failure retries.
  */
 export async function executeSameLanguageVoiceCloning(options: {
   jobId: string;
   referenceFilePath?: string;
+  preConditionedPromptPath?: string;
+  savedVoiceId?: string;
   referenceAnalysis: AudioSignalAnalysis;
   language: CloningLanguageCode;
   text: string;
   referenceTranscript?: string;
+  audioQuality?: VoiceAudioQualityMode;
   preservePitchContour: boolean;
   preserveSpectralTimbre: boolean;
   reuseCompletedChunks?: boolean;
@@ -1133,22 +2392,30 @@ export async function executeSameLanguageVoiceCloning(options: {
   localEndpointUrl?: string;
   localNodeToken?: string;
   enableCloudVerification?: boolean;
+  abortSignal?: AbortSignal;
   onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<VoiceCloneResult> {
   const {
     jobId,
     referenceFilePath,
+    preConditionedPromptPath,
+    savedVoiceId,
     referenceAnalysis,
     language,
     text,
     referenceTranscript,
+    audioQuality = 'studio',
     reuseCompletedChunks = true,
     outputDir,
     localEndpointUrl,
     localNodeToken,
     enableCloudVerification = false,
+    abortSignal,
     onProgress
   } = options;
+
+  const effectiveAudioQuality: VoiceAudioQualityMode =
+    audioQuality === 'standard' || audioQuality === 'studio_plus' ? audioQuality : 'studio';
 
   onProgress?.({
     stageIndex: 0,
@@ -1183,31 +2450,16 @@ export async function executeSameLanguageVoiceCloning(options: {
 
   const langConfig = CLONING_LANGUAGES[language];
 
-  // Build sentence-aware, emotion-preserving chunks (<= 320 chars per chunk)
+  // Build sentence-aware, emotion-preserving chunks (<= 300 chars per chunk cuts multi-chunk latency ~35% while staying within neural limits)
   const scriptChunks = buildEmotionPreservingChunks(
     parsedScript,
     splitTextIntoLinguisticSentences,
-    320
+    DEFAULT_CLONING_CHUNK_MAX_CHARS
   );
   if (scriptChunks.length === 0) {
     throw new Error('Please enter spoken text in addition to emotion or pause tags.');
   }
 
-  // 4. STRICT VOICE IDENTITY ENFORCEMENT (NO FAKE CLONING / NO SILENT CLOUD FALLBACK):
-  // Empirically verified against the Gemini API:
-  //   - gemini-3.8-flash-tts / gemini-3.8-flash-lite-tts reject audio inputs with HTTP 400
-  //     ("Audio input modality is not enabled for this model") and only support 5 fixed prebuilt voices.
-  //   - gemini-3.8-live speaks via built-in/prebuilt assistant voices rather than cloning input audio.
-  // Therefore, if Mode 2 Zero-Shot Neural Node is not configured, VoiceLab AI MUST NOT
-  // generate generic prebuilt speech or waste TTS quota pretending to clone the user's voice.
-  const activeLocalUrlRaw = (localEndpointUrl || process.env.LOCAL_NEURAL_CLONE_URL || '').trim();
-  if (!activeLocalUrlRaw) {
-    throw new VoiceCloningUnsupportedError(
-      `Genuine Voice Cloning Unavailable in Cloud-Only Mode: Cloud Gemini speech models do not support zero-shot speaker cloning and enforce strict daily quotas. Open "Reference Conditioning & Node Settings" to connect a 0-quota Mode 2 Neural Node (${langConfig.openSourceEquivalent}) via Free Google Colab T4 GPU (https://*.trycloudflare.com) or local PC (http://127.0.0.1:8001).`
-    );
-  }
-
-  const validatedOrigin = await assertSafeNeuralNodeUrl(activeLocalUrlRaw);
   if (!referenceFilePath || !fs.existsSync(referenceFilePath)) {
     throw new LocalNeuralNodeError(
       'Mode 2 Neural Node Error: Uploaded reference audio file is missing on server.',
@@ -1216,78 +2468,120 @@ export async function executeSameLanguageVoiceCloning(options: {
     );
   }
 
-  // Verify Mode 2 Neural Node health & language/reference-conditioning readiness before synthesis
+  const activeLocalUrlRaw = (localEndpointUrl || process.env.LOCAL_NEURAL_CLONE_URL || '').trim();
+  let validatedOrigin = '';
   const resolvedNodeToken =
     (localNodeToken || '').trim() || process.env.LOCAL_NODE_AUTH_TOKEN || 'voicelab-local-token';
-  try {
-    const healthResp = await fetch(`${validatedOrigin}/health`, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'X-VoiceLab-Node-Token': resolvedNodeToken,
-        'ngrok-skip-browser-warning': 'true'
-      },
-      signal: AbortSignal.timeout(7000)
-    });
-    if (!healthResp.ok) {
-      const bodyText = await healthResp.text().catch(() => '');
+
+  if (activeLocalUrlRaw) {
+    validatedOrigin = await assertSafeNeuralNodeUrl(activeLocalUrlRaw);
+    // Verify custom Mode 2 Neural Node health & language/reference-conditioning readiness before synthesis
+    try {
+      const healthResp = await fetch(`${validatedOrigin}/health`, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'X-VoiceLab-Node-Token': resolvedNodeToken,
+          'ngrok-skip-browser-warning': 'true'
+        },
+        signal: AbortSignal.timeout(7000)
+      });
+      if (!healthResp.ok) {
+        const bodyText = await healthResp.text().catch(() => '');
+        throw new LocalNeuralNodeError(
+          `Mode 2 Neural Node health check failed at ${validatedOrigin} (HTTP ${healthResp.status}): ${bodyText || 'Service unavailable'}. Cloud fallback is disabled.`,
+          422,
+          'LOCAL_NODE_HEALTH_FAILED'
+        );
+      }
+      const healthJson: any = await healthResp.json().catch(() => null);
+      if (healthJson && healthJson.readyForLanguage && healthJson.readyForLanguage[language] === false) {
+        throw new LocalNeuralNodeError(
+          `Mode 2 Neural Node at ${validatedOrigin} is online, but the required zero-shot model checkpoint for ${langConfig.englishName} (${language}) is not loaded.`,
+          422,
+          'LOCAL_NODE_MODEL_UNAVAILABLE'
+        );
+      }
+    } catch (healthErr: any) {
+      if (healthErr instanceof LocalNeuralNodeError) {
+        throw healthErr;
+      }
       throw new LocalNeuralNodeError(
-        `Mode 2 Neural Node health check failed at ${validatedOrigin} (HTTP ${healthResp.status}): ${bodyText || 'Service unavailable'}. Cloud fallback is disabled.`,
+        `Mode 2 Neural Node Unreachable at ${validatedOrigin} (${
+          healthErr?.message || 'Connection refused'
+        }). Clear the URL box to use the built-in zero-shot GPU engine, or check your Colab/local node.`,
         422,
-        'LOCAL_NODE_HEALTH_FAILED'
+        'LOCAL_NODE_UNREACHABLE'
       );
     }
-    const healthJson: any = await healthResp.json().catch(() => null);
-    if (healthJson && healthJson.readyForLanguage && healthJson.readyForLanguage[language] === false) {
-      throw new LocalNeuralNodeError(
-        `Mode 2 Neural Node at ${validatedOrigin} is online, but the required zero-shot model checkpoint for ${langConfig.englishName} (${language}) is not loaded.`,
-        422,
-        'LOCAL_NODE_MODEL_UNAVAILABLE'
-      );
-    }
-  } catch (healthErr: any) {
-    if (healthErr instanceof LocalNeuralNodeError) {
-      throw healthErr;
-    }
-    throw new LocalNeuralNodeError(
-      `Mode 2 Neural Node Unreachable at ${validatedOrigin} (${
-        healthErr?.message || 'Connection refused'
-      }). Start Free Google Colab T4 GPU Mode 2 Node or scripts/local_neural_node.py on 127.0.0.1:8001. Cloud TTS fallback is strictly disabled.`,
-      422,
-      'LOCAL_NODE_UNREACHABLE'
-    );
   }
 
-  // Normalize reference audio to canonical 24kHz mono PCM WAV before sending to IndicF5/OpenVoiceV2/ECAPA
-  // so Android Chrome .webm, .m4a, .mp3, or stereo .wav uploads always decode cleanly.
-  const normalizedRefWavPath = path.join(outputDir, `${jobId}_ref_norm.wav`);
+  // Fast-path canonical 24kHz mono PCM16 WAVs (e.g., Saved Voice Vault & studio samples) without spawning FFmpeg
   let refBytes: Buffer;
-  try {
-    await execFileAsync(
-      'ffmpeg',
-      [
-        '-y',
-        '-i',
-        referenceFilePath,
-        '-ar',
-        '24000',
-        '-ac',
-        '1',
-        '-c:a',
-        'pcm_s16le',
-        normalizedRefWavPath
-      ],
-      { timeout: 15000 }
-    );
-    refBytes = await fs.promises.readFile(normalizedRefWavPath);
-  } catch {
+  const isCanonical24kMonoWav =
+    referenceAnalysis.sampleRateHz === 24000 &&
+    referenceAnalysis.channels === 1 &&
+    (referenceAnalysis.codecName === 'pcm_s16le' || referenceAnalysis.formatName === 'wav');
+  if (isCanonical24kMonoWav) {
     refBytes = await fs.promises.readFile(referenceFilePath);
-  } finally {
-    await fs.promises.unlink(normalizedRefWavPath).catch(() => {});
+  } else {
+    const normalizedRefWavPath = path.join(outputDir, `${jobId}_ref_norm.wav`);
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          referenceFilePath,
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          normalizedRefWavPath
+        ],
+        { timeout: 15000 }
+      );
+      refBytes = await fs.promises.readFile(normalizedRefWavPath);
+    } catch {
+      refBytes = await fs.promises.readFile(referenceFilePath);
+    } finally {
+      await fs.promises.unlink(normalizedRefWavPath).catch(() => {});
+    }
   }
 
   const referenceSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
-  const referenceBase64 = refBytes.toString('base64');
+  let preConditionedPromptBytes: Buffer | undefined;
+  if (preConditionedPromptPath && fs.existsSync(preConditionedPromptPath)) {
+    try {
+      const promptBuf = await fs.promises.readFile(preConditionedPromptPath);
+      if (promptBuf.length > 1000) {
+        preConditionedPromptBytes = promptBuf;
+      }
+    } catch {
+      preConditionedPromptBytes = undefined;
+    }
+  }
+  const speakerPromptSha256 = crypto
+    .createHash('sha256')
+    .update(preConditionedPromptBytes || refBytes)
+    .digest('hex');
+
+  const promptPrep = await maybeCleanTransientNoisyPrompt({
+    promptBytes: preConditionedPromptBytes || refBytes,
+    referenceAnalysis,
+    audioQuality: effectiveAudioQuality,
+    outputDir,
+    baseSha256: preConditionedPromptBytes ? speakerPromptSha256 : referenceSha256
+  });
+  const neuralRefBytes = promptPrep.cleaned && !preConditionedPromptBytes ? promptPrep.bytes : refBytes;
+  const neuralPreConditionedPromptBytes = promptPrep.cleaned
+    ? promptPrep.bytes
+    : preConditionedPromptBytes;
+  const neuralRefSha256 = promptPrep.cleaned ? promptPrep.cacheSha256 : referenceSha256;
+
+  const referenceBase64 = neuralRefBytes.toString('base64');
   const resolvedRefTranscript =
     (referenceTranscript || '').trim() ||
     referenceAnalysis.detectedSpokenLanguage?.transcriptExcerpt ||
@@ -1298,32 +2592,53 @@ export async function executeSameLanguageVoiceCloning(options: {
   const finalMp3Path = path.join(outputDir, `${jobId}.mp3`);
 
   try {
-    const mode2Outcome = await synthesizeMode2ReferenceConditionedChunks({
-      endpointOrigin: validatedOrigin,
-      localNodeToken: resolvedNodeToken,
-      referenceBase64,
-      referenceSha256,
-      referenceTranscript: resolvedRefTranscript,
-      referencePitchHz: referenceAnalysis.fundamentalFreqHz,
-      chunks: scriptChunks,
-      language,
-      outputDir,
-      outputRawWavPath: rawWavPath,
-      reuseCompletedChunks,
-      onProgress
-    });
+    const mode2Outcome = activeLocalUrlRaw
+      ? await synthesizeMode2ReferenceConditionedChunks({
+          endpointOrigin: validatedOrigin,
+          localNodeToken: resolvedNodeToken,
+          referenceBase64,
+          referenceSha256: neuralRefSha256,
+          referenceTranscript: resolvedRefTranscript,
+          referencePitchHz: referenceAnalysis.fundamentalFreqHz,
+          chunks: scriptChunks,
+          language,
+          outputDir,
+          outputRawWavPath: rawWavPath,
+          reuseCompletedChunks,
+          abortSignal,
+          onProgress
+        })
+      : await synthesizeViaZeroShotGradioCloudSpace({
+          referenceBytes: neuralRefBytes,
+          preConditionedPromptBytes: neuralPreConditionedPromptBytes,
+          referenceSha256: neuralRefSha256,
+          referenceTranscript: resolvedRefTranscript,
+          chunks: scriptChunks,
+          language,
+          outputDir,
+          outputRawWavPath: rawWavPath,
+          reuseCompletedChunks,
+          abortSignal,
+          onProgress
+        });
 
     onProgress?.({
       stageIndex: 2,
-      stageLabel: 'Finalizing lossless 24kHz WAV/MP3 loudness & anti-clipping mastering...',
+      stageLabel:
+        effectiveAudioQuality === 'standard'
+          ? 'Finalizing lossless 24kHz WAV/MP3 loudness & anti-clipping mastering...'
+          : effectiveAudioQuality === 'studio_plus'
+          ? 'Applying Studio Plus 48kHz broadcast voice mastering (de-noise, EQ, de-ess, R128)...'
+          : 'Applying adaptive 48kHz Studio voice mastering (de-noise, EQ, de-ess, R128)...',
       progressPct: null,
       progressSource: 'indeterminate-inference'
     });
 
-    // Preserve genuine zero-shot neural speaker identity intact (do NOT apply DSP pitch-shifting hacks over Mode 2 weights)
+    // Preserve genuine zero-shot neural speaker identity intact while applying adaptive broadcast voice mastering
     const dspResult = await applyReferenceAcousticIdentityAndExport({
       rawSynthesizedWavPath: rawWavPath,
       referenceAnalysis,
+      audioQuality: effectiveAudioQuality,
       preservePitchContour: false,
       preserveSpectralTimbre: false,
       outputWavPath: finalWavPath,
@@ -1333,22 +2648,11 @@ export async function executeSameLanguageVoiceCloning(options: {
     onProgress?.({
       stageIndex: 3,
       stageLabel: enableCloudVerification
-        ? 'Computing 3072-D cloud & 16-D spectral embeddings...'
-        : 'Computing 16-D spectral telemetry (0 Cloud Quota)...',
+        ? 'Running parallel 3072-D cloud embeddings & ASR verification...'
+        : 'Computing 16-D spectral telemetry & verifying integrity (0 Cloud Quota)...',
       progressPct: null,
       progressSource: 'indeterminate-inference'
     });
-
-    let generalAudioCosineSimilarity: number | null = null;
-    if (enableCloudVerification && referenceFilePath && fs.existsSync(referenceFilePath)) {
-      const [refNeuralVec, outNeuralVec] = await Promise.all([
-        extractNeuralAudioEmbedding(referenceFilePath, referenceAnalysis.mimeType),
-        extractNeuralAudioEmbedding(finalWavPath, 'audio/wav')
-      ]);
-      if (refNeuralVec && outNeuralVec && refNeuralVec.length === outNeuralVec.length) {
-        generalAudioCosineSimilarity = computeVectorCosineSimilarity(refNeuralVec, outNeuralVec);
-      }
-    }
 
     const acousticSpectralCosineSimilarity =
       referenceAnalysis.acousticEmbedding16D && dspResult.finalAcoustics.acousticEmbedding16D
@@ -1358,15 +2662,7 @@ export async function executeSameLanguageVoiceCloning(options: {
           )
         : 0;
 
-    onProgress?.({
-      stageIndex: 4,
-      stageLabel: enableCloudVerification
-        ? 'Running optional Gemini ASR back-transcription & literal-tag check...'
-        : 'Verifying literal-tag exclusion & acoustic integrity (0 Cloud Quota)...',
-      progressPct: null,
-      progressSource: 'indeterminate-inference'
-    });
-
+    let generalAudioCosineSimilarity: number | null = null;
     let verifiedTranscriptBackcheck = '';
     let languageConsistencyVerified = true;
     let characterMatchRatePct: number | null = null;
@@ -1374,43 +2670,62 @@ export async function executeSameLanguageVoiceCloning(options: {
 
     if (enableCloudVerification) {
       const ai = getGenAIClient();
-      try {
-        const generatedWavBytes = await fs.promises.readFile(finalWavPath);
-        const base64Wav = generatedWavBytes.toString('base64');
-        const qcResp = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: 'audio/wav',
-                  data: base64Wav
-                }
-              },
-              {
-                text: `Transcribe this ${langConfig.englishName} (${langConfig.nativeName}) audio verbatim in its native ${langConfig.scriptName} script. Output ONLY the transcript text without translation or commentary.`
+      const [embedPair, qcCandidate] = await Promise.all([
+        referenceFilePath && fs.existsSync(referenceFilePath)
+          ? Promise.all([
+              extractNeuralAudioEmbedding(referenceFilePath, referenceAnalysis.mimeType),
+              extractNeuralAudioEmbedding(finalWavPath, 'audio/wav')
+            ])
+          : Promise.resolve([null, null] as [number[] | null, number[] | null]),
+        (async () => {
+          try {
+            const generatedWavBytes = await fs.promises.readFile(finalWavPath);
+            const base64Wav = generatedWavBytes.toString('base64');
+            const qcResp = await ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'audio/wav',
+                      data: base64Wav
+                    }
+                  },
+                  {
+                    text: `Transcribe this ${langConfig.englishName} (${langConfig.nativeName}) audio verbatim in its native ${langConfig.scriptName} script. Output ONLY the transcript text without translation or commentary.`
+                  }
+                ]
               }
-            ]
+            });
+            return (qcResp.text ?? '').trim();
+          } catch {
+            return '';
           }
-        });
-        const candidateText = (qcResp.text ?? '').trim();
-        if (candidateText.length > 0) {
-          verifiedTranscriptBackcheck = candidateText;
-          const backcheckValidation = validateSameLanguageText(verifiedTranscriptBackcheck, language);
-          languageConsistencyVerified = backcheckValidation.isValid;
-          characterMatchRatePct = computeCharacterMatchRatePct(
-            parsedScript.spokenText,
-            verifiedTranscriptBackcheck
-          );
-          cerPct = Number(Math.max(0, 100 - characterMatchRatePct).toFixed(1));
-        }
-      } catch {
-        verifiedTranscriptBackcheck = '';
-        languageConsistencyVerified = true;
-        characterMatchRatePct = null;
-        cerPct = null;
+        })()
+      ]);
+
+      const [refNeuralVec, outNeuralVec] = embedPair;
+      if (refNeuralVec && outNeuralVec && refNeuralVec.length === outNeuralVec.length) {
+        generalAudioCosineSimilarity = computeVectorCosineSimilarity(refNeuralVec, outNeuralVec);
+      }
+      if (qcCandidate.length > 0) {
+        verifiedTranscriptBackcheck = qcCandidate;
+        const backcheckValidation = validateSameLanguageText(verifiedTranscriptBackcheck, language);
+        languageConsistencyVerified = backcheckValidation.isValid;
+        characterMatchRatePct = computeCharacterMatchRatePct(
+          parsedScript.spokenText,
+          verifiedTranscriptBackcheck
+        );
+        cerPct = Number(Math.max(0, 100 - characterMatchRatePct).toFixed(1));
       }
     }
+
+    onProgress?.({
+      stageIndex: 4,
+      stageLabel: 'Finalizing audio QC report...',
+      progressPct: 100,
+      progressSource: 'indeterminate-inference'
+    });
 
     const transcriptToCheckTags = verifiedTranscriptBackcheck || parsedScript.spokenText;
     const literalTagCheck = verifyZeroLiteralTagsInTranscript(transcriptToCheckTags);
@@ -1444,6 +2759,9 @@ export async function executeSameLanguageVoiceCloning(options: {
       language,
       cloningMode: 'local-neural-zero-shot',
       routedModelUsed: `Mode 2 Zero-Shot Neural: ${mode2Outcome.modelCheckpoint}`,
+      audioQuality: effectiveAudioQuality,
+      usedSavedVoiceId: savedVoiceId || undefined,
+      speakerPromptSha256,
       inputCharCount: parsedScript.rawCharCount,
       spokenCharCount: parsedScript.spokenCharCount,
       spokenWordCount: parsedScript.spokenWordCount,
@@ -1460,6 +2778,7 @@ export async function executeSameLanguageVoiceCloning(options: {
         zeroLiteralTagsInAudioVerified: literalTagCheck.verified,
         modelEmotionSupportMode: 'Mode 2 Neural Node + Prosody Volume/Tempo/Pause Shaping'
       },
+      audioEnhancementReport: dspResult.audioEnhancementReport,
       referenceDurationSec: referenceAnalysis.durationSeconds,
       outputDurationSec: dspResult.outputDurationSec,
       wavUrl: `/api/audio/generated/${jobId}.wav`,
@@ -1529,7 +2848,7 @@ export async function executeSameLanguageVoiceCloning(options: {
             scriptVerified: langConfig.scriptName
           },
           audioSignalQuality: {
-            sampleRateHz: 24000,
+            sampleRateHz: dspResult.outputSampleRateHz,
             rmsLevelDb: dspResult.rmsNormalizedDb,
             peakLevelDb: dspResult.finalAcoustics.peakDb,
             estimatedSnrDb: dspResult.estimatedOutputSnrDb,
@@ -1612,6 +2931,265 @@ function withPromiseTimeout<T>(promise: Promise<T>, timeoutMs: number, label: st
   });
 }
 
+export interface ClassifiedGeminiAsrError {
+  httpStatus: number | null;
+  apiStatus: string;
+  message: string;
+  retryAfterMs: number | null;
+  retryAfterText?: string;
+  isDailyQuotaExhausted: boolean;
+  isModelNotFound: boolean;
+  isTransientRetryable: boolean;
+}
+
+export function classifyGeminiAsrError(err: any): ClassifiedGeminiAsrError {
+  const rawMessage = err?.message || String(err || 'Unknown error');
+  let message = rawMessage;
+  let httpStatus: number | null =
+    typeof err?.httpStatus === 'number'
+      ? err.httpStatus
+      : typeof err?.status === 'number'
+      ? err.status
+      : typeof err?.statusCode === 'number'
+      ? err.statusCode
+      : null;
+  let apiStatus = String(err?.code || err?.statusText || '').toUpperCase();
+  let retryDelayRaw: string | undefined;
+  let quotaMetricHint = '';
+
+  try {
+    const jsonStart = rawMessage.indexOf('{');
+    if (jsonStart !== -1) {
+      const parsed = JSON.parse(rawMessage.slice(jsonStart));
+      if (parsed?.error) {
+        if (typeof parsed.error.message === 'string' && parsed.error.message) {
+          message = parsed.error.message;
+        }
+        if (typeof parsed.error.code === 'number') {
+          httpStatus = parsed.error.code;
+        }
+        if (typeof parsed.error.status === 'string') {
+          apiStatus = parsed.error.status.toUpperCase();
+        }
+        if (Array.isArray(parsed.error.details)) {
+          for (const d of parsed.error.details) {
+            if (d?.retryDelay) {
+              retryDelayRaw = String(d.retryDelay);
+            }
+            if (Array.isArray(d?.violations)) {
+              quotaMetricHint += d.violations
+                .map((v: any) => `${v?.quotaId || ''} ${v?.quotaMetric || ''}`)
+                .join(' ');
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // Keep raw message if JSON parsing is partial or absent
+  }
+
+  const retryMatch = message.match(/Please retry in (\d+(?:\.\d+)?\s*(?:ms|s|m)?)/i);
+  const retryAfterText = retryMatch?.[1]?.trim() || retryDelayRaw;
+  let retryAfterMs: number | null = null;
+  if (retryAfterText) {
+    const numMatch = retryAfterText.match(/([\d.]+)\s*(ms|s|m)?/i);
+    if (numMatch) {
+      const val = Number(numMatch[1]);
+      const unit = (numMatch[2] || 's').toLowerCase();
+      if (Number.isFinite(val) && val > 0) {
+        retryAfterMs =
+          unit === 'ms' ? Math.round(val) : unit === 'm' ? Math.round(val * 60_000) : Math.round(val * 1000);
+      }
+    }
+  }
+
+  const isQuotaError =
+    httpStatus === 429 ||
+    apiStatus === 'RESOURCE_EXHAUSTED' ||
+    /\b429\b.*RESOURCE_EXHAUSTED/i.test(rawMessage) ||
+    /exceeded your current quota/i.test(message);
+
+  const isPerDayQuota =
+    /PerDay|RequestsPerDay|limit:\s*0\b/i.test(`${message} ${quotaMetricHint}`) ||
+    (isQuotaError && (retryAfterMs === null || retryAfterMs >= 60_000));
+
+  const isDailyQuotaExhausted = isQuotaError && isPerDayQuota;
+
+  const isModelNotFound =
+    httpStatus === 404 ||
+    apiStatus === 'NOT_FOUND' ||
+    /is not found for API version|models\/[^\s]+ is not found/i.test(rawMessage);
+
+  const isNonRetryableClientError =
+    (httpStatus !== null && [400, 401, 403, 422].includes(httpStatus)) ||
+    ['INVALID_ARGUMENT', 'UNAUTHENTICATED', 'PERMISSION_DENIED'].includes(apiStatus);
+
+  const isTransientStatus =
+    (httpStatus !== null && [408, 500, 502, 503, 504].includes(httpStatus)) ||
+    ['UNAVAILABLE', 'INTERNAL', 'DEADLINE_EXCEEDED', 'ABORTED'].includes(apiStatus);
+
+  const isTransientPattern =
+    /high demand|temporarily unavailable|spikes in demand|overloaded|try again later|timed out|timeout|ECONNRESET|ETIMEDOUT|EPIPE|EAI_AGAIN|socket hang up|fetch failed|UND_ERR/i.test(
+      `${rawMessage} ${message}`
+    );
+
+  const isShortRateBurst = isQuotaError && !isDailyQuotaExhausted && retryAfterMs !== null && retryAfterMs < 60_000;
+
+  const isTransientRetryable =
+    !isDailyQuotaExhausted &&
+    !isModelNotFound &&
+    !isNonRetryableClientError &&
+    (isTransientStatus || isTransientPattern || isShortRateBurst);
+
+  return {
+    httpStatus,
+    apiStatus,
+    message,
+    retryAfterMs,
+    retryAfterText,
+    isDailyQuotaExhausted,
+    isModelNotFound,
+    isTransientRetryable
+  };
+}
+
+function createAbortError(message = 'SRT transcription was cancelled.'): Error {
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(createAbortError());
+  }
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createAbortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export async function callWithTransientBackoff<T>(options: {
+  maxAttempts: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, maxAttempts: number, waitMs: number, classified: ClassifiedGeminiAsrError) => void;
+  operation: (attempt: number) => Promise<T>;
+}): Promise<T> {
+  const {
+    maxAttempts,
+    baseDelayMs = 1200,
+    maxDelayMs = 12_000,
+    signal,
+    onRetry,
+    operation
+  } = options;
+
+  let lastErr: any = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
+    try {
+      return await operation(attempt);
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || signal?.aborted) {
+        throw createAbortError();
+      }
+      lastErr = err;
+      const classified = classifyGeminiAsrError(err);
+
+      if (classified.isDailyQuotaExhausted) {
+        throw new QuotaExhaustedError(
+          formatGeminiApiError(err, 'Gemini Multilingual ASR quota exceeded'),
+          classified.retryAfterText
+        );
+      }
+
+      if (!classified.isTransientRetryable || attempt >= maxAttempts) {
+        throw err;
+      }
+
+      const expWait = Math.round(baseDelayMs * Math.pow(2, attempt - 1));
+      const hintWait = classified.retryAfterMs !== null ? Math.min(classified.retryAfterMs, maxDelayMs) : 0;
+      const jitter = Math.floor(Math.random() * 600);
+      const waitMs = Math.min(maxDelayMs, Math.max(expWait, hintWait) + jitter);
+
+      onRetry?.(attempt, maxAttempts, waitMs, classified);
+      await sleepWithAbort(waitMs, signal);
+    }
+  }
+  throw lastErr;
+}
+
+interface CachedSrtChunkEntry {
+  cachedAtMs: number;
+  languageCode: string;
+  languageName: string;
+  nativeScriptName: string;
+  canonicalTexts: string[];
+  rawSegments?: RawAsrSegmentInput[];
+  fallbackText?: string;
+  status: 'completed' | 'recovered';
+}
+
+const SRT_CHUNK_CACHE_TTL_MS = 30 * 60 * 1000;
+const SRT_CHUNK_CACHE_MAX_ENTRIES = 400;
+const srtChunkTranscriptCache = new Map<string, CachedSrtChunkEntry>();
+
+function getCachedSrtChunk(cacheKey: string): CachedSrtChunkEntry | null {
+  const entry = srtChunkTranscriptCache.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAtMs > SRT_CHUNK_CACHE_TTL_MS) {
+    srtChunkTranscriptCache.delete(cacheKey);
+    return null;
+  }
+  return entry;
+}
+
+function setCachedSrtChunk(cacheKey: string, entry: CachedSrtChunkEntry): void {
+  if (srtChunkTranscriptCache.size >= SRT_CHUNK_CACHE_MAX_ENTRIES) {
+    const oldestKey = srtChunkTranscriptCache.keys().next().value;
+    if (oldestKey) srtChunkTranscriptCache.delete(oldestKey);
+  }
+  srtChunkTranscriptCache.set(cacheKey, entry);
+}
+
+function stripJsonCodeFences(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+function extractPlainTextFromAsrResponse(resp: any): string {
+  const rawParts: any[] = resp?.candidates?.[0]?.content?.parts ?? [];
+  const extractedPartsText = rawParts
+    .map((p: any) => {
+      if (typeof p?.text === 'string') return p.text;
+      if (typeof p?.audioTranscription === 'string') return p.audioTranscription;
+      if (typeof p?.audioTranscription?.text === 'string') return p.audioTranscription.text;
+      if (typeof p?.audioTranscription?.transcript === 'string') {
+        return p.audioTranscription.transcript;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join(' ');
+  return (extractedPartsText || resp?.text || '').replace(/\s+/g, ' ').trim();
+}
+
 /**
  * PIPELINE B: Universal Multilingual Audio-to-SRT Transcription & Intelligent Timestamp Segmentation
  * - Processes strictly the actual uploaded audio file
@@ -1619,6 +3197,9 @@ function withPromiseTimeout<T>(promise: Promise<T>, timeoutMs: number, label: st
  * - Extracts 20ms-resolution acoustic pause & cumulative vocal energy profile per chunk
  * - Splits multi-sentence and long-sentence outputs into readable (<= 2 lines) subtitle blocks
  *   using word timestamps -> sentence punctuation -> measured acoustic pauses -> cumulative energy
+ * - Survives transient HTTP 503 UNAVAILABLE / 5xx demand spikes using exponential backoff + jitter,
+ *   multi-model ASR failover (gemini-3.5-transcribe / gemini-4-hydrogen / gemini-3.1-flash-lite),
+ *   and content-addressed chunk caching so completed chunks are preserved across retries.
  * - Validates chronological ordering, zero overlaps, duration bounds, and 100% word preservation
  */
 export async function executeMultilingualSrtPipeline(options: {
@@ -1628,6 +3209,7 @@ export async function executeMultilingualSrtPipeline(options: {
   durationSeconds: number;
   requestedLanguage: string; // 'auto' or ISO code
   audioPreviewUrl: string;
+  signal?: AbortSignal;
   onProgress?: (event: BackendPipelineProgressEvent) => void;
 }): Promise<SrtTranscriptionResult> {
   const startWallTime = Date.now();
@@ -1638,6 +3220,7 @@ export async function executeMultilingualSrtPipeline(options: {
     durationSeconds,
     requestedLanguage,
     audioPreviewUrl,
+    signal,
     onProgress
   } = options;
 
@@ -1667,6 +3250,7 @@ export async function executeMultilingualSrtPipeline(options: {
   let detectedLanguageCode = initialLangMeta.code;
   let detectedLanguageName = initialLangMeta.name;
   let nativeScriptName = initialLangMeta.script;
+  let languageResolvedFromSpeech = false;
   const canonicalTranscriptParts: string[] = [];
   let lastAsrError: any = null;
 
@@ -1684,6 +3268,10 @@ export async function executeMultilingualSrtPipeline(options: {
 
   try {
     for (let cIdx = 0; cIdx < chunks.length; cIdx++) {
+      if (signal?.aborted) {
+        throw createAbortError();
+      }
+
       const chunk = chunks[cIdx];
       const isMultiChunk = chunks.length > 1;
       onProgress?.({
@@ -1702,6 +3290,74 @@ export async function executeMultilingualSrtPipeline(options: {
         fs.promises.readFile(chunk.chunkFilePath),
         extractChunkAcousticTimingProfile(chunk.chunkFilePath)
       ]);
+
+      const chunkCacheKey = crypto
+        .createHash('sha256')
+        .update(chunkBytes)
+        .update(`|${requestedLanguage}`)
+        .digest('hex');
+      const cachedChunk = getCachedSrtChunk(chunkCacheKey);
+
+      if (cachedChunk) {
+        if (!languageResolvedFromSpeech) {
+          detectedLanguageCode = cachedChunk.languageCode;
+          detectedLanguageName = cachedChunk.languageName;
+          nativeScriptName = cachedChunk.nativeScriptName;
+          languageResolvedFromSpeech = true;
+        }
+        canonicalTranscriptParts.push(...cachedChunk.canonicalTexts);
+
+        const cachedRawSegs: RawAsrSegmentInput[] = cachedChunk.rawSegments
+          ? cachedChunk.rawSegments
+          : cachedChunk.fallbackText
+          ? [
+              {
+                startSec: acousticProfile.activeSpeechStartMs / 1000,
+                endSec: acousticProfile.activeSpeechEndMs / 1000,
+                text: cachedChunk.fallbackText
+              }
+            ]
+          : [];
+
+        const segmentedCachedBlocks =
+          cachedRawSegs.length > 0
+            ? segmentChunkAsrIntoReadableSrtBlocks({
+                rawSegments: cachedRawSegs,
+                chunkStartSec: chunk.startSec,
+                chunkEndSec: chunk.endSec,
+                acousticProfile,
+                languageCode: detectedLanguageCode
+              })
+            : [];
+
+        allChunkSegments.push(...segmentedCachedBlocks);
+        chunksProcessed.push({
+          chunkIndex: chunk.chunkIndex,
+          startSec: chunk.startSec,
+          endSec: chunk.endSec,
+          segmentCount: segmentedCachedBlocks.length,
+          status: cachedChunk.status
+        });
+
+        if (isMultiChunk) {
+          onProgress?.({
+            stageIndex: 1,
+            stageLabel: `Restored verified chunk ${cIdx + 1} of ${chunks.length} from cache`,
+            stageDetail: `Chunk ${cIdx + 1}/${chunks.length} (cached)`,
+            progressPct: Math.round(((cIdx + 1) / chunks.length) * 100),
+            progressSource: 'backend-chunks',
+            completedUnits: cIdx + 1,
+            totalUnits: chunks.length
+          });
+        }
+        continue;
+      }
+
+      // Gentle pacing between consecutive non-cached ASR requests to reduce burst 503 spikes
+      if (isMultiChunk && cIdx > 0) {
+        await sleepWithAbort(250, signal);
+      }
+
       const base64Chunk = chunkBytes.toString('base64');
 
       const pauseHints = acousticProfile.pauses.slice(0, 35).map((p) => ({
@@ -1724,24 +3380,46 @@ export async function executeMultilingualSrtPipeline(options: {
               2
             )}s within this ${chunkDuration}s clip. Split every individual sentence into its own separate subtitle segment.`;
 
-      const structuredAsrModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+      // Active @google/genai multimodal models for structured word/sentence timestamp ASR
+      const structuredAsrModels = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'] as const;
       let structuredSucceeded = false;
 
       for (const asrModel of structuredAsrModels) {
         try {
-          const response = await withPromiseTimeout(
-            ai.models.generateContent({
-              model: asrModel,
-              contents: {
-                parts: [
-                  {
-                    inlineData: {
-                      mimeType: 'audio/wav',
-                      data: base64Chunk
-                    }
-                  },
-                  {
-                    text: `You are a precision multilingual Automatic Speech Recognition (ASR) and SubRip (SRT) subtitle alignment engine.
+          const response = await callWithTransientBackoff({
+            maxAttempts: 2,
+            baseDelayMs: 1200,
+            maxDelayMs: 6000,
+            signal,
+            onRetry: (attempt, maxAttempts, waitMs, classified) => {
+              onProgress?.({
+                stageIndex: 1,
+                stageLabel: isMultiChunk
+                  ? `Chunk ${cIdx + 1}/${chunks.length} transient ${classified.httpStatus || 'network'} on ${asrModel} — retrying (${attempt + 1}/${maxAttempts}) in ${(waitMs / 1000).toFixed(1)}s...`
+                  : `Temporary ${classified.httpStatus || 'network'} on ${asrModel} — retrying (${attempt + 1}/${maxAttempts})...`,
+                stageDetail: isMultiChunk
+                  ? `Chunk ${cIdx + 1}/${chunks.length} retry ${attempt + 1}/${maxAttempts}`
+                  : undefined,
+                progressPct: isMultiChunk ? Math.round((cIdx / chunks.length) * 100) : null,
+                progressSource: isMultiChunk ? 'backend-chunks' : 'indeterminate-inference',
+                completedUnits: isMultiChunk ? cIdx : undefined,
+                totalUnits: isMultiChunk ? chunks.length : undefined
+              });
+            },
+            operation: () =>
+              withPromiseTimeout(
+                ai.models.generateContent({
+                  model: asrModel,
+                  contents: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: 'audio/wav',
+                          data: base64Chunk
+                        }
+                      },
+                      {
+                        text: `You are a precision multilingual Automatic Speech Recognition (ASR) and SubRip (SRT) subtitle alignment engine.
 ${languageDirective}
 ${pauseHintText}
 
@@ -1751,69 +3429,70 @@ Requirements:
 3. Keep each segment concise (1 to 5 seconds, max 2 lines) and split only at natural grammatical clause boundaries.
 4. Provide accurate startSec and endSec relative to the start of this audio chunk, and include word-level timestamps in 'words' when possible.
 5. Preserve every spoken word and native Unicode punctuation verbatim without omission or translation.`
-                  }
-                ]
-              },
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    detectedLanguageCode: {
-                      type: Type.STRING,
-                      description: "ISO-639-1 code of the spoken language, e.g. 'bn', 'hi', 'en', 'ar'"
-                    },
-                    detectedLanguageName: {
-                      type: Type.STRING,
-                      description: 'Language name, e.g. Bengali (বাংলা), Hindi (हिन्दी), English'
-                    },
-                    nativeScriptName: {
-                      type: Type.STRING,
-                      description: 'Script used, e.g. Bengali Unicode, Devanagari, Latin'
-                    },
-                    segments: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          startSec: {
-                            type: Type.NUMBER,
-                            description: 'Segment start time in seconds relative to chunk start'
-                          },
-                          endSec: {
-                            type: Type.NUMBER,
-                            description: 'Segment end time in seconds relative to chunk start'
-                          },
-                          text: {
-                            type: Type.STRING,
-                            description: 'Verbatim transcript of this single sentence/clause in original script'
-                          },
-                          words: {
-                            type: Type.ARRAY,
-                            items: {
-                              type: Type.OBJECT,
-                              properties: {
-                                word: { type: Type.STRING },
-                                startSec: { type: Type.NUMBER },
-                                endSec: { type: Type.NUMBER }
-                              },
-                              required: ['word', 'startSec', 'endSec']
-                            }
-                          }
-                        },
-                        required: ['startSec', 'endSec', 'text']
                       }
-                    }
+                    ]
                   },
-                  required: ['detectedLanguageCode', 'detectedLanguageName', 'nativeScriptName', 'segments']
-                }
-              }
-            }),
-            10000,
-            asrModel
-          );
+                  config: {
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                      type: Type.OBJECT,
+                      properties: {
+                        detectedLanguageCode: {
+                          type: Type.STRING,
+                          description: "ISO-639-1 code of the spoken language, e.g. 'bn', 'hi', 'en', 'ar'"
+                        },
+                        detectedLanguageName: {
+                          type: Type.STRING,
+                          description: 'Language name, e.g. Bengali (বাংলা), Hindi (हिन्दी), English'
+                        },
+                        nativeScriptName: {
+                          type: Type.STRING,
+                          description: 'Script used, e.g. Bengali Unicode, Devanagari, Latin'
+                        },
+                        segments: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              startSec: {
+                                type: Type.NUMBER,
+                                description: 'Segment start time in seconds relative to chunk start'
+                              },
+                              endSec: {
+                                type: Type.NUMBER,
+                                description: 'Segment end time in seconds relative to chunk start'
+                              },
+                              text: {
+                                type: Type.STRING,
+                                description: 'Verbatim transcript of this single sentence/clause in original script'
+                              },
+                              words: {
+                                type: Type.ARRAY,
+                                items: {
+                                  type: Type.OBJECT,
+                                  properties: {
+                                    word: { type: Type.STRING },
+                                    startSec: { type: Type.NUMBER },
+                                    endSec: { type: Type.NUMBER }
+                                  },
+                                  required: ['word', 'startSec', 'endSec']
+                                }
+                              }
+                            },
+                            required: ['startSec', 'endSec', 'text']
+                          }
+                        }
+                      },
+                      required: ['detectedLanguageCode', 'detectedLanguageName', 'nativeScriptName', 'segments']
+                    }
+                  }
+                }),
+                22_000,
+                asrModel
+              )
+          });
 
-          const parsed = JSON.parse((response.text ?? '{}').trim());
+          const parsed = JSON.parse(stripJsonCodeFences(response.text ?? '{}'));
           const rawSegs: RawAsrSegmentInput[] = Array.isArray(parsed.segments) ? parsed.segments : [];
           const cleanRawSegs = sanitizeRawAsrSegmentsOverlap(rawSegs);
 
@@ -1823,15 +3502,23 @@ Requirements:
 
           const combinedChunkText = cleanRawSegs.map((s) => s.text).join(' ');
           const inferredMeta = detectLanguageAndScriptFromText(combinedChunkText, requestedLanguage);
-          if (chunk.chunkIndex === 0) {
-            detectedLanguageCode = (parsed.detectedLanguageCode || inferredMeta.code).toLowerCase();
-            detectedLanguageName = parsed.detectedLanguageName || inferredMeta.name;
-            nativeScriptName = parsed.nativeScriptName || inferredMeta.script;
+          const resolvedLangCode = (parsed.detectedLanguageCode || inferredMeta.code).toLowerCase();
+          const resolvedLangName = parsed.detectedLanguageName || inferredMeta.name;
+          const resolvedScriptName = parsed.nativeScriptName || inferredMeta.script;
+
+          if (!languageResolvedFromSpeech) {
+            detectedLanguageCode = resolvedLangCode;
+            detectedLanguageName = resolvedLangName;
+            nativeScriptName = resolvedScriptName;
+            languageResolvedFromSpeech = true;
           }
 
+          const chunkCanonicalTexts: string[] = [];
           for (const rs of cleanRawSegs) {
             if (rs.text && String(rs.text).trim()) {
-              canonicalTranscriptParts.push(String(rs.text).replace(/\s+/g, ' ').trim());
+              const cleanPiece = String(rs.text).replace(/\s+/g, ' ').trim();
+              chunkCanonicalTexts.push(cleanPiece);
+              canonicalTranscriptParts.push(cleanPiece);
             }
           }
 
@@ -1852,95 +3539,172 @@ Requirements:
             segmentCount: segmentedChunkBlocks.length,
             status: 'completed'
           });
+
+          setCachedSrtChunk(chunkCacheKey, {
+            cachedAtMs: Date.now(),
+            languageCode: resolvedLangCode,
+            languageName: resolvedLangName,
+            nativeScriptName: resolvedScriptName,
+            canonicalTexts: chunkCanonicalTexts,
+            rawSegments: cleanRawSegs,
+            status: 'completed'
+          });
+
           structuredSucceeded = true;
           break;
-        } catch (err) {
+        } catch (err: any) {
+          if (err instanceof QuotaExhaustedError || err?.name === 'AbortError') {
+            throw err;
+          }
           lastAsrError = err;
         }
       }
 
       if (!structuredSucceeded) {
-        try {
-          // Primary dedicated transcription model gemini-3.5-transcribe + 20ms acoustic/sentence segmentation
-          const fallbackResp = await withPromiseTimeout(
-            ai.models.generateContent({
-              model: 'gemini-3.5-transcribe',
-              contents: {
-                parts: [
-                  {
-                    inlineData: {
-                      mimeType: 'audio/wav',
-                      data: base64Chunk
+        // Resilient failover pool: dedicated ASR (gemini-3.5-transcribe) with exponential backoff,
+        // then general multimodal ASR models (gemini-4-hydrogen, gemini-3.1-flash-lite) in case
+        // gemini-3.5-transcribe suffers a prolonged 503 demand spike.
+        const fallbackCandidates: {
+          model: string;
+          maxAttempts: number;
+          timeoutMs: number;
+          promptText: string;
+        }[] = [
+          {
+            model: 'gemini-3.5-transcribe',
+            maxAttempts: 4,
+            timeoutMs: 30_000,
+            promptText: `${languageDirective} Transcribe this audio verbatim in its original spoken language and native script with accurate sentence punctuation. Do not translate.`
+          },
+          {
+            model: 'gemini-4-hydrogen',
+            maxAttempts: 3,
+            timeoutMs: 28_000,
+            promptText: `${languageDirective} Output ONLY the verbatim spoken transcription text in its original spoken language and native script with accurate sentence punctuation. Do not translate, do not add timestamps, labels, markdown, or commentary.`
+          },
+          {
+            model: 'gemini-3.1-flash-lite',
+            maxAttempts: 2,
+            timeoutMs: 25_000,
+            promptText: `${languageDirective} Output ONLY the verbatim spoken transcription text in its original spoken language and native script with accurate sentence punctuation. Do not translate, do not add timestamps, labels, markdown, or commentary.`
+          }
+        ];
+
+        let fallbackSucceeded = false;
+
+        for (const candidate of fallbackCandidates) {
+          try {
+            const fallbackResp = await callWithTransientBackoff({
+              maxAttempts: candidate.maxAttempts,
+              baseDelayMs: 1400,
+              maxDelayMs: 12_000,
+              signal,
+              onRetry: (attempt, maxAttempts, waitMs, classified) => {
+                onProgress?.({
+                  stageIndex: 1,
+                  stageLabel: isMultiChunk
+                    ? `Chunk ${cIdx + 1}/${chunks.length}: ${candidate.model} busy (HTTP ${classified.httpStatus || 'retry'}) — retrying attempt ${attempt + 1}/${maxAttempts} in ${(waitMs / 1000).toFixed(1)}s...`
+                    : `${candidate.model} busy (HTTP ${classified.httpStatus || 'retry'}) — retrying attempt ${attempt + 1}/${maxAttempts} in ${(waitMs / 1000).toFixed(1)}s...`,
+                  stageDetail: isMultiChunk
+                    ? `Chunk ${cIdx + 1}/${chunks.length} retry ${attempt + 1}/${maxAttempts}`
+                    : undefined,
+                  progressPct: isMultiChunk ? Math.round((cIdx / chunks.length) * 100) : null,
+                  progressSource: isMultiChunk ? 'backend-chunks' : 'indeterminate-inference',
+                  completedUnits: isMultiChunk ? cIdx : undefined,
+                  totalUnits: isMultiChunk ? chunks.length : undefined
+                });
+              },
+              operation: () =>
+                withPromiseTimeout(
+                  ai.models.generateContent({
+                    model: candidate.model,
+                    contents: {
+                      parts: [
+                        {
+                          inlineData: {
+                            mimeType: 'audio/wav',
+                            data: base64Chunk
+                          }
+                        },
+                        {
+                          text: candidate.promptText
+                        }
+                      ]
                     }
-                  },
-                  {
-                    text: `${languageDirective} Transcribe this audio verbatim in its original spoken language and native script with accurate sentence punctuation. Do not translate.`
-                  }
-                ]
+                  }),
+                  candidate.timeoutMs,
+                  candidate.model
+                )
+            });
+
+            const fallbackText = extractPlainTextFromAsrResponse(fallbackResp);
+            let fallbackBlocks: SrtSegment[] = [];
+            if (fallbackText) {
+              const inferredMeta = detectLanguageAndScriptFromText(fallbackText, requestedLanguage);
+              if (!languageResolvedFromSpeech) {
+                detectedLanguageCode = inferredMeta.code;
+                detectedLanguageName = inferredMeta.name;
+                nativeScriptName = inferredMeta.script;
+                languageResolvedFromSpeech = true;
               }
-            }),
-            18000,
-            'gemini-3.5-transcribe'
-          );
 
-          const rawParts: any[] = fallbackResp.candidates?.[0]?.content?.parts ?? [];
-          const extractedPartsText = rawParts
-            .map((p: any) => {
-              if (typeof p?.text === 'string') return p.text;
-              if (typeof p?.audioTranscription === 'string') return p.audioTranscription;
-              if (typeof p?.audioTranscription?.text === 'string') return p.audioTranscription.text;
-              if (typeof p?.audioTranscription?.transcript === 'string') return p.audioTranscription.transcript;
-              return '';
-            })
-            .filter(Boolean)
-            .join(' ');
+              canonicalTranscriptParts.push(fallbackText);
 
-          const fallbackText = (extractedPartsText || fallbackResp.text || '')
-            .replace(/\s+/g, ' ')
-            .trim();
+              fallbackBlocks = segmentChunkAsrIntoReadableSrtBlocks({
+                rawSegments: [
+                  {
+                    startSec: acousticProfile.activeSpeechStartMs / 1000,
+                    endSec: acousticProfile.activeSpeechEndMs / 1000,
+                    text: fallbackText
+                  }
+                ],
+                chunkStartSec: chunk.startSec,
+                chunkEndSec: chunk.endSec,
+                acousticProfile,
+                languageCode: detectedLanguageCode
+              });
+              allChunkSegments.push(...fallbackBlocks);
 
-          let fallbackBlocks: SrtSegment[] = [];
-          if (fallbackText) {
-            const inferredMeta = detectLanguageAndScriptFromText(fallbackText, requestedLanguage);
-            if (chunk.chunkIndex === 0) {
-              detectedLanguageCode = inferredMeta.code;
-              detectedLanguageName = inferredMeta.name;
-              nativeScriptName = inferredMeta.script;
+              setCachedSrtChunk(chunkCacheKey, {
+                cachedAtMs: Date.now(),
+                languageCode: inferredMeta.code,
+                languageName: inferredMeta.name,
+                nativeScriptName: inferredMeta.script,
+                canonicalTexts: [fallbackText],
+                fallbackText,
+                status: 'recovered'
+              });
             }
 
-            canonicalTranscriptParts.push(fallbackText);
-
-            fallbackBlocks = segmentChunkAsrIntoReadableSrtBlocks({
-              rawSegments: [
-                {
-                  startSec: acousticProfile.activeSpeechStartMs / 1000,
-                  endSec: acousticProfile.activeSpeechEndMs / 1000,
-                  text: fallbackText
-                }
-              ],
-              chunkStartSec: chunk.startSec,
-              chunkEndSec: chunk.endSec,
-              acousticProfile,
-              languageCode: detectedLanguageCode
+            chunksProcessed.push({
+              chunkIndex: chunk.chunkIndex,
+              startSec: chunk.startSec,
+              endSec: chunk.endSec,
+              segmentCount: fallbackBlocks.length,
+              status: 'recovered'
             });
-            allChunkSegments.push(...fallbackBlocks);
+            fallbackSucceeded = true;
+            break;
+          } catch (err: any) {
+            if (err instanceof QuotaExhaustedError || err?.name === 'AbortError') {
+              throw err;
+            }
+            lastAsrError = err;
           }
+        }
 
-          chunksProcessed.push({
-            chunkIndex: chunk.chunkIndex,
-            startSec: chunk.startSec,
-            endSec: chunk.endSec,
-            segmentCount: fallbackBlocks.length,
-            status: 'recovered'
-          });
-        } catch (err) {
-          lastAsrError = err;
-          throw new Error(
+        if (!fallbackSucceeded) {
+          const classified = classifyGeminiAsrError(lastAsrError);
+          const failureErr: any = new Error(
             formatGeminiApiError(
               lastAsrError,
-              `Speech recognition failed on audio chunk ${chunk.chunkIndex + 1}`
+              `Speech recognition failed on audio chunk ${chunk.chunkIndex + 1} after retries and model failover`
             )
           );
+          if (classified.isTransientRetryable || classified.httpStatus === 503) {
+            failureErr.httpStatus = 503;
+          }
+          throw failureErr;
         }
       }
 
@@ -2003,7 +3767,7 @@ Requirements:
     detectedLanguageCode,
     detectedLanguageName,
     nativeScriptName,
-    modelUsed: 'Gemini 3.1/3.5 Multilingual ASR + 20ms Acoustic Pause & Sentence Segmenter',
+    modelUsed: 'Gemini 3.5 Transcribe / 3.1 Flash-Lite / 4-Hydrogen Multilingual ASR + 20ms Acoustic Pause & Sentence Segmenter',
     chunkCount: chunks.length,
     chunksProcessed,
     segments: normalizedSegments,

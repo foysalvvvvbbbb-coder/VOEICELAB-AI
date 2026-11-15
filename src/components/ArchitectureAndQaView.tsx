@@ -339,7 +339,7 @@ export const ArchitectureAndQaView: React.FC = () => {
             </h2>
           </div>
           <p className="text-xs text-[#A2B5AA] leading-relaxed">
-            Runs <span className="font-mono text-[#F4F8F5]">ai4bharat/IndicF5</span> (Bengali &amp; Hindi), <span className="font-mono text-[#F4F8F5]">myshell-ai/OpenVoiceV2</span> (English), and <span className="font-mono text-[#F4F8F5]">ECAPA-TDNN</span> 192-D speaker verification on <span className="font-mono text-[#42D9A0]">127.0.0.1:8001</span> or a Free Google Colab T4 GPU HTTPS tunnel (<span className="font-mono text-[#42D9A0]">https://*.trycloudflare.com</span>) with <strong className="text-[#F4F8F5]">0 Gemini quota consumed</strong>.
+            Runs genuine zero-shot reference-conditioned cloning via built-in <span className="font-mono text-[#F4F8F5]">ai4bharat/IndicF5</span> (Bengali &amp; Hindi) and <span className="font-mono text-[#F4F8F5]">SWivid/F5-TTS</span> (English) with <strong className="text-[#F4F8F5]">0 Gemini quota consumed</strong>, plus optional private <span className="font-mono text-[#42D9A0]">Colab T4 / 127.0.0.1:8001</span> override.
           </p>
         </div>
       </div>

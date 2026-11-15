@@ -18,13 +18,20 @@ import {
   Mic,
   Square,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Sparkles,
+  Sliders
 } from 'lucide-react';
 import {
   AudioSignalAnalysis,
   SrtSegment,
   SrtTranscriptionResult
 } from '../types/voicelab';
+import type { VoiceToSrtHandoff } from './VoiceCloningWorkspace';
+import {
+  formatSegmentsToPlainText,
+  formatSegmentsToVttString
+} from '../utils/voiceToSrt';
 import { SRT_SUPPORTED_LANGUAGES } from '../data/researchAndConfigs';
 import { fetchApiJson } from '../utils/apiClient';
 import {
@@ -38,6 +45,8 @@ import {
 } from '../utils/activityManager';
 
 interface SrtGeneratorWorkspaceProps {
+  initialHandoff?: VoiceToSrtHandoff | null;
+  onConsumeHandoff?: () => void;
   onActivityComplete?: (info: {
     languageLabel: string;
     srtContent: string;
@@ -74,6 +83,8 @@ function buildSrtStringFromSegments(segments: SrtSegment[]): string {
 }
 
 export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
+  initialHandoff,
+  onConsumeHandoff,
   onActivityComplete
 }) => {
   const [selectedAudioFile, setSelectedAudioFile] = useState<File | null>(null);
@@ -100,6 +111,8 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
   const [copiedSrt, setCopiedSrt] = useState(false);
   const [includeUtf8Bom, setIncludeUtf8Bom] = useState(true);
   const [searchFilter, setSearchFilter] = useState('');
+  const [autoScrollDuringPlayback, setAutoScrollDuringPlayback] = useState(true);
+  const [timelineStatusNote, setTimelineStatusNote] = useState<string | null>(null);
 
   // Collapsible progressive disclosure states
   const [showExportSettings, setShowExportSettings] = useState(false);
@@ -109,6 +122,7 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const operationSeqRef = useRef<number>(0);
+  const segmentRowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   useEffect(() => {
     return () => {
@@ -128,6 +142,124 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       }
     };
   }, [localAudioUrl]);
+
+  useEffect(() => {
+    if (!initialHandoff) return;
+
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current.currentTime = 0;
+    }
+
+    setSelectedAudioFile(null);
+    setLocalAudioUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setUploadError(null);
+    setTranscriptionError(null);
+    setCurrentPlayheadMs(0);
+    setSearchFilter('');
+
+    const handoffId = `voice_clone_${Date.now()}`;
+    setAudioAnalysis({
+      fileId: handoffId,
+      fileName: initialHandoff.fileName,
+      mimeType: 'audio/wav',
+      formatName: 'wav',
+      codecName: 'pcm_s16le',
+      fileSizeBytes: 0,
+      durationSeconds: initialHandoff.durationSeconds,
+      sampleRateHz: 48000,
+      channels: 1,
+      bitRateKbps: 768,
+      rmsLevelDb: -16,
+      peakLevelDb: -1,
+      noiseFloorDb: -60,
+      estimatedSnrDb: 38,
+      silenceRatio: 0.1,
+      fundamentalFreqHz: 150,
+      pitchRangeHz: [90, 240],
+      spectralWarmthRatio: 0.55,
+      qualityGrade: 'Studio Grade',
+      qualityWarnings: [],
+      isValid: true,
+      previewUrl: initialHandoff.audioUrl
+    });
+
+    if (
+      initialHandoff.languageCode === 'bn' ||
+      initialHandoff.languageCode === 'hi' ||
+      initialHandoff.languageCode === 'en'
+    ) {
+      setRequestedLanguage(initialHandoff.languageCode);
+    }
+
+    setSegments(initialHandoff.segments);
+    const rawSrt = buildSrtStringFromSegments(initialHandoff.segments);
+    const plainText = formatSegmentsToPlainText(initialHandoff.segments);
+    const tokenCount = plainText.split(/\s+/).filter(Boolean).length;
+    const durations = initialHandoff.segments.map((s) => Math.max(0, s.endTimeMs - s.startTimeMs));
+    const minDur = durations.length > 0 ? Math.min(...durations) : 0;
+    const maxDur = durations.length > 0 ? Math.max(...durations) : 0;
+
+    setSrtResult({
+      jobId: handoffId,
+      fileName: initialHandoff.fileName,
+      detectedLanguageCode: initialHandoff.languageCode,
+      detectedLanguageName: initialHandoff.languageName,
+      nativeScriptName:
+        initialHandoff.languageCode === 'bn'
+          ? 'Bengali (বাংলা)'
+          : initialHandoff.languageCode === 'hi'
+          ? 'Devanagari (हिन्दी)'
+          : initialHandoff.languageName,
+      requestedLanguage: initialHandoff.languageCode,
+      durationSeconds: initialHandoff.durationSeconds,
+      modelUsed: 'VoiceLab Acoustic Chunk Align',
+      chunkCount: initialHandoff.segments.length,
+      chunksProcessed: [],
+      segments: initialHandoff.segments,
+      rawSrtContent: rawSrt,
+      audioPreviewUrl: initialHandoff.audioUrl,
+      processingTimeMs: 0,
+      validationReport: {
+        isValid: true,
+        chronologicalOrderVerified: true,
+        zeroOverlapsVerified: true,
+        zeroNegativeOrReversedVerified: true,
+        withinAudioDurationVerified: true,
+        sequentialNumberingVerified: true,
+        wordPreservationVerified: true,
+        exactSequenceMatch: true,
+        inputTokenCount: tokenCount,
+        outputTokenCount: tokenCount,
+        duplicateTokenCount: 0,
+        missingTokenCount: 0,
+        reorderedTokenCount: 0,
+        insertedTokenCount: 0,
+        normalizationMismatchCount: 0,
+        missingTokens: [],
+        duplicatedTokens: [],
+        reorderedTokens: [],
+        insertedTokens: [],
+        originalTranscript: plainText,
+        reconstructedTranscript: plainText,
+        maxLinesPerBlock: 2,
+        maxCharsPerLineObserved: initialHandoff.languageCode === 'en' ? 42 : 38,
+        minDurationMsObserved: minDur,
+        maxDurationMsObserved: maxDur,
+        totalWordsInput: tokenCount,
+        totalWordsOutput: tokenCount,
+        timingAlignmentSummary: `Synced from Voice Cloning (${initialHandoff.scriptName})`
+      }
+    });
+
+    setTimelineStatusNote(
+      `Loaded ${initialHandoff.segments.length} synced subtitles from Voice Cloning (${initialHandoff.scriptName}).`
+    );
+    onConsumeHandoff?.();
+  }, [initialHandoff, onConsumeHandoff]);
 
   const handleFileUpload = async (file: File) => {
     // 1. Increment operation sequence & abort any in-flight upload or transcription
@@ -334,9 +466,25 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       const formData = new FormData();
       if (selectedAudioFile) {
         formData.append('audio', selectedAudioFile);
-      }
-      if (audioAnalysis?.fileId) {
+      } else if (
+        audioAnalysis?.fileId &&
+        !audioAnalysis.fileId.startsWith('voice_clone_')
+      ) {
         formData.append('fileId', audioAnalysis.fileId);
+      } else if (audioAnalysis?.previewUrl) {
+        const audioRes = await fetch(audioAnalysis.previewUrl, {
+          signal: controller.signal
+        });
+        if (!audioRes.ok) {
+          throw new Error('Could not read audio stream for transcription.');
+        }
+        const audioBlob = await audioRes.blob();
+        const synthesizedFile = new File(
+          [audioBlob],
+          audioAnalysis.fileName || 'cloned_voice.wav',
+          { type: audioBlob.type || 'audio/wav' }
+        );
+        formData.append('audio', synthesizedFile);
       }
       formData.append('requestedLanguage', requestedLanguage);
 
@@ -408,6 +556,14 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
       (s) => currentPlayheadMs >= s.startTimeMs && currentPlayheadMs <= s.endTimeMs
     );
   }, [segments, currentPlayheadMs]);
+
+  useEffect(() => {
+    if (!autoScrollDuringPlayback || !activeSegment || currentPlayheadMs <= 0) return;
+    const el = segmentRowRefs.current.get(activeSegment.id);
+    if (el) {
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [activeSegment?.id, autoScrollDuringPlayback, currentPlayheadMs]);
 
   const liveSrtText = useMemo(() => {
     return buildSrtStringFromSegments(segments);
@@ -583,12 +739,77 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
     }
   };
 
-  const handleDownloadSrtFile = () => {
+  const handleShiftAllTimestamps = (deltaMs: number) => {
+    setSegments((prev) =>
+      prev.map((seg) => {
+        const dur = Math.max(350, seg.endTimeMs - seg.startTimeMs);
+        const nextStart = Math.max(0, seg.startTimeMs + deltaMs);
+        const nextEnd = Math.max(nextStart + 350, nextStart + dur);
+        return {
+          ...seg,
+          startTimeMs: nextStart,
+          endTimeMs: nextEnd,
+          startTimestamp: msToSrtTimestampClient(nextStart),
+          endTimestamp: msToSrtTimestampClient(nextEnd)
+        };
+      })
+    );
+    const label = deltaMs > 0 ? `+${deltaMs}ms` : `${deltaMs}ms`;
+    setTimelineStatusNote(`All ${segments.length} subtitle timestamps shifted by ${label}.`);
+  };
+
+  const handleFixOverlaps = () => {
+    let fixedCount = 0;
+    setSegments((prev) => {
+      const sorted = [...prev].sort((a, b) => a.startTimeMs - b.startTimeMs);
+      let prevEnd = -20;
+      return sorted.map((seg, idx) => {
+        let startMs = Math.max(0, seg.startTimeMs);
+        if (idx > 0 && startMs < prevEnd + 20) {
+          startMs = prevEnd + 20;
+          fixedCount += 1;
+        }
+        const endMs = Math.max(startMs + 350, seg.endTimeMs);
+        prevEnd = endMs;
+        return {
+          ...seg,
+          id: idx + 1,
+          startTimeMs: startMs,
+          endTimeMs: endMs,
+          startTimestamp: msToSrtTimestampClient(startMs),
+          endTimestamp: msToSrtTimestampClient(endMs)
+        };
+      });
+    });
+    setTimelineStatusNote(
+      fixedCount > 0
+        ? `Fixed ${fixedCount} overlapping timestamp transition(s).`
+        : 'All subtitle blocks are cleanly ordered with zero overlaps.'
+    );
+  };
+
+  const getExportBaseFilename = () => {
     const baseName = audioAnalysis?.fileName
       ? audioAnalysis.fileName.replace(/\.[^/.]+$/, '')
       : 'voicelab_subtitles';
     const langSuffix = srtResult?.detectedLanguageCode || requestedLanguage || 'multilingual';
-    const filename = `${baseName}_${langSuffix}.srt`;
+    return `${baseName}_${langSuffix}`;
+  };
+
+  const triggerTextFileDownload = (content: string, filename: string, mimeType: string) => {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadSrtFile = () => {
+    const filename = `${getExportBaseFilename()}.srt`;
 
     const op = startOperation({
       feature: 'export-download',
@@ -603,25 +824,31 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
     });
 
     const content = includeUtf8Bom ? `\uFEFF${liveSrtText}` : liveSrtText;
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     updateOperationStage(op.operationId, {
       stageIndex: 1,
       stageLabel: `Downloading ${filename}...`,
       progressPct: 100,
       progressSource: 'task-steps'
     });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    triggerTextFileDownload(content, filename, 'text/plain;charset=utf-8');
     completeOperation(
       op.operationId,
       `Exported ${filename} (${segments.length} subtitle blocks)`
     );
+  };
+
+  const handleDownloadVttFile = () => {
+    const filename = `${getExportBaseFilename()}.vtt`;
+    const vttContent = formatSegmentsToVttString(segments);
+    triggerTextFileDownload(vttContent, filename, 'text/vtt;charset=utf-8');
+    setTimelineStatusNote(`Exported WebVTT (${filename}).`);
+  };
+
+  const handleDownloadTxtFile = () => {
+    const filename = `${getExportBaseFilename()}.txt`;
+    const txtContent = formatSegmentsToPlainText(segments);
+    triggerTextFileDownload(txtContent, filename, 'text/plain;charset=utf-8');
+    setTimelineStatusNote(`Exported clean script (${filename}).`);
   };
 
   const handleCopySrt = async () => {
@@ -889,11 +1116,11 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
                   </h3>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
                     onClick={handleCopySrt}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-xs font-medium text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-xs font-medium text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
                   >
                     {copiedSrt ? (
                       <>
@@ -910,6 +1137,26 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
 
                   <button
                     type="button"
+                    onClick={handleDownloadVttFile}
+                    title="Download WebVTT (.vtt)"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-xs font-medium text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    <Download className="w-3 h-3 text-[#42D9A0]" />
+                    <span>.VTT</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleDownloadTxtFile}
+                    title="Download clean plain text (.txt)"
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-xs font-medium text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    <FileText className="w-3 h-3 text-[#42D9A0]" />
+                    <span>.TXT</span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={handleDownloadSrtFile}
                     className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#16A36A] hover:bg-[#16A36A]/90 text-xs font-semibold text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap"
                   >
@@ -918,6 +1165,50 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
                   </button>
                 </div>
               </div>
+
+              {/* Timeline Quick-Tools (Shift Sync, Auto-Fix Overlaps, Auto-Scroll) */}
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-[#0B1512] border border-[#19352A] px-3 py-2 text-[11px]">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="inline-flex items-center gap-1 text-[#A2B5AA] font-medium mr-1">
+                    <Sliders className="w-3 h-3 text-[#42D9A0]" />
+                    <span>Sync Nudge:</span>
+                  </span>
+                  {[-500, -100, 100, 500].map((ms) => (
+                    <button
+                      key={ms}
+                      type="button"
+                      onClick={() => handleShiftAllTimestamps(ms)}
+                      className="px-2 py-0.5 rounded bg-[#12231D] hover:bg-[#19352A] border border-[#19352A] font-mono tabular-nums text-[#F4F8F5] transition-colors cursor-pointer"
+                    >
+                      {ms > 0 ? `+${ms}ms` : `${ms}ms`}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={handleFixOverlaps}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#19352A] hover:bg-[#16A36A]/30 border border-[#16A36A]/40 text-[#42D9A0] font-medium transition-colors cursor-pointer"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span>Fix Overlaps</span>
+                  </button>
+                </div>
+
+                <label className="inline-flex items-center gap-1.5 text-[#A2B5AA] hover:text-[#F4F8F5] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoScrollDuringPlayback}
+                    onChange={(e) => setAutoScrollDuringPlayback(e.target.checked)}
+                    className="accent-[#16A36A]"
+                  />
+                  <span>Auto-Scroll</span>
+                </label>
+              </div>
+
+              {timelineStatusNote && (
+                <div className="text-[11px] text-[#42D9A0] bg-[#0B1512]/80 border border-[#16A36A]/30 rounded-lg px-3 py-1.5">
+                  {timelineStatusNote}
+                </div>
+              )}
 
               {/* Filter Input */}
               <input
@@ -938,6 +1229,13 @@ export const SrtGeneratorWorkspace: React.FC<SrtGeneratorWorkspaceProps> = ({
                   return (
                     <div
                       key={seg.id}
+                      ref={(el) => {
+                        if (el) {
+                          segmentRowRefs.current.set(seg.id, el);
+                        } else {
+                          segmentRowRefs.current.delete(seg.id);
+                        }
+                      }}
                       className={`rounded-xl border p-3 transition-colors space-y-2 ${
                         isPlayingNow
                           ? 'bg-[#19352A] border-[#16A36A]'

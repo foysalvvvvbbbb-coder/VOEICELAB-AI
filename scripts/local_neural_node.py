@@ -127,6 +127,7 @@ def _get_indicf5_model():
         _MODELS["indicf5"] = AutoModel.from_pretrained(
             ckpt,
             trust_remote_code=True,
+            token=os.environ.get("HF_TOKEN") or None,
         ).to(_get_device())
     return _MODELS["indicf5"]
 

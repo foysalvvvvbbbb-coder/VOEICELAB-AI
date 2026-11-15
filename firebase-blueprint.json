@@ -1,0 +1,444 @@
+{
+  "entities": {
+    "OwnershipRecord": {
+      "title": "OwnershipRecord",
+      "description": "Primary root ownership record locking platform ownership to the verified Owner.",
+      "type": "object",
+      "properties": {
+        "primaryOwnerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128,
+          "description": "Firebase UID of the verified primary Owner."
+        },
+        "primaryOwnerEmail": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254,
+          "description": "Verified email of the primary Owner."
+        },
+        "organizationName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Display brand or organization owning the deployment."
+        },
+        "ownershipLocked": {
+          "type": "boolean",
+          "description": "Prevents casual ownership edits unless explicitly unlocked by the Owner."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "primaryOwnerUid",
+        "primaryOwnerEmail",
+        "organizationName",
+        "ownershipLocked",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "GovernanceConfig": {
+      "title": "GovernanceConfig",
+      "description": "Owner-controlled runtime feature toggles, maintenance lock, and rate limits.",
+      "type": "object",
+      "properties": {
+        "maintenanceMode": { "type": "boolean" },
+        "maintenanceNotice": { "type": "string", "maxLength": 300 },
+        "allowVoiceCloning": { "type": "boolean" },
+        "allowSrtGeneration": { "type": "boolean" },
+        "requireAuthForCompute": { "type": "boolean" },
+        "maxScriptChars": { "type": "integer" },
+        "rateLimitPerMinute": { "type": "integer" },
+        "enforceZeroGeminiQuota": { "type": "boolean" },
+        "updatedByUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "maintenanceMode",
+        "maintenanceNotice",
+        "allowVoiceCloning",
+        "allowSrtGeneration",
+        "requireAuthForCompute",
+        "maxScriptChars",
+        "rateLimitPerMinute",
+        "enforceZeroGeminiQuota",
+        "updatedByUid",
+        "updatedAt"
+      ]
+    },
+    "PlatformCatalog": {
+      "title": "PlatformCatalog",
+      "description": "Public-safe feature access flags, token costs, and package definitions (excludes private payment instructions and numbers).",
+      "type": "object",
+      "properties": {
+        "currency": { "type": "string", "enum": ["BDT"] },
+        "voiceCloningEnabled": { "type": "boolean" },
+        "voiceCloningPaid": { "type": "boolean" },
+        "voiceCloningTokenCost": { "type": "integer" },
+        "longScriptEnabled": { "type": "boolean" },
+        "longScriptPaid": { "type": "boolean" },
+        "longScriptTokenCost": { "type": "integer" },
+        "srtGeneratorEnabled": { "type": "boolean" },
+        "srtGeneratorPaid": { "type": "boolean" },
+        "srtGeneratorTokenCost": { "type": "integer" },
+        "updatedByUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "currency",
+        "voiceCloningEnabled",
+        "voiceCloningPaid",
+        "voiceCloningTokenCost",
+        "longScriptEnabled",
+        "longScriptPaid",
+        "longScriptTokenCost",
+        "srtGeneratorEnabled",
+        "srtGeneratorPaid",
+        "srtGeneratorTokenCost",
+        "updatedByUid",
+        "updatedAt"
+      ]
+    },
+    "PaymentSettings": {
+      "title": "PaymentSettings",
+      "description": "Owner-only payment gateway instructions and receiver numbers for bKash and Nagad.",
+      "type": "object",
+      "properties": {
+        "bkashEnabled": { "type": "boolean" },
+        "bkashNumber": { "type": "string", "maxLength": 20 },
+        "bkashAccountType": { "type": "string", "enum": ["Personal", "Merchant", "Agent"] },
+        "bkashInstructions": { "type": "string", "maxLength": 500 },
+        "nagadEnabled": { "type": "boolean" },
+        "nagadNumber": { "type": "string", "maxLength": 20 },
+        "nagadAccountType": { "type": "string", "enum": ["Personal", "Merchant", "Agent"] },
+        "nagadInstructions": { "type": "string", "maxLength": 500 },
+        "updatedByUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "bkashEnabled",
+        "bkashNumber",
+        "bkashAccountType",
+        "bkashInstructions",
+        "nagadEnabled",
+        "nagadNumber",
+        "nagadAccountType",
+        "nagadInstructions",
+        "updatedByUid",
+        "updatedAt"
+      ]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile with server/owner-controlled account status and role.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "photoURL": { "type": "string", "maxLength": 512 },
+        "role": { "type": "string", "enum": ["owner", "user"] },
+        "accountStatus": { "type": "string", "enum": ["active", "suspended"] },
+        "lastSeenAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "photoURL",
+        "role",
+        "accountStatus",
+        "lastSeenAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PaymentRequest": {
+      "title": "PaymentRequest",
+      "description": "User-submitted bKash or Nagad payment verification requests for feature plans or token packages.",
+      "type": "object",
+      "properties": {
+        "orderId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "userUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "userEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "userName": { "type": "string", "maxLength": 120 },
+        "itemType": { "type": "string", "enum": ["feature_package", "token_package"] },
+        "itemId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "itemTitle": { "type": "string", "maxLength": 120 },
+        "amountBdt": { "type": "integer" },
+        "tokensGranted": { "type": "integer" },
+        "durationDays": { "type": "integer" },
+        "paymentMethod": { "type": "string", "enum": ["bkash", "nagad"] },
+        "senderNumber": { "type": "string", "pattern": "^01[3-9][0-9]{8}$", "maxLength": 11 },
+        "trxId": { "type": "string", "pattern": "^[A-Z0-9]{8,16}$", "maxLength": 16 },
+        "receiverNumber": { "type": "string", "maxLength": 20 },
+        "note": { "type": "string", "maxLength": 200 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "reviewedByUid": { "type": "string", "maxLength": 128 },
+        "rejectionReason": { "type": "string", "maxLength": 250 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "orderId",
+        "userUid",
+        "userEmail",
+        "userName",
+        "itemType",
+        "itemId",
+        "itemTitle",
+        "amountBdt",
+        "tokensGranted",
+        "durationDays",
+        "paymentMethod",
+        "senderNumber",
+        "trxId",
+        "receiverNumber",
+        "note",
+        "status",
+        "reviewedByUid",
+        "rejectionReason",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserEntitlement": {
+      "title": "UserEntitlement",
+      "description": "Owner-granted feature unlocks and server-tracked token balance per verified user UID.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "tokenBalance": { "type": "integer" },
+        "voiceCloningUnlocked": { "type": "boolean" },
+        "voiceCloningExpiresAtMs": { "type": "integer" },
+        "longScriptUnlocked": { "type": "boolean" },
+        "longScriptExpiresAtMs": { "type": "integer" },
+        "srtGeneratorUnlocked": { "type": "boolean" },
+        "srtGeneratorExpiresAtMs": { "type": "integer" },
+        "proBundleUnlocked": { "type": "boolean" },
+        "proBundleExpiresAtMs": { "type": "integer" },
+        "grantedByUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "lastOrderId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "uid",
+        "email",
+        "tokenBalance",
+        "voiceCloningUnlocked",
+        "voiceCloningExpiresAtMs",
+        "longScriptUnlocked",
+        "longScriptExpiresAtMs",
+        "srtGeneratorUnlocked",
+        "srtGeneratorExpiresAtMs",
+        "proBundleUnlocked",
+        "proBundleExpiresAtMs",
+        "grantedByUid",
+        "lastOrderId",
+        "updatedAt"
+      ]
+    },
+    "TokenLedgerEntry": {
+      "title": "TokenLedgerEntry",
+      "description": "Append-only token balance ledger tracking purchases, admin grants, revocations, and feature deductions.",
+      "type": "object",
+      "properties": {
+        "entryId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "userUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "userEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "delta": { "type": "integer" },
+        "balanceAfter": { "type": "integer" },
+        "type": { "type": "string", "enum": ["purchase_credit", "admin_grant", "admin_revoke", "feature_debit", "refund"] },
+        "reason": { "type": "string", "maxLength": 240 },
+        "actorUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "entryId",
+        "userUid",
+        "userEmail",
+        "delta",
+        "balanceAfter",
+        "type",
+        "reason",
+        "actorUid",
+        "createdAt"
+      ]
+    },
+    "AdminAuditLog": {
+      "title": "AdminAuditLog",
+      "description": "Append-only security audit log recording ownership, monetization, token, and verification actions.",
+      "type": "object",
+      "properties": {
+        "logId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "actorUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "actorEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "actorRole": { "type": "string", "enum": ["owner"] },
+        "action": { "type": "string", "maxLength": 120 },
+        "target": { "type": "string", "maxLength": 254 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "logId",
+        "actorUid",
+        "actorEmail",
+        "actorRole",
+        "action",
+        "target",
+        "details",
+        "createdAt"
+      ]
+    },
+    "SavedVoiceProfile": {
+      "title": "SavedVoiceProfile",
+      "description": "User-owned persistent saved voice profile metadata linking to server-isolated speaker conditioning audio (never stores Base64 audio).",
+      "type": "object",
+      "properties": {
+        "voiceId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "ownerUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "ownerEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "language": { "type": "string", "enum": ["bn", "hi", "en"] },
+        "languageName": { "type": "string", "maxLength": 64 },
+        "conditioningMethod": { "type": "string", "maxLength": 80 },
+        "modelCheckpoint": { "type": "string", "maxLength": 160 },
+        "speakerConditioningSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "maxLength": 64 },
+        "promptConditioningSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "maxLength": 64 },
+        "referenceTranscript": { "type": "string", "maxLength": 1000 },
+        "referenceDurationSec": { "type": "number" },
+        "promptDurationSec": { "type": "number" },
+        "fundamentalFreqHz": { "type": "number" },
+        "pitchMinHz": { "type": "number" },
+        "pitchMaxHz": { "type": "number" },
+        "spectralWarmthRatio": { "type": "number" },
+        "estimatedSnrDb": { "type": "number" },
+        "qualityGrade": { "type": "string", "enum": ["Studio Grade", "Good", "Acceptable (Noisy)", "Poor / Corrupted"] },
+        "sourceType": { "type": "string", "enum": ["cloned_output", "reference_upload", "microphone", "studio_sample"] },
+        "sourceFileName": { "type": "string", "maxLength": 160 },
+        "storageKey": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-/]+$", "maxLength": 200 },
+        "consentConfirmed": { "type": "boolean" },
+        "usageCount": { "type": "integer" },
+        "lastUsedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "voiceId",
+        "ownerUid",
+        "ownerEmail",
+        "name",
+        "language",
+        "languageName",
+        "conditioningMethod",
+        "modelCheckpoint",
+        "speakerConditioningSha256",
+        "promptConditioningSha256",
+        "referenceTranscript",
+        "referenceDurationSec",
+        "promptDurationSec",
+        "fundamentalFreqHz",
+        "pitchMinHz",
+        "pitchMaxHz",
+        "spectralWarmthRatio",
+        "estimatedSnrDb",
+        "qualityGrade",
+        "sourceType",
+        "sourceFileName",
+        "storageKey",
+        "consentConfirmed",
+        "usageCount",
+        "lastUsedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SavedVoiceConditioningChunk": {
+      "title": "SavedVoiceConditioningChunk",
+      "description": "Immutable lossless FLAC binary chunk storing verified speaker-conditioning audio permanently in a user-isolated subcollection.",
+      "type": "object",
+      "properties": {
+        "chunkId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "voiceId": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "ownerUid": { "type": "string", "pattern": "^[a-zA-Z0-9_\\-]+$", "maxLength": 128 },
+        "assetKind": { "type": "string", "enum": ["prompt_flac", "ref_flac"] },
+        "codec": { "type": "string", "enum": ["flac"] },
+        "chunkIndex": { "type": "integer" },
+        "totalChunks": { "type": "integer" },
+        "assetSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "maxLength": 64 },
+        "targetWavSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$", "maxLength": 64 },
+        "payload": { "type": "string", "format": "byte" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "chunkId",
+        "voiceId",
+        "ownerUid",
+        "assetKind",
+        "codec",
+        "chunkIndex",
+        "totalChunks",
+        "assetSha256",
+        "targetWavSha256",
+        "payload",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/system/ownership": {
+      "schema": { "$ref": "#/entities/OwnershipRecord" },
+      "description": "Singleton root ownership document (Owner-only read/write)."
+    },
+    "/system/governance": {
+      "schema": { "$ref": "#/entities/GovernanceConfig" },
+      "description": "Singleton platform governance and access control settings."
+    },
+    "/system/catalog": {
+      "schema": { "$ref": "#/entities/PlatformCatalog" },
+      "description": "Public-safe feature pricing and token requirement flags (zero payment secrets)."
+    },
+    "/system/paymentSettings": {
+      "schema": { "$ref": "#/entities/PaymentSettings" },
+      "description": "Owner-only bKash & Nagad payment configuration (strictly blocked from non-owners)."
+    },
+    "/users/{uid}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated user registry with PII restricted to account owner and platform owner."
+    },
+    "/paymentRequests/{orderId}": {
+      "schema": { "$ref": "#/entities/PaymentRequest" },
+      "description": "bKash & Nagad payment verification requests submitted by verified users and approved/rejected by the Owner."
+    },
+    "/entitlements/{uid}": {
+      "schema": { "$ref": "#/entities/UserEntitlement" },
+      "description": "Paid feature entitlements and token balance per user, writable exclusively by the Owner."
+    },
+    "/tokenLedger/{entryId}": {
+      "schema": { "$ref": "#/entities/TokenLedgerEntry" },
+      "description": "Append-only token accounting ledger readable by self or Owner."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AdminAuditLog" },
+      "description": "Append-only Owner security audit logs."
+    },
+    "/savedVoices/{voiceId}": {
+      "schema": { "$ref": "#/entities/SavedVoiceProfile" },
+      "description": "User-isolated persistent saved voice profile metadata strictly accessible to ownerUid only."
+    },
+    "/savedVoices/{voiceId}/conditioningChunks/{chunkId}": {
+      "schema": { "$ref": "#/entities/SavedVoiceConditioningChunk" },
+      "description": "User-isolated immutable lossless FLAC conditioning audio chunks strictly accessible to ownerUid only."
+    }
+  }
+}

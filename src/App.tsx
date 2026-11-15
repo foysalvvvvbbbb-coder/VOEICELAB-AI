@@ -11,12 +11,29 @@ import {
   Home,
   Settings2,
   ShieldCheck,
-  Sparkles
+  Sparkles,
+  Crown,
+  Lock,
+  AlertTriangle,
+  LogIn,
+  LogOut,
+  Coins
 } from 'lucide-react';
-import { VoiceCloningWorkspace } from './components/VoiceCloningWorkspace';
+import {
+  VoiceCloningWorkspace,
+  type VoiceToSrtHandoff
+} from './components/VoiceCloningWorkspace';
 import { SrtGeneratorWorkspace } from './components/SrtGeneratorWorkspace';
 import { ArchitectureAndQaView } from './components/ArchitectureAndQaView';
+import { AdminOwnershipPanel } from './components/AdminOwnershipPanel';
+import { UpgradeAccessModal } from './components/UpgradeAccessModal';
 import { FloatingActivityBar } from './components/FloatingActivityBar';
+import {
+  FirebaseAuthProvider,
+  useFirebaseAuth,
+  type FeatureGateKey,
+  type PackageFeatureKey
+} from './contexts/FirebaseAuthContext';
 import { ensureSessionInitialized, fetchApiJson } from './utils/apiClient';
 import {
   completeOperation,
@@ -25,7 +42,12 @@ import {
   updateOperationStage
 } from './utils/activityManager';
 
-export type ActiveScreen = 'dashboard' | 'voice-cloning' | 'srt-generator' | 'architecture-qa';
+export type ActiveScreen =
+  | 'dashboard'
+  | 'voice-cloning'
+  | 'srt-generator'
+  | 'architecture-qa'
+  | 'admin-panel';
 
 export interface ActivityRecord {
   id: string;
@@ -41,9 +63,98 @@ export interface ActivityRecord {
 }
 
 export default function App() {
+  return (
+    <FirebaseAuthProvider>
+      <AppContent />
+    </FirebaseAuthProvider>
+  );
+}
+
+function AppContent() {
+  const {
+    user,
+    authReady,
+    role,
+    isOwner,
+    isSuspended,
+    tokenBalance,
+    governanceConfig,
+    featureConfigs,
+    hasAnyPaidOrTokenFeature,
+    myPaymentRequests,
+    hasFeatureAccess,
+    getFeatureTokenCost,
+    signInWithGoogle,
+    signOutUser
+  } = useFirebaseAuth();
   const [activeScreen, setActiveScreen] = useState<ActiveScreen>('dashboard');
+  const [voiceToSrtHandoff, setVoiceToSrtHandoff] = useState<VoiceToSrtHandoff | null>(null);
   const [purgeStatus, setPurgeStatus] = useState<string | null>(null);
+  const activityStorageKey = `voicelab_recent_activities_v1_${user?.uid || 'guest'}`;
   const [recentActivities, setRecentActivities] = useState<ActivityRecord[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(activityStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setRecentActivities(parsed.slice(0, 10));
+          return;
+        }
+      }
+      setRecentActivities([]);
+    } catch {
+      setRecentActivities([]);
+    }
+  }, [activityStorageKey]);
+  const [upgradeModal, setUpgradeModal] = useState<{ open: boolean; feature: PackageFeatureKey }>({
+    open: false,
+    feature: 'pro_bundle'
+  });
+
+  // Block unauthorized direct URL access (?screen=admin / #admin) and enforce owner-only admin view
+  useEffect(() => {
+    const syncAndGuardRoute = () => {
+      const params = new URLSearchParams(window.location.search);
+      const screenParam = params.get('screen');
+      const hash = window.location.hash.replace(/^#/, '');
+      const wantsAdmin =
+        screenParam === 'admin' ||
+        screenParam === 'admin-panel' ||
+        hash === 'admin' ||
+        hash === 'admin-panel';
+
+      if (wantsAdmin) {
+        if (authReady && isOwner) {
+          setActiveScreen('admin-panel');
+        } else if (authReady && !isOwner) {
+          setActiveScreen('dashboard');
+          params.delete('screen');
+          const nextSearch = params.toString();
+          const cleanUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}`;
+          window.history.replaceState(null, '', cleanUrl);
+        }
+      }
+    };
+
+    syncAndGuardRoute();
+    window.addEventListener('hashchange', syncAndGuardRoute);
+    window.addEventListener('popstate', syncAndGuardRoute);
+    return () => {
+      window.removeEventListener('hashchange', syncAndGuardRoute);
+      window.removeEventListener('popstate', syncAndGuardRoute);
+    };
+  }, [authReady, isOwner]);
+
+  // Immediately close Admin Panel if user signs out or is not verified Owner
+  useEffect(() => {
+    if (activeScreen === 'admin-panel' && (!authReady || !isOwner)) {
+      if (authReady && !isOwner) {
+        setActiveScreen('dashboard');
+      }
+    }
+  }, [activeScreen, authReady, isOwner]);
 
   // Initialize authenticated session on mount & keep Nginx Lua auth_token_cache (300s TTL) warm
   useEffect(() => {
@@ -67,10 +178,18 @@ export default function App() {
     const newEntry: ActivityRecord = {
       ...item,
       id: `act_${Date.now()}`,
-      timestampLabel: 'Just now',
+      timestampLabel: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: 'Completed'
     };
-    setRecentActivities((prev) => [newEntry, ...prev.slice(0, 5)]);
+    setRecentActivities((prev) => {
+      const next = [newEntry, ...prev.slice(0, 9)];
+      try {
+        window.localStorage.setItem(activityStorageKey, JSON.stringify(next));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return next;
+    });
   };
 
   const handleDownloadActivitySrt = (act: ActivityRecord) => {
@@ -203,8 +322,8 @@ export default function App() {
               <span>Audio to SRT</span>
             </button>
 
-            {/* Secondary Technical Section */}
-            <div className="pt-3 mt-3 border-t border-[#19352A]/80">
+            {/* Secondary Technical & Governance Section */}
+            <div className="pt-3 mt-3 border-t border-[#19352A]/80 space-y-1">
               <button
                 type="button"
                 onClick={() => setActiveScreen('architecture-qa')}
@@ -217,12 +336,82 @@ export default function App() {
                 <Settings2 className="w-4 h-4 text-[#A2B5AA] shrink-0" />
                 <span>Architecture &amp; QA</span>
               </button>
+
+              {isOwner && (
+                <button
+                  type="button"
+                  onClick={() => setActiveScreen('admin-panel')}
+                  className={`w-full flex items-center justify-between gap-2 px-3.5 py-2 rounded-xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    activeScreen === 'admin-panel'
+                      ? 'bg-[#19352A] text-[#F4F8F5] border border-[#16A36A]/50'
+                      : 'text-[#A2B5AA] hover:bg-[#12231D] hover:text-[#F4F8F5]'
+                  }`}
+                >
+                  <span className="flex items-center gap-3 min-w-0">
+                    <Crown className="w-4 h-4 text-[#42D9A0] shrink-0" />
+                    <span className="truncate">Admin Panel</span>
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded bg-[#16A36A]/20 text-[10px] font-semibold uppercase text-[#42D9A0]">
+                    Owner
+                  </span>
+                </button>
+              )}
             </div>
           </nav>
         </div>
 
         {/* Bottom Sidebar Info Card */}
         <div className="space-y-3">
+          {user ? (
+            <div className="rounded-xl bg-[#12231D] border border-[#19352A] p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-xs font-semibold text-[#F4F8F5]">
+                <span className="truncate">{user.displayName || user.email}</span>
+                <span className="text-[10px] uppercase text-[#42D9A0] shrink-0">
+                  {role === 'owner' ? 'Owner' : 'Member'}
+                </span>
+              </div>
+              <div className="text-[11px] text-[#A2B5AA] truncate font-mono">{user.email}</div>
+              {(tokenBalance > 0 || hasAnyPaidOrTokenFeature) && (
+                <div className="flex items-center justify-between text-[11px] pt-1 border-t border-[#19352A]">
+                  <span className="text-[#A2B5AA] flex items-center gap-1">
+                    <Coins className="w-3.5 h-3.5 text-[#42D9A0]" />
+                    <span>Tokens</span>
+                  </span>
+                  <span className="font-mono font-semibold text-[#F4F8F5]">{tokenBalance}</span>
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-2 pt-1 border-t border-[#19352A]">
+                {hasAnyPaidOrTokenFeature || myPaymentRequests.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => setUpgradeModal({ open: true, feature: 'pro_bundle' })}
+                    className="text-[11px] font-medium text-[#42D9A0] hover:underline cursor-pointer"
+                  >
+                    Upgrade / Access
+                  </button>
+                ) : (
+                  <span className="text-[11px] text-[#A2B5AA]">Standard Access</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void signOutUser()}
+                  className="text-[11px] text-[#A2B5AA] hover:text-red-300 inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <LogOut className="w-3 h-3" /> Sign Out
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void signInWithGoogle()}
+              className="w-full rounded-xl bg-white hover:bg-gray-100 text-gray-900 p-2.5 flex items-center justify-center gap-2 text-xs font-semibold transition-colors cursor-pointer shadow-sm"
+            >
+              <LogIn className="w-3.5 h-3.5 text-[#16A36A]" />
+              <span>Continue with Google</span>
+            </button>
+          )}
+
           <div className="rounded-xl bg-[#12231D] border border-[#19352A] p-3.5 space-y-1">
             <div className="flex items-center gap-2 text-xs font-semibold text-[#F4F8F5]">
               <ShieldCheck className="w-4 h-4 text-[#42D9A0] shrink-0" />
@@ -299,6 +488,19 @@ export default function App() {
               >
                 QA
               </button>
+              {isOwner && (
+                <button
+                  type="button"
+                  onClick={() => setActiveScreen('admin-panel')}
+                  className={`px-2 py-1 rounded-lg text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                    activeScreen === 'admin-panel'
+                      ? 'bg-[#19352A] text-[#42D9A0]'
+                      : 'text-[#A2B5AA] hover:text-[#F4F8F5]'
+                  }`}
+                >
+                  Admin
+                </button>
+              )}
             </nav>
 
             {/* Desktop Breadcrumb Context */}
@@ -312,12 +514,44 @@ export default function App() {
                   ? 'Voice Cloning Studio'
                   : activeScreen === 'srt-generator'
                   ? 'Universal Audio to SRT'
+                  : activeScreen === 'admin-panel' && isOwner
+                  ? 'Admin Panel'
                   : 'Architecture & QA'}
               </span>
             </div>
 
-            {/* Zone 3: 1 Primary Utility Action */}
-            <div className="flex items-center shrink-0">
+            {/* Zone 3: Account, Token Balance & Purge Utility */}
+            <div className="flex items-center gap-2 shrink-0">
+              {user && (tokenBalance > 0 || hasAnyPaidOrTokenFeature) && (
+                <div className="px-2.5 py-1.5 rounded-lg bg-[#12231D] border border-[#19352A] text-xs font-mono text-[#F4F8F5] flex items-center gap-1.5 whitespace-nowrap">
+                  <Coins className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
+                  <span>{tokenBalance}</span>
+                </div>
+              )}
+
+              {user && (hasAnyPaidOrTokenFeature || myPaymentRequests.length > 0) && (
+                <button
+                  type="button"
+                  onClick={() => setUpgradeModal({ open: true, feature: 'pro_bundle' })}
+                  className="px-2.5 py-1.5 text-xs font-semibold text-[#42D9A0] bg-[#19352A] hover:bg-[#16A36A]/25 border border-[#16A36A]/40 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden sm:inline">Upgrade</span>
+                </button>
+              )}
+
+              {!user && (
+                <button
+                  type="button"
+                  onClick={() => void signInWithGoogle()}
+                  className="px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-gray-900 bg-white hover:bg-gray-100 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <LogIn className="w-3.5 h-3.5 text-[#16A36A] shrink-0" />
+                  <span className="hidden sm:inline">Continue with Google</span>
+                  <span className="sm:hidden">Google</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={handlePurgeTemporaryAudio}
@@ -332,8 +566,8 @@ export default function App() {
                 ) : (
                   <>
                     <Trash2 className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
-                    <span className="hidden sm:inline">Purge Temp Audio</span>
-                    <span className="sm:hidden">Purge</span>
+                    <span className="hidden lg:inline">Purge Temp Audio</span>
+                    <span className="lg:hidden">Purge</span>
                   </>
                 )}
               </button>
@@ -342,12 +576,59 @@ export default function App() {
         </header>
 
         {/* Main Content Viewport */}
-        <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-6 py-5 sm:py-7">
+        <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-6 py-5 sm:py-7 space-y-5">
+          {governanceConfig.maintenanceMode && !isOwner && (
+            <div className="rounded-2xl bg-amber-950/50 border border-amber-600/50 p-4 flex items-start gap-2.5 text-xs text-amber-200">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-amber-100">Maintenance Mode Active</div>
+                <div className="mt-0.5">{governanceConfig.maintenanceNotice}</div>
+              </div>
+            </div>
+          )}
+
+          {isSuspended && (
+            <div className="rounded-2xl bg-red-950/50 border border-red-700/50 p-4 flex items-start gap-2.5 text-xs text-red-200">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-red-100">Account Suspended</div>
+                <div className="mt-0.5">
+                  Your account has been suspended by an administrator. Contact the workspace administrator to restore access.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {governanceConfig.requireAuthForCompute &&
+            !user &&
+            (activeScreen === 'voice-cloning' || activeScreen === 'srt-generator') && (
+              <div className="rounded-2xl bg-[#12231D] border border-[#16A36A]/50 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                <div className="flex items-start gap-2.5">
+                  <Lock className="w-4 h-4 text-[#42D9A0] shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-semibold text-[#F4F8F5]">
+                      Google Sign-In Required
+                    </div>
+                    <div className="text-[#A2B5AA] mt-0.5">
+                      Signing in with Google is required before running voice synthesis or SRT transcription jobs.
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void signInWithGoogle()}
+                  className="px-3.5 py-2 rounded-xl bg-[#16A36A] hover:bg-[#16A36A]/90 text-[#F4F8F5] font-semibold whitespace-nowrap cursor-pointer self-start sm:self-center"
+                >
+                  Sign In with Google
+                </button>
+              </div>
+            )}
+
           {activeScreen === 'dashboard' && (
             <div className="space-y-5">
               {/* Compact Welcome Banner */}
-              <section className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#12231D] via-[#19352A]/90 to-[#12231D] border border-[#16A36A]/40 px-5 py-5 sm:px-7 sm:py-6 flex items-center justify-between gap-6">
-                <div className="space-y-1.5 max-w-xl z-10">
+              <section className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#12231D] via-[#19352A]/90 to-[#12231D] border border-[#16A36A]/40 px-5 py-5 sm:px-7 sm:py-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="space-y-2 max-w-xl z-10">
                   <h1
                     className="text-xl sm:text-3xl font-bold text-[#F4F8F5] tracking-tight"
                     style={{ textWrap: 'balance' }}
@@ -357,6 +638,40 @@ export default function App() {
                   <p className="text-xs sm:text-sm text-[#A2B5AA] leading-relaxed">
                     Create studio-quality cloned voice or generate SRT subtitles with ease.
                   </p>
+                  <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                    {!user ? (
+                      <button
+                        type="button"
+                        onClick={() => void signInWithGoogle()}
+                        className="px-4 py-2 rounded-xl bg-white hover:bg-gray-100 text-gray-900 font-semibold text-xs flex items-center gap-2 cursor-pointer shadow-sm"
+                      >
+                        <LogIn className="w-3.5 h-3.5 text-[#16A36A]" />
+                        <span>Continue with Google</span>
+                      </button>
+                    ) : (
+                      <>
+                        <span className="px-3 py-1.5 rounded-xl bg-[#0B1512]/80 border border-[#16A36A]/50 text-xs text-[#42D9A0] font-medium">
+                          {user.email}
+                        </span>
+                        {(tokenBalance > 0 || hasAnyPaidOrTokenFeature) && (
+                          <span className="px-3 py-1.5 rounded-xl bg-[#0B1512]/80 border border-[#19352A] text-xs text-[#F4F8F5] font-mono inline-flex items-center gap-1.5">
+                            <Coins className="w-3.5 h-3.5 text-[#42D9A0]" />
+                            <span>{tokenBalance} Tokens</span>
+                          </span>
+                        )}
+                        {(hasAnyPaidOrTokenFeature || myPaymentRequests.length > 0) && (
+                          <button
+                            type="button"
+                            onClick={() => setUpgradeModal({ open: true, feature: 'pro_bundle' })}
+                            className="px-3.5 py-1.5 rounded-xl bg-[#19352A] hover:bg-[#16A36A]/30 border border-[#16A36A]/50 text-[#42D9A0] font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            <span>Upgrade / Request Access</span>
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </div>
 
                 {/* Decorative Acoustic Waveform Illustration (Desktop/Tablet) */}
@@ -387,9 +702,18 @@ export default function App() {
                         <Mic2 className="w-6 h-6 text-[#42D9A0]" />
                       </div>
                       <div className="min-w-0">
-                        <h2 className="text-lg sm:text-xl font-bold text-[#F4F8F5] tracking-tight">
-                          Voice Cloning
-                        </h2>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h2 className="text-lg sm:text-xl font-bold text-[#F4F8F5] tracking-tight">
+                            Voice Cloning
+                          </h2>
+                          <FeatureStatusTag
+                            feature="voice_cloning"
+                            enabled={featureConfigs.voice_cloning.enabled}
+                            isPaid={featureConfigs.voice_cloning.isPaid}
+                            hasAccess={hasFeatureAccess('voice_cloning')}
+                            tokenCost={getFeatureTokenCost('voice_cloning')}
+                          />
+                        </div>
                         <p className="text-xs sm:text-sm text-[#A2B5AA] mt-1 line-clamp-2 leading-relaxed">
                           Clone any voice in Bengali, Hindi or English (Same Language Only).
                         </p>
@@ -423,9 +747,18 @@ export default function App() {
                         <Captions className="w-6 h-6 text-[#42D9A0]" />
                       </div>
                       <div className="min-w-0">
-                        <h2 className="text-lg sm:text-xl font-bold text-[#F4F8F5] tracking-tight">
-                          Audio to SRT
-                        </h2>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h2 className="text-lg sm:text-xl font-bold text-[#F4F8F5] tracking-tight">
+                            Audio to SRT
+                          </h2>
+                          <FeatureStatusTag
+                            feature="srt_generator"
+                            enabled={featureConfigs.srt_generator.enabled}
+                            isPaid={featureConfigs.srt_generator.isPaid}
+                            hasAccess={hasFeatureAccess('srt_generator')}
+                            tokenCost={getFeatureTokenCost('srt_generator')}
+                          />
+                        </div>
                         <p className="text-xs sm:text-sm text-[#A2B5AA] mt-1 line-clamp-2 leading-relaxed">
                           Convert audio to accurate subtitles in multiple languages.
                         </p>
@@ -537,38 +870,103 @@ export default function App() {
             </div>
           )}
 
-          {activeScreen === 'voice-cloning' && (
-            <VoiceCloningWorkspace
-              onNavigateBackToDashboard={() => setActiveScreen('dashboard')}
-              onActivityComplete={(info) =>
-                handleRecordActivity({
-                  type: 'voice-cloning',
-                  title: 'Voice Cloning',
-                  languageLabel: info.languageLabel,
-                  downloadUrl: info.downloadUrl,
-                  downloadFilename: info.downloadFilename,
-                  targetScreen: 'voice-cloning'
-                })
-              }
-            />
-          )}
+          {activeScreen === 'voice-cloning' &&
+            (!featureConfigs.voice_cloning.enabled ? (
+              <FeatureDisabledGate title="Voice Cloning Studio" />
+            ) : (featureConfigs.voice_cloning.isPaid && !hasFeatureAccess('voice_cloning')) ||
+              (getFeatureTokenCost('voice_cloning') > 0 &&
+                tokenBalance < getFeatureTokenCost('voice_cloning') &&
+                !isOwner) ? (
+              <FeatureAccessGate
+                title="Voice Cloning Studio"
+                description="Access to Voice Cloning Studio requires an active plan or sufficient token balance."
+                tokenCost={getFeatureTokenCost('voice_cloning')}
+                tokenBalance={tokenBalance}
+                isSignedIn={Boolean(user)}
+                onSignIn={() => void signInWithGoogle()}
+                onRequestUpgrade={() =>
+                  setUpgradeModal({ open: true, feature: 'voice_cloning' })
+                }
+              />
+            ) : (
+              <div className="space-y-4">
+                {featureConfigs.long_script.isPaid && !hasFeatureAccess('long_script') && (
+                  <div className="rounded-xl bg-[#12231D] border border-[#16A36A]/40 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                    <div className="flex items-center gap-2 text-[#F4F8F5]">
+                      <Lock className="w-4 h-4 text-[#42D9A0] shrink-0" />
+                      <span>
+                        <strong>Long-Script (&gt;1,000 Chars)</strong> requires premium feature
+                        access.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setUpgradeModal({ open: true, feature: 'long_script' })}
+                      className="px-3.5 py-1.5 rounded-lg bg-[#16A36A] hover:bg-[#16A36A]/90 text-[#F4F8F5] font-semibold whitespace-nowrap cursor-pointer self-start sm:self-center"
+                    >
+                      Upgrade / Request Access
+                    </button>
+                  </div>
+                )}
 
-          {activeScreen === 'srt-generator' && (
-            <SrtGeneratorWorkspace
-              onActivityComplete={(info) =>
-                handleRecordActivity({
-                  type: 'srt-generator',
-                  title: 'SRT Generation',
-                  languageLabel: info.languageLabel,
-                  srtContent: info.srtContent,
-                  downloadFilename: info.downloadFilename,
-                  targetScreen: 'srt-generator'
-                })
-              }
-            />
-          )}
+                <VoiceCloningWorkspace
+                  onNavigateBackToDashboard={() => setActiveScreen('dashboard')}
+                  onSendToSrtEditor={(handoff) => {
+                    setVoiceToSrtHandoff(handoff);
+                    setActiveScreen('srt-generator');
+                  }}
+                  onActivityComplete={(info) =>
+                    handleRecordActivity({
+                      type: 'voice-cloning',
+                      title: 'Voice Cloning',
+                      languageLabel: info.languageLabel,
+                      downloadUrl: info.downloadUrl,
+                      downloadFilename: info.downloadFilename,
+                      targetScreen: 'voice-cloning'
+                    })
+                  }
+                />
+              </div>
+            ))}
+
+          {activeScreen === 'srt-generator' &&
+            (!featureConfigs.srt_generator.enabled ? (
+              <FeatureDisabledGate title="Audio to SRT Generator" />
+            ) : (featureConfigs.srt_generator.isPaid && !hasFeatureAccess('srt_generator')) ||
+              (getFeatureTokenCost('srt_generator') > 0 &&
+                tokenBalance < getFeatureTokenCost('srt_generator') &&
+                !isOwner) ? (
+              <FeatureAccessGate
+                title="Audio to SRT Generator"
+                description="Access to Audio to SRT Generator requires an active plan or sufficient token balance."
+                tokenCost={getFeatureTokenCost('srt_generator')}
+                tokenBalance={tokenBalance}
+                isSignedIn={Boolean(user)}
+                onSignIn={() => void signInWithGoogle()}
+                onRequestUpgrade={() =>
+                  setUpgradeModal({ open: true, feature: 'srt_generator' })
+                }
+              />
+            ) : (
+              <SrtGeneratorWorkspace
+                initialHandoff={voiceToSrtHandoff}
+                onConsumeHandoff={() => setVoiceToSrtHandoff(null)}
+                onActivityComplete={(info) =>
+                  handleRecordActivity({
+                    type: 'srt-generator',
+                    title: 'SRT Generation',
+                    languageLabel: info.languageLabel,
+                    srtContent: info.srtContent,
+                    downloadFilename: info.downloadFilename,
+                    targetScreen: 'srt-generator'
+                  })
+                }
+              />
+            ))}
 
           {activeScreen === 'architecture-qa' && <ArchitectureAndQaView />}
+
+          {activeScreen === 'admin-panel' && isOwner && <AdminOwnershipPanel />}
         </main>
 
         {/* Compact Footer */}
@@ -599,6 +997,18 @@ export default function App() {
               >
                 Architecture &amp; QA
               </button>
+              {isOwner && (
+                <>
+                  <span>·</span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveScreen('admin-panel')}
+                    className="hover:text-[#42D9A0] text-[#42D9A0] transition-colors cursor-pointer"
+                  >
+                    Admin Panel
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </footer>
@@ -606,6 +1016,111 @@ export default function App() {
 
       {/* Global Floating Bottom Activity Bar */}
       <FloatingActivityBar />
+
+      {/* Minimal Upgrade / Request Access Modal (Instructions loaded dynamically per selection) */}
+      <UpgradeAccessModal
+        isOpen={upgradeModal.open}
+        initialFeature={upgradeModal.feature}
+        onClose={() => setUpgradeModal((prev) => ({ ...prev, open: false }))}
+      />
     </div>
   );
 }
+
+const FeatureStatusTag: React.FC<{
+  feature: FeatureGateKey;
+  enabled: boolean;
+  isPaid: boolean;
+  hasAccess: boolean;
+  tokenCost: number;
+}> = ({ enabled, isPaid, hasAccess, tokenCost }) => {
+  if (!enabled) {
+    return (
+      <span className="px-2 py-0.5 rounded-md bg-red-950/60 border border-red-800/50 text-[10px] font-semibold text-red-300">
+        Disabled
+      </span>
+    );
+  }
+  if (isPaid && !hasAccess) {
+    return (
+      <span className="px-2 py-0.5 rounded-md bg-amber-950/60 border border-amber-700/50 text-[10px] font-semibold text-amber-300">
+        Access Required
+      </span>
+    );
+  }
+  if (tokenCost > 0) {
+    return (
+      <span className="px-2 py-0.5 rounded-md bg-[#0B1512] border border-[#19352A] text-[10px] font-mono text-[#42D9A0]">
+        {tokenCost} Tokens / Run
+      </span>
+    );
+  }
+  return null;
+};
+
+const FeatureDisabledGate: React.FC<{ title: string }> = ({ title }) => (
+  <div className="max-w-xl mx-auto bg-[#12231D] border border-red-800/40 rounded-2xl p-6 sm:p-8 space-y-3 text-center">
+    <div className="w-12 h-12 mx-auto rounded-2xl bg-red-950/50 border border-red-800/50 flex items-center justify-center">
+      <Lock className="w-6 h-6 text-red-300" />
+    </div>
+    <h2 className="text-lg font-bold text-[#F4F8F5]">{title} Temporarily Disabled</h2>
+    <p className="text-xs sm:text-sm text-[#A2B5AA]">
+      This feature has been temporarily disabled by the workspace administrator.
+    </p>
+  </div>
+);
+
+const FeatureAccessGate: React.FC<{
+  title: string;
+  description: string;
+  tokenCost: number;
+  tokenBalance: number;
+  isSignedIn: boolean;
+  onSignIn: () => void;
+  onRequestUpgrade: () => void;
+}> = ({
+  title,
+  description,
+  tokenCost,
+  tokenBalance,
+  isSignedIn,
+  onSignIn,
+  onRequestUpgrade
+}) => (
+  <div className="max-w-xl mx-auto bg-[#12231D] border border-[#16A36A]/40 rounded-2xl p-6 sm:p-8 space-y-5">
+    <div className="flex items-start gap-4">
+      <div className="w-12 h-12 rounded-2xl bg-[#19352A] border border-[#16A36A]/50 flex items-center justify-center shrink-0">
+        <Lock className="w-6 h-6 text-[#42D9A0]" />
+      </div>
+      <div className="space-y-1">
+        <h2 className="text-lg font-bold text-[#F4F8F5]">{title} — Access Required</h2>
+        <p className="text-xs sm:text-sm text-[#A2B5AA] leading-relaxed">{description}</p>
+        {tokenCost > 0 && (
+          <div className="text-xs font-mono text-[#42D9A0] pt-1">
+            Required: {tokenCost} Tokens · Your Balance: {tokenBalance} Tokens
+          </div>
+        )}
+      </div>
+    </div>
+    <div className="flex flex-wrap gap-3">
+      {!isSignedIn && (
+        <button
+          type="button"
+          onClick={onSignIn}
+          className="px-4 py-2.5 rounded-xl bg-white hover:bg-gray-100 text-gray-900 font-semibold text-xs flex items-center gap-2 cursor-pointer"
+        >
+          <LogIn className="w-4 h-4 text-[#16A36A]" />
+          <span>Continue with Google</span>
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={onRequestUpgrade}
+        className="px-5 py-2.5 rounded-xl bg-[#16A36A] hover:bg-[#16A36A]/90 text-[#F4F8F5] font-semibold text-xs flex items-center gap-2 cursor-pointer"
+      >
+        <Sparkles className="w-4 h-4" />
+        <span>Upgrade / Request Access</span>
+      </button>
+    </div>
+  </div>
+);

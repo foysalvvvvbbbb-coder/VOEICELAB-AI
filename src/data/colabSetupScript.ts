@@ -2,14 +2,17 @@ export function buildColabOneCellSetupScript(customToken = 'voicelab-local-token
   const safeToken = (customToken || 'voicelab-local-token').replace(/["'\\\n\r]/g, '').trim() || 'voicelab-local-token';
   return `# =====================================================================
 # VoiceLab AI v3.3.0 — Free Google Colab T4 GPU Mode 2 Neural Node (0 Tk)
-# Runtime -> Change runtime type -> T4 GPU -> Run this cell once!
-# Supports Unlimited Bengali (bn) & Hindi (hi) Zero-Shot Cloning (IndicF5)
+# 1) Runtime -> Change runtime type -> T4 GPU
+# 2) One-time free step: Open https://huggingface.co/ai4bharat/IndicF5
+#    and click "Agree" (auto-approved), then copy a free Read Token from
+#    https://huggingface.co/settings/tokens
+# 3) Run this cell! Paste your https://*.trycloudflare.com URL into VoiceLab AI.
 # =====================================================================
 !pip install -q fastapi uvicorn pydantic soundfile numpy git+https://github.com/ai4bharat/IndicF5.git speechbrain
 !wget -q -O /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
 !chmod +x /usr/local/bin/cloudflared
 
-import os, re, time, threading, subprocess, base64, tempfile, importlib.util
+import os, re, time, getpass, threading, subprocess, base64, tempfile, importlib.util
 from typing import List, Optional
 import numpy as np
 import soundfile as sf
@@ -18,6 +21,19 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+
+hf_token = os.environ.get("HF_TOKEN", "").strip()
+if not hf_token:
+    try:
+        from google.colab import userdata
+        hf_token = (userdata.get("HF_TOKEN") or "").strip()
+    except Exception:
+        pass
+if not hf_token:
+    print("ai4bharat/IndicF5 requires a free HuggingFace Read token (click Agree once on huggingface.co/ai4bharat/IndicF5).")
+    hf_token = getpass.getpass("Paste HuggingFace Read Token (hf_...): ").strip()
+if hf_token:
+    os.environ["HF_TOKEN"] = hf_token
 
 os.environ["LOCAL_NODE_AUTH_TOKEN"] = "${safeToken}"
 EXPECTED_TOKEN = os.environ["LOCAL_NODE_AUTH_TOKEN"]
@@ -33,7 +49,11 @@ def get_indicf5():
     if "indicf5" not in _MODELS:
         from transformers import AutoModel
         print("Loading ai4bharat/IndicF5 onto", get_device(), "...")
-        _MODELS["indicf5"] = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True).to(get_device())
+        _MODELS["indicf5"] = AutoModel.from_pretrained(
+            "ai4bharat/IndicF5",
+            trust_remote_code=True,
+            token=os.environ.get("HF_TOKEN") or None
+        ).to(get_device())
         print("IndicF5 ready!")
     return _MODELS["indicf5"]
 

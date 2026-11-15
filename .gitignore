@@ -26,8 +26,9 @@ server.js
 firebase-applet-config.json
 service-account*.json
 
-# Ephemeral Audio Uploads, Samples & Generated Media
+# Ephemeral Audio Uploads, Samples & Persistent Voice Vault
 voicelab_ai_storage/
+.voicelab_persistent/
 uploads/
 generated/
 samples/

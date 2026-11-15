@@ -6,10 +6,21 @@ import type {
   AudioSignalAnalysis,
   SrtSegment,
   SrtValidationReport,
-  SrtWordTimestamp
+  SrtWordTimestamp,
+  VoiceAudioEnhancementReport,
+  VoiceAudioQualityMode
 } from '../types/voicelab.ts';
 
 const execFileAsync = promisify(execFile);
+
+export interface StudioBandProfileDb {
+  lowWarmthDb: number;
+  mudDb: number;
+  nasalDb: number;
+  presenceDb: number;
+  sibilanceDb: number;
+  airDb: number;
+}
 
 export interface RawPcmPitchStats {
   fundamentalFreqHz: number;
@@ -20,10 +31,12 @@ export interface RawPcmPitchStats {
   rmsDb: number;
   peakDb: number;
   noiseFloorDb: number;
+  activeNoiseFloorDb: number;
   silenceRatio: number;
   clippedSamplesCount: number;
   dcOffset: number;
   acousticEmbedding16D: number[];
+  studioBandProfileDb: StudioBandProfileDb;
 }
 
 export function computeVectorCosineSimilarity(a: number[], b: number[]): number {
@@ -41,17 +54,18 @@ export function computeVectorCosineSimilarity(a: number[], b: number[]): number 
 }
 
 const VOCAL_BAND_FREQS_HZ = [120, 180, 260, 380, 550, 800, 1150, 1650, 2350, 3300, 4600, 6400];
+const AIR_BAND_FREQS_HZ = [8000, 9400];
 
 /**
- * Extracts raw 16kHz 16-bit mono PCM via FFmpeg and computes:
+ * Extracts raw 24kHz 16-bit mono PCM via FFmpeg and computes:
  * - Voiced frame autocorrelation fundamental frequency (F0 in Hz, 72Hz–350Hz human vocal range)
  * - 10th to 90th percentile F0 range & F0 standard deviation (Hz)
- * - RMS level (dBFS), Peak level (dBFS), Noise floor (15th percentile frame energy)
+ * - RMS level (dBFS), Peak level (dBFS), Noise floor (all-frame p15 & active-speech p12 excluding digital zero pauses)
  * - Clipped sample count (|s| >= 0.998) and DC offset
- * - 16-D Voiced Acoustic-Spectral Speaker Descriptor (12 Goertzel vocal band energies + 4 prosodic descriptors)
+ * - 16-D Voiced Acoustic-Spectral Speaker Descriptor + 6-band Studio Mastering dB profile (up to 9.4 kHz air)
  */
 export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Promise<RawPcmPitchStats> {
-  const tempRawPath = `${filePath}.16k.pcm`;
+  const tempRawPath = `${filePath}.24k.pcm`;
   try {
     await execFileAsync('ffmpeg', [
       '-y',
@@ -61,7 +75,7 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
       '-ac',
       '1',
       '-ar',
-      '16000',
+      '24000',
       '-f',
       's16le',
       tempRawPath
@@ -69,7 +83,7 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
 
     const buffer = await fs.promises.readFile(tempRawPath);
     const numSamples = Math.floor(buffer.length / 2);
-    if (numSamples < 1600) {
+    if (numSamples < 2400) {
       throw new Error('Audio recording is too short (< 0.1s) or contains no decodable PCM samples.');
     }
 
@@ -94,24 +108,28 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
     const rmsDb = globalRms > 1e-6 ? 20 * Math.log10(globalRms) : -96.0;
     const peakDb = globalPeak > 1e-6 ? 20 * Math.log10(globalPeak) : -96.0;
 
-    // Frame-by-frame analysis (30ms frames = 480 samples at 16kHz, hop = 240 samples)
-    const sampleRate = 16000;
-    const frameSize = 480;
-    const hopSize = 240;
+    // Frame-by-frame analysis (30ms frames = 720 samples at 24kHz, hop = 360 samples)
+    const sampleRate = 24000;
+    const frameSize = 720;
+    const hopSize = 360;
     const frameDbValues: number[] = [];
+    const nonZeroFrameDbValues: number[] = [];
     const f0Estimates: number[] = [];
-    const bandEnergySums = new Float64Array(VOCAL_BAND_FREQS_HZ.length);
+    const allFreqs = [...VOCAL_BAND_FREQS_HZ, ...AIR_BAND_FREQS_HZ];
+    const bandEnergySums = new Float64Array(allFreqs.length);
+    const bandPowerLinearSums = new Float64Array(allFreqs.length);
     let voicedSpectralFrames = 0;
+    let speechBandFrames = 0;
     let silentFrames = 0;
     let totalFrames = 0;
     let lowBandEnergy = 0;
     let highBandEnergy = 0;
 
     const minLag = Math.floor(sampleRate / 350); // ~350 Hz max vocal F0
-    const maxLag = Math.floor(sampleRate / 72);  // ~72 Hz min vocal F0
+    const maxLag = Math.floor(sampleRate / 72); // ~72 Hz min vocal F0
 
-    // Precompute Goertzel coefficients for the 12 vocal formant/harmonic bands
-    const goertzelCoeffs = VOCAL_BAND_FREQS_HZ.map((freq) => {
+    // Exact full-rate Goertzel coefficients (up to 9.4 kHz air with zero aliasing)
+    const goertzelCoeffs = allFreqs.map((freq) => {
       const k = Math.round((frameSize * freq) / sampleRate);
       const omega = (2 * Math.PI * k) / frameSize;
       return 2 * Math.cos(omega);
@@ -132,6 +150,9 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
       const frameRms = Math.sqrt(frameSumSq / frameSize);
       const frameDb = frameRms > 1e-6 ? 20 * Math.log10(frameRms) : -96.0;
       frameDbValues.push(frameDb);
+      if (frameDb > -74.0) {
+        nonZeroFrameDbValues.push(frameDb);
+      }
 
       if (frameDb < -45.0) {
         silentFrames++;
@@ -141,8 +162,31 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
       lowBandEnergy += frameSumSq;
       highBandEnergy += diffSumSq + 1e-9;
 
-      // Normalized autocorrelation for voiced F0 detection & Goertzel spectral envelope
-      if (f0Estimates.length < 400 && totalFrames % 2 === 0 && frameDb > rmsDb - 12) {
+      // Full-speech spectral envelope (vowels + fricatives/consonants up to 9.4 kHz air)
+      const isSpeechSpectralFrame = frameDb > rmsDb - 18 && speechBandFrames < 450 && totalFrames % 2 === 0;
+      const runVoicedAc = f0Estimates.length < 400 && totalFrames % 2 === 0 && frameDb > rmsDb - 13;
+
+      let frameBandPowers: Float64Array | null = null;
+      if (isSpeechSpectralFrame) {
+        speechBandFrames++;
+        frameBandPowers = new Float64Array(allFreqs.length);
+        for (let b = 0; b < goertzelCoeffs.length; b++) {
+          const coeff = goertzelCoeffs[b];
+          let s1 = 0;
+          let s2 = 0;
+          for (let i = 0; i < frameSize; i++) {
+            const s0 = samples[start + i] + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+          }
+          const power = Math.max(1e-10, (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (frameSize * frameSize));
+          frameBandPowers[b] = power;
+          bandPowerLinearSums[b] += power;
+        }
+      }
+
+      // Normalized autocorrelation for voiced F0 detection & 16-D voiced spectral embedding
+      if (runVoicedAc) {
         let bestLag = 0;
         let maxCorr = 0;
 
@@ -151,7 +195,7 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
           let norm1 = 0;
           let norm2 = 0;
           const limit = frameSize - lag;
-          for (let i = 0; i < limit; i += 2) {
+          for (let i = 0; i < limit; i += 3) {
             const a = samples[start + i];
             const b = samples[start + i + lag];
             corr += a * b;
@@ -166,26 +210,27 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
           }
         }
 
-        // Voiced frame threshold
         if (maxCorr > 0.62 && bestLag > 0) {
           const f0 = sampleRate / bestLag;
           if (f0 >= 75 && f0 <= 340) {
             f0Estimates.push(f0);
           }
 
-          // Accumulate Goertzel sub-band energies on voiced frames
           voicedSpectralFrames++;
-          for (let b = 0; b < goertzelCoeffs.length; b++) {
-            const coeff = goertzelCoeffs[b];
-            let s1 = 0;
-            let s2 = 0;
-            for (let i = 0; i < frameSize; i += 2) {
-              const s0 = samples[start + i] + coeff * s1 - s2;
-              s2 = s1;
-              s1 = s0;
+          for (let b = 0; b < VOCAL_BAND_FREQS_HZ.length; b++) {
+            let power = frameBandPowers ? frameBandPowers[b] : 0;
+            if (!frameBandPowers) {
+              const coeff = goertzelCoeffs[b];
+              let s1 = 0;
+              let s2 = 0;
+              for (let i = 0; i < frameSize; i++) {
+                const s0 = samples[start + i] + coeff * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+              }
+              power = Math.max(1e-10, (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (frameSize * frameSize));
             }
-            const power = Math.max(1e-9, s1 * s1 + s2 * s2 - coeff * s1 * s2);
-            bandEnergySums[b] += Math.log10(power + 1e-6) + 6.0;
+            bandEnergySums[b] += Math.log10(power * frameSize * frameSize + 1e-6) + 6.0;
           }
         }
       }
@@ -194,6 +239,12 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
     frameDbValues.sort((a, b) => a - b);
     const p15Index = Math.floor(frameDbValues.length * 0.15);
     const noiseFloorDb = frameDbValues.length > 0 ? frameDbValues[p15Index] : -72.0;
+
+    nonZeroFrameDbValues.sort((a, b) => a - b);
+    const activeNoiseFloorDb =
+      nonZeroFrameDbValues.length > 8
+        ? nonZeroFrameDbValues[Math.floor(nonZeroFrameDbValues.length * 0.12)]
+        : noiseFloorDb;
 
     f0Estimates.sort((a, b) => a - b);
     let medianF0 = 155;
@@ -212,7 +263,7 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
     }
 
     const spectralWarmthRatio = Number(
-      Math.min(4.5, Math.max(0.5, lowBandEnergy / (highBandEnergy * 2.5 + 1e-6))).toFixed(2)
+      Math.min(4.5, Math.max(0.5, lowBandEnergy / (highBandEnergy * 3.5 + 1e-6))).toFixed(2)
     );
 
     const activeRatio = totalFrames > 0 ? Number(((totalFrames - silentFrames) / totalFrames).toFixed(2)) : 0;
@@ -231,6 +282,24 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
     const l2Norm = Math.sqrt(rawVec.reduce((acc, v) => acc + v * v, 0)) || 1.0;
     const acousticEmbedding16D = rawVec.map((v) => Number((v / l2Norm).toFixed(4)));
 
+    const speechDenomFrames = Math.max(1, speechBandFrames);
+    const toBandDb = (indices: number[]) => {
+      const avgPower =
+        indices.reduce((sum, idx) => sum + bandPowerLinearSums[idx] / speechDenomFrames, 0) /
+        Math.max(1, indices.length);
+      return Number((10 * Math.log10(Math.max(1e-10, avgPower))).toFixed(1));
+    };
+
+    // Indices: 0:120, 1:180, 2:260, 3:380, 4:550, 5:800, 6:1150, 7:1650, 8:2350, 9:3300, 10:4600, 11:6400, 12:8000, 13:9400
+    const studioBandProfileDb: StudioBandProfileDb = {
+      lowWarmthDb: toBandDb([0, 1]),
+      mudDb: toBandDb([2, 3]),
+      nasalDb: toBandDb([5, 6]),
+      presenceDb: toBandDb([8, 9]),
+      sibilanceDb: toBandDb([10, 11]),
+      airDb: toBandDb([12, 13])
+    };
+
     return {
       fundamentalFreqHz: Math.round(medianF0),
       pitchRangeHz: [Math.round(p10F0), Math.round(p90F0)],
@@ -240,10 +309,12 @@ export async function analyzeVocalAcousticsFromAudioFile(filePath: string): Prom
       rmsDb: Number(rmsDb.toFixed(1)),
       peakDb: Number(peakDb.toFixed(1)),
       noiseFloorDb: Number(noiseFloorDb.toFixed(1)),
+      activeNoiseFloorDb: Number(activeNoiseFloorDb.toFixed(1)),
       silenceRatio: totalFrames > 0 ? Number((silentFrames / totalFrames).toFixed(2)) : 0,
       clippedSamplesCount,
       dcOffset,
-      acousticEmbedding16D
+      acousticEmbedding16D,
+      studioBandProfileDb
     };
   } finally {
     await fs.promises.unlink(tempRawPath).catch(() => {});
@@ -367,43 +438,159 @@ export interface ChunkPauseTiming {
   trailingPauseMs?: number;
 }
 
+function buildComfortSilenceBuffer(sampleCount: number): Buffer {
+  if (sampleCount <= 0) return Buffer.alloc(0);
+  const buf = Buffer.alloc(sampleCount * 2);
+  // Subtle -76 dBFS brown-weighted comfort floor (prevents abrupt digital-zero gating clicks)
+  let prev = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const white = (((i * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff) * 2 - 1;
+    prev = prev * 0.72 + white * 0.28;
+    const sample = Math.round(prev * 5.0);
+    buf.writeInt16LE(sample, i * 2);
+  }
+  return buf;
+}
+
+function measureActiveSpeechRmsDbFromPcm(buf: Buffer): number {
+  const totalSamples = Math.floor(buf.length / 2);
+  if (totalSamples < 480) return -18.0;
+  const frameLen = 480;
+  const activeSq: number[] = [];
+  for (let start = 0; start + frameLen <= totalSamples; start += frameLen) {
+    let sumSq = 0;
+    for (let i = 0; i < frameLen; i++) {
+      const s = buf.readInt16LE((start + i) * 2) / 32768.0;
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / frameLen);
+    if (rms > 0.0056) {
+      // > -45 dBFS active speech
+      activeSq.push(sumSq / frameLen);
+    }
+  }
+  if (activeSq.length === 0) return -18.0;
+  const meanSq = activeSq.reduce((a, b) => a + b, 0) / activeSq.length;
+  return 10 * Math.log10(Math.max(1e-8, meanSq));
+}
+
+function tryExtractCanonical24kMonoPcmSync(wavBuffer: Buffer): Buffer | null {
+  if (wavBuffer.length < 44) return null;
+  if (wavBuffer.toString('ascii', 0, 4) !== 'RIFF' || wavBuffer.toString('ascii', 8, 12) !== 'WAVE') {
+    return null;
+  }
+  let offset = 12;
+  let audioFormat = 0;
+  let channels = 0;
+  let sampleRate = 0;
+  let bitsPerSample = 0;
+  let dataStart = -1;
+  let dataSize = 0;
+
+  while (offset + 8 <= wavBuffer.length) {
+    const chunkId = wavBuffer.toString('ascii', offset, offset + 4);
+    const chunkSize = wavBuffer.readUInt32LE(offset + 4);
+    const bodyStart = offset + 8;
+    if (bodyStart + chunkSize > wavBuffer.length) break;
+
+    if (chunkId === 'fmt ' && chunkSize >= 16) {
+      audioFormat = wavBuffer.readUInt16LE(bodyStart);
+      channels = wavBuffer.readUInt16LE(bodyStart + 2);
+      sampleRate = wavBuffer.readUInt32LE(bodyStart + 4);
+      bitsPerSample = wavBuffer.readUInt16LE(bodyStart + 14);
+    } else if (chunkId === 'data') {
+      dataStart = bodyStart;
+      dataSize = chunkSize;
+      break;
+    }
+    offset = bodyStart + chunkSize + (chunkSize % 2);
+  }
+
+  if (
+    audioFormat === 1 &&
+    channels === 1 &&
+    sampleRate === 24000 &&
+    bitsPerSample === 16 &&
+    dataStart > 0 &&
+    dataSize > 0
+  ) {
+    const end = Math.min(wavBuffer.length, dataStart + dataSize);
+    return wavBuffer.subarray(dataStart, end);
+  }
+  return null;
+}
+
+function trimActivePcmChunk(buf: Buffer, sampleRate = 24000): { buf: Buffer; activeRmsDb: number } | null {
+  const totalSamples = Math.floor(buf.length / 2);
+  if (totalSamples === 0) return null;
+
+  let firstActive = 0;
+  let lastActive = totalSamples - 1;
+  const threshold = 65; // ~ -54 dBFS in int16
+  while (firstActive < totalSamples && Math.abs(buf.readInt16LE(firstActive * 2)) < threshold) {
+    firstActive++;
+  }
+  while (lastActive > firstActive && Math.abs(buf.readInt16LE(lastActive * 2)) < threshold) {
+    lastActive--;
+  }
+  const padSamples = Math.round(sampleRate * 0.065);
+  const startSample = Math.max(0, firstActive - padSamples);
+  const endSample = Math.min(totalSamples, lastActive + padSamples);
+  const activeLen = Math.max(1, endSample - startSample);
+
+  const trimmedBuf = Buffer.alloc(activeLen * 2);
+  buf.copy(trimmedBuf, 0, startSample * 2, endSample * 2);
+
+  return {
+    buf: trimmedBuf,
+    activeRmsDb: measureActiveSpeechRmsDbFromPcm(trimmedBuf)
+  };
+}
+
 /**
- * Concatenates multiple 24kHz mono WAV sentence chunks into a single continuous WAV file
- * with 6ms zero-crossing linear fade-in/fade-out, natural 180ms inter-sentence pause,
- * and exact millisecond support for explicit [pause] instructions at chunk boundaries.
+ * Concatenates multiple 24kHz mono WAV sentence chunks into a single continuous WAV file with:
+ * - Zero-spawn fast RIFF PCM extraction when chunks are already 24kHz mono PCM16 (parallel FFmpeg fallback otherwise)
+ * - Active-speech RMS leveling across chunks (bounded +/- 4.5 dB) for consistent loudness
+ * - Raised-cosine 14ms S-curve edge fades (zero click & zero boundary step)
+ * - Generous 65ms natural breath/consonant tail preservation
+ * - Ultra-quiet comfort room-tone gaps honoring exact [pause] millisecond timings
  */
 export async function concatenateWavChunksWithCrossfade(
   chunkWavPaths: string[],
   outputWavPath: string,
-  interSentencePauseMs = 180,
+  interSentencePauseMs = 190,
   perChunkPauses?: ChunkPauseTiming[]
 ): Promise<void> {
   if (chunkWavPaths.length === 0) {
     throw new Error('No audio chunks provided for concatenation.');
   }
 
-  const hasExplicitPauses = Boolean(
-    perChunkPauses &&
-      perChunkPauses.some((p) => (p.leadingPauseMs || 0) > 0 || (p.trailingPauseMs || 0) > 0)
-  );
+  const sampleRate = 24000;
+  const fadeSamples = Math.round((sampleRate * 14) / 1000); // 14ms cosine fade (336 samples)
+  const defaultPauseSamples = Math.round((sampleRate * interSentencePauseMs) / 1000);
 
-  if (chunkWavPaths.length === 1 && !hasExplicitPauses) {
-    await fs.promises.copyFile(chunkWavPaths[0], outputWavPath);
-    return;
+  interface DecodedChunk {
+    buf: Buffer;
+    activeRmsDb: number;
   }
 
-  const sampleRate = 24000;
-  const fadeSamples = Math.round((sampleRate * 6) / 1000); // 6ms anti-click fade (144 samples)
-  const defaultPauseSamples = Math.round((sampleRate * interSentencePauseMs) / 1000);
-  const pcmBuffers: Buffer[] = [];
+  const decodeSingleChunk = async (chunkPath: string): Promise<DecodedChunk | null> => {
+    try {
+      const wavBuf = await fs.promises.readFile(chunkPath);
+      const directPcm = tryExtractCanonical24kMonoPcmSync(wavBuf);
+      if (directPcm) {
+        return trimActivePcmChunk(directPcm, sampleRate);
+      }
+    } catch {
+      // Fall back cleanly to FFmpeg decode below
+    }
 
-  for (let idx = 0; idx < chunkWavPaths.length; idx++) {
-    const rawPath = `${chunkWavPaths[idx]}.24k.pcm`;
+    const rawPath = `${chunkPath}.24k.pcm`;
     try {
       await execFileAsync('ffmpeg', [
         '-y',
         '-i',
-        chunkWavPaths[idx],
+        chunkPath,
         '-vn',
         '-ac',
         '1',
@@ -414,72 +601,99 @@ export async function concatenateWavChunksWithCrossfade(
         rawPath
       ]);
       const buf = await fs.promises.readFile(rawPath);
-      const totalSamples = Math.floor(buf.length / 2);
-      if (totalSamples === 0) continue;
-
-      // Trim leading/trailing digital dead-air (< -52 dBFS) while keeping natural 35ms breath pad
-      let firstActive = 0;
-      let lastActive = totalSamples - 1;
-      const threshold = 82; // ~ -52 dBFS in int16
-      while (firstActive < totalSamples && Math.abs(buf.readInt16LE(firstActive * 2)) < threshold) {
-        firstActive++;
-      }
-      while (lastActive > firstActive && Math.abs(buf.readInt16LE(lastActive * 2)) < threshold) {
-        lastActive--;
-      }
-      const padSamples = Math.round(sampleRate * 0.035);
-      const startSample = Math.max(0, firstActive - padSamples);
-      const endSample = Math.min(totalSamples, lastActive + padSamples);
-      const activeLen = Math.max(1, endSample - startSample);
-
-      const trimmedBuf = Buffer.alloc(activeLen * 2);
-      buf.copy(trimmedBuf, 0, startSample * 2, endSample * 2);
-
-      // Apply 6ms linear fade-in and fade-out to prevent boundary clicks
-      const effFade = Math.min(fadeSamples, Math.floor(activeLen / 4));
-      for (let i = 0; i < effFade; i++) {
-        const gainIn = i / effFade;
-        const sIn = Math.round(trimmedBuf.readInt16LE(i * 2) * gainIn);
-        trimmedBuf.writeInt16LE(Math.max(-32768, Math.min(32767, sIn)), i * 2);
-
-        const outIdx = activeLen - 1 - i;
-        const gainOut = i / effFade;
-        const sOut = Math.round(trimmedBuf.readInt16LE(outIdx * 2) * gainOut);
-        trimmedBuf.writeInt16LE(Math.max(-32768, Math.min(32767, sOut)), outIdx * 2);
-      }
-
-      // Leading explicit [pause] on the very first chunk
-      if (idx === 0) {
-        const leadMs = perChunkPauses?.[0]?.leadingPauseMs || 0;
-        if (leadMs > 0) {
-          const leadSamples = Math.round((sampleRate * leadMs) / 1000);
-          pcmBuffers.push(Buffer.alloc(leadSamples * 2, 0));
-        }
-      }
-
-      pcmBuffers.push(trimmedBuf);
-
-      if (idx < chunkWavPaths.length - 1) {
-        const currTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
-        const nextLeadMs = perChunkPauses?.[idx + 1]?.leadingPauseMs || 0;
-        const explicitBoundaryMs = currTrailMs + nextLeadMs;
-        const effectivePauseSamples =
-          explicitBoundaryMs > 0
-            ? Math.round((sampleRate * explicitBoundaryMs) / 1000)
-            : defaultPauseSamples;
-        if (effectivePauseSamples > 0) {
-          pcmBuffers.push(Buffer.alloc(effectivePauseSamples * 2, 0));
-        }
-      } else {
-        // Trailing explicit [pause] on the final chunk
-        const finalTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
-        if (finalTrailMs > 0) {
-          const trailSamples = Math.round((sampleRate * finalTrailMs) / 1000);
-          pcmBuffers.push(Buffer.alloc(trailSamples * 2, 0));
-        }
-      }
+      return trimActivePcmChunk(buf, sampleRate);
     } finally {
       await fs.promises.unlink(rawPath).catch(() => {});
+    }
+  };
+
+  // Decode in bounded parallel batches of 6 chunks
+  const decodedMaybe: (DecodedChunk | null)[] = new Array(chunkWavPaths.length).fill(null);
+  let nextIdx = 0;
+  const workerCount = Math.min(6, chunkWavPaths.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIdx < chunkWavPaths.length) {
+        const myIdx = nextIdx++;
+        decodedMaybe[myIdx] = await decodeSingleChunk(chunkWavPaths[myIdx]);
+      }
+    })
+  );
+
+  const decodedChunks: DecodedChunk[] = decodedMaybe.filter(
+    (c): c is DecodedChunk => c !== null
+  );
+
+  if (decodedChunks.length === 0) {
+    throw new Error('No decodable audio chunks available for concatenation.');
+  }
+
+  // Match active chunk RMS toward median loudness (bounded +/- 4.5 dB) when multiple chunks exist
+  let targetChunkRmsDb = decodedChunks[0].activeRmsDb;
+  if (decodedChunks.length > 1) {
+    const sorted = [...decodedChunks.map((c) => c.activeRmsDb)].sort((a, b) => a - b);
+    targetChunkRmsDb = sorted[Math.floor(sorted.length / 2)];
+  }
+
+  const pcmBuffers: Buffer[] = [];
+  for (let idx = 0; idx < decodedChunks.length; idx++) {
+    const chunkBuf = decodedChunks[idx].buf;
+    const totalSamples = Math.floor(chunkBuf.length / 2);
+
+    if (decodedChunks.length > 1) {
+      const gainDb = Math.max(-4.5, Math.min(4.5, targetChunkRmsDb - decodedChunks[idx].activeRmsDb));
+      if (Math.abs(gainDb) >= 0.35) {
+        const linearGain = Math.pow(10, gainDb / 20);
+        for (let i = 0; i < totalSamples; i++) {
+          let scaled = (chunkBuf.readInt16LE(i * 2) / 32768.0) * linearGain;
+          // Soft-knee ceiling prevents inter-chunk gain matching from ever hard-clipping
+          if (Math.abs(scaled) > 0.88) {
+            scaled = Math.sign(scaled) * (0.88 + 0.1 * Math.tanh((Math.abs(scaled) - 0.88) / 0.1));
+          }
+          chunkBuf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(scaled * 32767))), i * 2);
+        }
+      }
+    }
+
+    // Apply 14ms raised-cosine S-curve fade-in and fade-out to eliminate boundary steps cleanly
+    const effFade = Math.min(fadeSamples, Math.floor(totalSamples / 4));
+    for (let i = 0; i < effFade; i++) {
+      const t = (i + 0.5) / effFade;
+      const gain = 0.5 * (1 - Math.cos(Math.PI * t));
+
+      const sIn = Math.round(chunkBuf.readInt16LE(i * 2) * gain);
+      chunkBuf.writeInt16LE(Math.max(-32768, Math.min(32767, sIn)), i * 2);
+
+      const outIdx = totalSamples - 1 - i;
+      const sOut = Math.round(chunkBuf.readInt16LE(outIdx * 2) * gain);
+      chunkBuf.writeInt16LE(Math.max(-32768, Math.min(32767, sOut)), outIdx * 2);
+    }
+
+    if (idx === 0) {
+      const leadMs = perChunkPauses?.[0]?.leadingPauseMs || 0;
+      if (leadMs > 0) {
+        pcmBuffers.push(buildComfortSilenceBuffer(Math.round((sampleRate * leadMs) / 1000)));
+      }
+    }
+
+    pcmBuffers.push(chunkBuf);
+
+    if (idx < decodedChunks.length - 1) {
+      const currTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
+      const nextLeadMs = perChunkPauses?.[idx + 1]?.leadingPauseMs || 0;
+      const explicitBoundaryMs = currTrailMs + nextLeadMs;
+      const effectivePauseSamples =
+        explicitBoundaryMs > 0
+          ? Math.round((sampleRate * explicitBoundaryMs) / 1000)
+          : defaultPauseSamples;
+      if (effectivePauseSamples > 0) {
+        pcmBuffers.push(buildComfortSilenceBuffer(effectivePauseSamples));
+      }
+    } else {
+      const finalTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
+      if (finalTrailMs > 0) {
+        pcmBuffers.push(buildComfortSilenceBuffer(Math.round((sampleRate * finalTrailMs) / 1000)));
+      }
     }
   }
 
@@ -505,17 +719,66 @@ export async function concatenateWavChunksWithCrossfade(
   }
 }
 
+interface EbuR128Measurement {
+  input_i: string;
+  input_tp: string;
+  input_lra: string;
+  input_thresh: string;
+  target_offset: string;
+}
+
+async function measureEbuR128Loudness(
+  filePath: string,
+  targetI: number,
+  targetTp: number,
+  targetLra: number
+): Promise<EbuR128Measurement | null> {
+  try {
+    const { stderr } = await execFileAsync(
+      'ffmpeg',
+      [
+        '-hide_banner',
+        '-i',
+        filePath,
+        '-af',
+        `loudnorm=I=${targetI}:TP=${targetTp}:LRA=${targetLra}:print_format=json`,
+        '-f',
+        'null',
+        '-'
+      ],
+      { timeout: 25_000 }
+    );
+    const jsonMatch = (stderr || '').match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (
+      typeof parsed?.input_i === 'string' &&
+      typeof parsed?.input_tp === 'string' &&
+      typeof parsed?.input_lra === 'string' &&
+      typeof parsed?.input_thresh === 'string' &&
+      typeof parsed?.target_offset === 'string'
+    ) {
+      return parsed as EbuR128Measurement;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Conservative, optional post-synthesis DSP audio finishing and WAV/MP3 export.
- * By default (when preservePitchContour=false and preserveSpectralTimbre=false), NO pitch-shifting,
- * EQ, or aggressive single-pass loudnorm is applied—preserving the neural synthesizer's exact
- * waveform, prosody, and formant structure without distortion.
- * When optional DSP is explicitly enabled, pitch adjustment is strictly clamped to +/- 2.0 semitones
- * and EQ to +/- 2.0 dB with a transparent peak limiter to prevent clipping.
+ * Adaptive Broadcast Voice Mastering Engine & WAV/MP3 Exporter.
+ * - 'standard': Transparent DC rumble removal + 2-pass linear EBU R128 loudness normalization (-17 LUFS).
+ * - 'studio' (Default): 48kHz SoXR oversampled processing with F0-adaptive highpass, measured-floor spectral
+ *   noise reduction, gentle room-tail de-reverberation, adaptive voice EQ (mud cut, nasal tame, clarity,
+ *   silky air), de-essing, parallel vocal compression, and 2-pass linear -15.5 LUFS mastering.
+ * - 'studio_plus': Enhanced creator/podcast polish (-14.5 LUFS, 256kbps MP3) while strictly preserving
+ *   the cloned speaker's fundamental pitch, gender characteristics, accent, and vocal identity.
  */
 export async function applyReferenceAcousticIdentityAndExport(options: {
   rawSynthesizedWavPath: string;
   referenceAnalysis: AudioSignalAnalysis;
+  audioQuality?: VoiceAudioQualityMode;
   preservePitchContour: boolean;
   preserveSpectralTimbre: boolean;
   outputWavPath: string;
@@ -524,130 +787,345 @@ export async function applyReferenceAcousticIdentityAndExport(options: {
   synthesizedBasePitchHz: number;
   pitchShiftSemitonesApplied: number;
   outputDurationSec: number;
+  outputSampleRateHz: number;
   rmsNormalizedDb: number;
   finalAcoustics: RawPcmPitchStats;
   estimatedOutputSnrDb: number;
   dspApplied: boolean;
+  audioEnhancementReport: VoiceAudioEnhancementReport;
 }> {
   const {
     rawSynthesizedWavPath,
-    referenceAnalysis,
-    preservePitchContour,
-    preserveSpectralTimbre,
+    audioQuality = 'studio',
     outputWavPath,
     outputMp3Path
   } = options;
 
-  const synthAcoustics = await analyzeVocalAcousticsFromAudioFile(rawSynthesizedWavPath);
-  const refF0 = referenceAnalysis.fundamentalFreqHz || 155;
-  const synthF0 = synthAcoustics.fundamentalFreqHz || 165;
+  const qualityMode: VoiceAudioQualityMode =
+    audioQuality === 'standard' || audioQuality === 'studio_plus' ? audioQuality : 'studio';
 
-  // Conservative pitch ratio clamp: max +/- 2.0 semitones ONLY when explicitly requested,
-  // avoiding formant shifting ("chipmunk/hollow" distortion) and WSOLA time-stretch artifacts.
-  const rawRatio = refF0 / synthF0;
-  const minRatio = Math.pow(2, -2.0 / 12); // ~0.8909
-  const maxRatio = Math.pow(2, 2.0 / 12);  // ~1.1225
-  const clampedRatio = preservePitchContour
-    ? Math.min(maxRatio, Math.max(minRatio, rawRatio))
-    : 1.0;
+  const isStudioLike = qualityMode === 'studio' || qualityMode === 'studio_plus';
+  const isPlus = qualityMode === 'studio_plus';
+  const targetSampleRateHz = isStudioLike ? 48000 : 24000;
+  const targetLufs = isPlus ? -14.5 : isStudioLike ? -15.5 : -17.0;
+  const targetTp = isPlus ? -1.0 : -1.2;
+  const targetLra = isPlus ? 5.2 : isStudioLike ? 6.0 : 7.0;
 
-  const rawSemitones = 12 * Math.log2(clampedRatio);
-  const applyPitchShift = preservePitchContour && Math.abs(rawSemitones) >= 0.35;
-  const semitonesApplied = applyPitchShift ? Number(rawSemitones.toFixed(2)) : 0;
-  const tempoCompensation = applyPitchShift ? Number((1 / clampedRatio).toFixed(4)) : 1.0;
-
-  const filterChain: string[] = [];
-
-  // 1. Remove sub-audible DC offset / rumble cleanly
-  filterChain.push('highpass=f=55');
-
-  // 2. Optional conservative pitch shift (only if explicitly enabled and >= 0.35 st)
-  if (applyPitchShift) {
-    const shiftedRate = Math.round(24000 * clampedRatio);
-    filterChain.push(`asetrate=${shiftedRate}`);
-    filterChain.push('aresample=24000');
-    filterChain.push(`atempo=${tempoCompensation}`);
-  } else {
-    filterChain.push('aresample=24000');
-  }
-
-  // 3. Optional conservative spectral timbre finishing (+/- 2.0 dB max)
-  if (preserveSpectralTimbre) {
-    const warmthDelta = referenceAnalysis.spectralWarmthRatio - synthAcoustics.spectralWarmthRatio;
-    const lowShelfGainDb = Number(Math.min(2.0, Math.max(-2.0, warmthDelta * 1.2)).toFixed(1));
-    const presenceGainDb = Number(Math.min(1.8, Math.max(-1.8, -warmthDelta * 0.9)).toFixed(1));
-    if (Math.abs(lowShelfGainDb) >= 0.3) {
-      filterChain.push(`equalizer=f=190:t=q:w=1.2:g=${lowShelfGainDb}`);
-    }
-    if (Math.abs(presenceGainDb) >= 0.3) {
-      filterChain.push(`equalizer=f=2850:t=q:w=1.5:g=${presenceGainDb}`);
-    }
-  }
-
-  // 4. Transparent static gain normalization toward -17 dBFS RMS with true-peak ceiling at -1.0 dBFS
-  // (Avoids single-pass loudnorm dynamic pumping while guaranteeing zero digital clipping)
-  const targetRmsDb = -17.0;
-  const gainDeltaDb = Number(
-    Math.min(8.0, Math.max(-8.0, targetRmsDb - synthAcoustics.rmsDb)).toFixed(1)
+  const [synthAcoustics, inputEbu] = await Promise.all([
+    analyzeVocalAcousticsFromAudioFile(rawSynthesizedWavPath),
+    measureEbuR128Loudness(rawSynthesizedWavPath, targetLufs, targetTp, targetLra)
+  ]);
+  const synthF0 = synthAcoustics.fundamentalFreqHz || 155;
+  const activeNoiseFloorDb = synthAcoustics.activeNoiseFloorDb ?? synthAcoustics.noiseFloorDb;
+  const inputEstimatedSnrDb = Number(
+    Math.max(0, synthAcoustics.rmsDb - activeNoiseFloorDb).toFixed(1)
   );
-  if (Math.abs(gainDeltaDb) >= 0.5) {
-    filterChain.push(`volume=${gainDeltaDb}dB`);
+  const inputIntegratedLufs = Number(parseFloat(inputEbu?.input_i || String(synthAcoustics.rmsDb)).toFixed(2));
+
+  const adaptiveDecisions: string[] = [];
+  let noiseReductionDbApplied = 0;
+  let deEsserApplied = false;
+  let eqAppliedSummary = 'Sub-sonic DC filter only (60 Hz HPF)';
+  let compressionSummary = 'Transparent true-peak lookahead limiter (-1.2 dBTP)';
+
+  const intermediateWavPath = `${outputWavPath}.stage1.wav`;
+
+  try {
+    if (!isStudioLike) {
+      // Standard mode: Clean rumble removal + direct pass into 2-pass linear loudnorm
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          rawSynthesizedWavPath,
+          '-af',
+          'highpass=f=60,aresample=24000:resampler=soxr',
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          intermediateWavPath
+        ],
+        { timeout: 25_000 }
+      );
+      adaptiveDecisions.push('Standard transparent chain (raw neural vocal tone preserved)');
+    } else {
+      const bands = synthAcoustics.studioBandProfileDb;
+      const filterChain: string[] = [];
+
+      // 1. 48kHz SoXR linear-phase oversampling prevents Nyquist EQ cramping in 4-10 kHz range
+      filterChain.push('aresample=48000:resampler=soxr:precision=28');
+
+      // 2. Speaker-F0-adaptive sub-sonic rumble removal (protects deep male fundamental)
+      const hpHz = Math.max(60, Math.min(92, Math.round(synthF0 * 0.54)));
+      filterChain.push(`highpass=f=${hpHz}:p=2`);
+      adaptiveDecisions.push(`F0-safe sub-sonic HPF at ${hpHz} Hz (tracks ${synthF0} Hz voice)`);
+
+      // 3. Adaptive spectral denoising strictly scaled to measured active speech floor (never aggressive/watery)
+      if (activeNoiseFloorDb <= -58 && inputEstimatedSnrDb >= 30) {
+        noiseReductionDbApplied = isPlus ? 4.5 : 3.5;
+        filterChain.push(`afftdn=nr=${noiseReductionDbApplied}:nf=-56:tn=1`);
+        adaptiveDecisions.push(`Light hiss polish (${noiseReductionDbApplied} dB) on clean input`);
+      } else if (activeNoiseFloorDb <= -46) {
+        noiseReductionDbApplied = isPlus ? 8.5 : 7.0;
+        const nfBound = Math.max(-52, Math.min(-38, Math.round(activeNoiseFloorDb + 3.5)));
+        filterChain.push(`afftdn=nr=${noiseReductionDbApplied}:nf=${nfBound}:tn=1`);
+        adaptiveDecisions.push(`Moderate denoising (${noiseReductionDbApplied} dB @ ${nfBound} dB floor)`);
+      } else {
+        noiseReductionDbApplied = isPlus ? 12.0 : 10.5;
+        const nfBound = Math.max(-44, Math.min(-32, Math.round(activeNoiseFloorDb + 5.0)));
+        filterChain.push(`afftdn=nr=${noiseReductionDbApplied}:nf=${nfBound}:tn=1`);
+        adaptiveDecisions.push(`Mobile-noise reduction (${noiseReductionDbApplied} dB @ ${nfBound} dB floor)`);
+      }
+
+      // 4. Gentle downward expansion (de-reverb / room-tail taming without clipping breaths or tails)
+      if (activeNoiseFloorDb > -56 || isPlus) {
+        const threshDb = Math.max(-48, Math.min(-31, activeNoiseFloorDb + 7.5));
+        const threshLin = Number(Math.pow(10, threshDb / 20).toFixed(5));
+        const ratio = isPlus ? 1.8 : 1.65;
+        const range = isPlus ? 0.22 : 0.28;
+        filterChain.push(
+          `agate=threshold=${threshLin}:ratio=${ratio}:range=${range}:attack=15:release=230:knee=4.5:detection=rms`
+        );
+        adaptiveDecisions.push(`Soft room-tail de-reverb (ratio ${ratio}:1, release 230ms)`);
+      }
+
+      // 5. Speaker-adaptive parametric studio voice EQ (calibrated against full-speech vowel+consonant spectrum)
+      const mudExcessDb = bands.mudDb - bands.lowWarmthDb;
+      const nasalExcessDb = bands.nasalDb - 0.5 * (bands.lowWarmthDb + bands.presenceDb);
+      const presenceDeficitDb = bands.lowWarmthDb - bands.presenceDb;
+      const sibilanceExcessDb = bands.sibilanceDb - bands.presenceDb;
+      const airDeficitDb = bands.lowWarmthDb - bands.airDb;
+
+      // 5a. Chest warmth (skip if voice is already warm/heavy)
+      const warmthCenterHz = Math.max(140, Math.min(215, Math.round(synthF0 * 1.25)));
+      let warmthBoostDb = 0;
+      if (synthAcoustics.spectralWarmthRatio < 1.35 || mudExcessDb > 1.5) {
+        warmthBoostDb = isPlus ? 1.7 : 1.3;
+      } else if (synthAcoustics.spectralWarmthRatio < 2.3) {
+        warmthBoostDb = isPlus ? 0.9 : 0.6;
+      }
+      if (warmthBoostDb >= 0.4) {
+        filterChain.push(`equalizer=f=${warmthCenterHz}:t=q:w=0.85:g=${warmthBoostDb}`);
+      }
+
+      // 5b. Boxy phone/room mud reduction around 330 Hz
+      const mudCutDb =
+        mudExcessDb > -2.5
+          ? -Number(
+              Math.min(isPlus ? 2.9 : 2.5, Math.max(0.9, (mudExcessDb + 3.0) * 0.62)).toFixed(1)
+            )
+          : -0.7;
+      filterChain.push(`equalizer=f=330:t=q:w=1.1:g=${mudCutDb}`);
+
+      // 5c. Nasal midrange phone-mic taming around 1120 Hz
+      let nasalCutDb = 0;
+      if (nasalExcessDb > -1.0) {
+        nasalCutDb = -Number(Math.min(1.6, Math.max(0.7, (nasalExcessDb + 1.5) * 0.35)).toFixed(1));
+        filterChain.push(`equalizer=f=1120:t=q:w=1.4:g=${nasalCutDb}`);
+      }
+
+      // 5d. Vocal articulation & intimacy around 2950 Hz (scales smoothly from dark to already crisp voices)
+      const presenceGainDb = Number(
+        Math.min(
+          isPlus ? 3.2 : 2.7,
+          Math.max(0.3, (presenceDeficitDb - (isPlus ? 7.5 : 8.5)) * (isPlus ? 0.48 : 0.42))
+        ).toFixed(1)
+      );
+      filterChain.push(`equalizer=f=2950:t=q:w=0.9:g=${presenceGainDb}`);
+
+      // 5e. Tame vocoder grain spike around 4800 Hz if 4.8kHz exceeds vocal clarity band
+      let grainCutDb = 0;
+      if (sibilanceExcessDb > -2.5) {
+        grainCutDb = -Number(Math.min(1.6, Math.max(0.6, (sibilanceExcessDb + 3.0) * 0.32)).toFixed(1));
+        filterChain.push(`equalizer=f=4800:t=q:w=1.6:g=${grainCutDb}`);
+      }
+
+      // 5f. Silky high-frequency air shelf at 8200 Hz (minimal touch on already bright voices) + 11.6 kHz guard
+      const airGainDb = Number(
+        Math.min(
+          isPlus ? 3.8 : 3.2,
+          Math.max(0.0, (airDeficitDb - (isPlus ? 10.5 : 11.5)) * (isPlus ? 0.35 : 0.30))
+        ).toFixed(1)
+      );
+      if (airGainDb >= 0.3) {
+        filterChain.push(`highshelf=f=8200:t=q:w=0.85:g=${airGainDb}`);
+      }
+      filterChain.push('lowpass=f=11600');
+
+      eqAppliedSummary = `Warmth(${warmthCenterHz}Hz:${warmthBoostDb > 0 ? `+${warmthBoostDb}` : '0'}dB) · DeMud(330Hz:${mudCutDb}dB)${
+        nasalCutDb !== 0 ? ` · DeNasal(1.1kHz:${nasalCutDb}dB)` : ''
+      } · Clarity(2.95kHz:+${presenceGainDb}dB)${airGainDb >= 0.3 ? ` · Air(8.2kHz:+${airGainDb}dB)` : ''}`;
+      adaptiveDecisions.push(`Adaptive EQ: ${eqAppliedSummary}`);
+
+      // 6. Adaptive De-Esser (smooths harsh sibilance without dulling speech)
+      const deessIntensity = Number(
+        Math.min(0.34, Math.max(0.16, 0.18 + Math.max(0, sibilanceExcessDb + 3.0) * 0.032)).toFixed(2)
+      );
+      filterChain.push(`deesser=i=${deessIntensity}:m=0.42:f=0.52:s=o`);
+      deEsserApplied = true;
+      adaptiveDecisions.push(`Adaptive De-Esser (intensity=${deessIntensity})`);
+
+      // 7. Parallel optical-style vocal compression (smooth intimacy + preserved breath transients)
+      const compRatio = isPlus ? 2.55 : 2.2;
+      const compThresh = isPlus ? -21 : -20;
+      const compMakeup = isPlus ? 2.4 : 2.0;
+      const compMix = isPlus ? 0.80 : 0.72;
+      filterChain.push(
+        `acompressor=threshold=${compThresh}dB:ratio=${compRatio}:attack=14:release=160:knee=6:makeup=${compMakeup}:mix=${compMix}:detection=rms`
+      );
+      compressionSummary = `Parallel broadcast compressor (${compRatio}:1, ${Math.round(compMix * 100)}% wet) + 2-pass ${targetLufs} LUFS linear mastering`;
+      adaptiveDecisions.push(`Parallel vocal compression (${compRatio}:1 @ ${Math.round(compMix * 100)}% mix)`);
+
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          rawSynthesizedWavPath,
+          '-af',
+          filterChain.join(','),
+          '-ar',
+          String(targetSampleRateHz),
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          intermediateWavPath
+        ],
+        { timeout: 35_000 }
+      );
+    }
+
+    // Pass 2: True-Linear 2-Pass EBU R128 Broadcast Loudness Normalization + Lookahead Peak Limiter
+    const stage1Ebu = await measureEbuR128Loudness(
+      intermediateWavPath,
+      targetLufs,
+      targetTp,
+      targetLra
+    );
+
+    const masteringFilters: string[] = [];
+    if (stage1Ebu) {
+      masteringFilters.push(
+        `loudnorm=I=${targetLufs}:TP=${targetTp}:LRA=${targetLra}:measured_I=${stage1Ebu.input_i}:measured_LRA=${stage1Ebu.input_lra}:measured_TP=${stage1Ebu.input_tp}:measured_thresh=${stage1Ebu.input_thresh}:offset=${stage1Ebu.target_offset}:linear=true:print_format=json`
+      );
+      adaptiveDecisions.push(`2-pass linear EBU R128 normalization to ${targetLufs} LUFS`);
+    } else {
+      const targetRmsDb = isPlus ? -15.5 : isStudioLike ? -16.5 : -17.0;
+      const gainDb = Number(
+        Math.min(8.0, Math.max(-8.0, targetRmsDb - synthAcoustics.rmsDb)).toFixed(1)
+      );
+      if (Math.abs(gainDb) >= 0.4) {
+        masteringFilters.push(`volume=${gainDb}dB`);
+      }
+    }
+    masteringFilters.push('alimiter=limit=0.891:attack=4:release=65:level=disabled');
+
+    const { stderr: stage2Stderr } = await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        intermediateWavPath,
+        '-af',
+        masteringFilters.join(','),
+        '-ar',
+        String(targetSampleRateHz),
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        outputWavPath
+      ],
+      { timeout: 30_000 }
+    );
+
+    let stage2OutputEbu: { output_i?: string; output_lra?: string; output_tp?: string } | null = null;
+    try {
+      const jsonMatch = (stage2Stderr || '').match(/\{[\s\S]*?"output_i"[\s\S]*?\}/);
+      if (jsonMatch) {
+        stage2OutputEbu = JSON.parse(jsonMatch[0]);
+      }
+    } catch {
+      stage2OutputEbu = null;
+    }
+
+    const mp3Bitrate = isPlus ? '256k' : '192k';
+    const [, finalStats, ffprobeOut] = await Promise.all([
+      execFileAsync(
+        'ffmpeg',
+        ['-y', '-i', outputWavPath, '-c:a', 'libmp3lame', '-b:a', mp3Bitrate, outputMp3Path],
+        { timeout: 25_000 }
+      ),
+      analyzeVocalAcousticsFromAudioFile(outputWavPath),
+      execFileAsync('ffprobe', [
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        outputWavPath
+      ])
+    ]);
+
+    const outputDurationSec = Number(parseFloat(ffprobeOut.stdout.trim() || '0').toFixed(2));
+    const outputActiveNoiseDb = finalStats.activeNoiseFloorDb ?? finalStats.noiseFloorDb;
+    const estimatedOutputSnrDb = Number(
+      Math.max(0, finalStats.rmsDb - outputActiveNoiseDb).toFixed(1)
+    );
+
+    const qualityLabels: Record<VoiceAudioQualityMode, string> = {
+      standard: 'Standard (Raw Neural Output)',
+      studio: 'Studio (Broadcast Voice Mastering)',
+      studio_plus: 'Studio Plus (Creator & Podcast Polish)'
+    };
+
+    const outputIntegratedLufs = Number(
+      parseFloat(stage2OutputEbu?.output_i || String(finalStats.rmsDb)).toFixed(2)
+    );
+    const outputLoudnessRangeLu = Number(parseFloat(stage2OutputEbu?.output_lra || '3.0').toFixed(2));
+    const outputTruePeakDb = Number(
+      parseFloat(stage2OutputEbu?.output_tp || String(finalStats.peakDb)).toFixed(2)
+    );
+
+    return {
+      synthesizedBasePitchHz: synthF0,
+      pitchShiftSemitonesApplied: 0,
+      outputDurationSec,
+      outputSampleRateHz: targetSampleRateHz,
+      rmsNormalizedDb: finalStats.rmsDb,
+      finalAcoustics: finalStats,
+      estimatedOutputSnrDb,
+      dspApplied: isStudioLike,
+      audioEnhancementReport: {
+        qualityMode,
+        qualityLabel: qualityLabels[qualityMode],
+        adaptiveDecisions,
+        inputNoiseFloorDb: activeNoiseFloorDb,
+        outputNoiseFloorDb: outputActiveNoiseDb,
+        inputEstimatedSnrDb,
+        outputEstimatedSnrDb: estimatedOutputSnrDb,
+        inputIntegratedLufs,
+        outputIntegratedLufs,
+        outputLoudnessRangeLu,
+        outputTruePeakDb,
+        inputPitchHz: synthF0,
+        outputPitchHz: finalStats.fundamentalFreqHz,
+        outputSampleRateHz: targetSampleRateHz,
+        eqAppliedSummary,
+        deEsserApplied,
+        noiseReductionDbApplied,
+        compressionSummary
+      }
+    };
+  } finally {
+    await fs.promises.unlink(intermediateWavPath).catch(() => {});
   }
-  filterChain.push('alimiter=limit=0.891:attack=5:release=50:level=disabled');
-
-  const afString = filterChain.join(',');
-  const dspApplied = applyPitchShift || preserveSpectralTimbre;
-
-  // Export 24kHz 16-bit mono WAV
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-i',
-    rawSynthesizedWavPath,
-    '-af',
-    afString,
-    '-ar',
-    '24000',
-    '-ac',
-    '1',
-    '-c:a',
-    'pcm_s16le',
-    outputWavPath
-  ]);
-
-  // Export 192kbps MP3
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-i',
-    outputWavPath,
-    '-c:a',
-    'libmp3lame',
-    '-b:a',
-    '192k',
-    outputMp3Path
-  ]);
-
-  const finalStats = await analyzeVocalAcousticsFromAudioFile(outputWavPath);
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v',
-    'error',
-    '-show_entries',
-    'format=duration',
-    '-of',
-    'default=noprint_wrappers=1:nokey=1',
-    outputWavPath
-  ]);
-  const outputDurationSec = Number(parseFloat(stdout.trim() || '0').toFixed(2));
-  const estimatedOutputSnrDb = Number(Math.max(0, finalStats.rmsDb - finalStats.noiseFloorDb).toFixed(1));
-
-  return {
-    synthesizedBasePitchHz: synthF0,
-    pitchShiftSemitonesApplied: semitonesApplied,
-    outputDurationSec,
-    rmsNormalizedDb: finalStats.rmsDb,
-    finalAcoustics: finalStats,
-    estimatedOutputSnrDb,
-    dspApplied
-  };
 }
 
 export interface AudioSpeechInterval {

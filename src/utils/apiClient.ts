@@ -44,6 +44,13 @@ const RAW_API_BASE = normalizeApiBaseUrl();
 let cachedSessionToken: string | null = null;
 let lastSessionVerifiedAtMs = 0;
 let inflightSessionHandshake: Promise<boolean> | null = null;
+let firebaseIdTokenProvider: (() => Promise<string | null>) | null = null;
+
+export function registerFirebaseIdTokenProvider(
+  provider: (() => Promise<string | null>) | null
+): void {
+  firebaseIdTokenProvider = provider;
+}
 
 // Keep session & Nginx Lua auth_token_cache (300s TTL) warm by refreshing if > 180s old
 const SESSION_WARM_TTL_MS = 180_000;
@@ -370,6 +377,17 @@ export async function fetchApiJson<T = any>(
   // Never manually set Content-Type on FormData; browser must generate the multipart boundary
   if (typeof FormData !== 'undefined' && options.body instanceof FormData) {
     headers.delete('Content-Type');
+  }
+
+  if (firebaseIdTokenProvider && !headers.has('Authorization')) {
+    try {
+      const idToken = await firebaseIdTokenProvider();
+      if (idToken) {
+        headers.set('Authorization', `Bearer ${idToken}`);
+      }
+    } catch {
+      // Proceed without Firebase Bearer token if unavailable
+    }
   }
 
   let attempt = 0;

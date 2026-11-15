@@ -7,7 +7,15 @@ import os from 'os';
 import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import type { AudioSignalAnalysis, CloningLanguageCode } from './src/types/voicelab.ts';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+import type {
+  AudioSignalAnalysis,
+  CloningLanguageCode,
+  SavedVoiceProfile,
+  SavedVoiceSourceType,
+  VoiceAudioQualityMode,
+  VoiceCloneResult
+} from './src/types/voicelab.ts';
 import { inspectAndValidateAudioFile } from './src/server/audioDsp.ts';
 import {
   analyzeReferenceVoiceLanguageAndIdentity,
@@ -16,11 +24,61 @@ import {
   executeSameLanguageVoiceCloning,
   extractQuotaExhaustedInfo,
   getOrCreateAuthorizedSampleAudio,
+  prepareCanonicalSpeakerPromptWav,
   QuotaExhaustedError,
   resolveRuntimeGeminiApiKey
 } from './src/server/aiPipelines.ts';
+import {
+  checkCloudConditioningExists,
+  deleteSavedVoiceFromFirestore,
+  extractBearerTokenFromAuthHeader,
+  fetchSingleSavedVoiceFromFirestore,
+  hydrateSavedVoiceFilesFromFirestore,
+  incrementSavedVoiceUsageInFirestore,
+  listUserSavedVoicesFromFirestore,
+  persistSavedVoiceAndAudioToFirestore,
+  renameSavedVoiceInFirestore
+} from './src/server/firestoreVaultBridge.ts';
 
 const execFileAsync = promisify(execFile);
+
+function resolveOwnerEmailAllowlist(): Set<string> {
+  const configured = [process.env.OWNER_EMAIL || '', process.env.OWNER_EMAIL_ALLOWLIST || '']
+    .join(',')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.includes('@'));
+  if (configured.length > 0) {
+    return new Set(configured);
+  }
+  // Default server-side owner identity when OWNER_EMAIL env var is unset
+  return new Set(['foysalvvvvbbbb@gmail.com']);
+}
+
+const OWNER_EMAIL_ALLOWLIST = resolveOwnerEmailAllowlist();
+const PRIMARY_DEFAULT_OWNER_EMAIL = Array.from(OWNER_EMAIL_ALLOWLIST)[0];
+
+function resolveFirebaseProjectId(): string {
+  try {
+    const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      if (typeof parsed?.projectId === 'string' && parsed.projectId.trim()) {
+        return parsed.projectId.trim();
+      }
+    }
+  } catch {
+    // Fallback cleanly
+  }
+  return '';
+}
+
+const FIREBASE_PROJECT_ID = resolveFirebaseProjectId();
+const FIREBASE_JWKS = createRemoteJWKSet(
+  new URL(
+    'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'
+  )
+);
 
 const PORT =
   process.env.PORT && process.env.PORT !== process.env.NGINX_PORT
@@ -28,12 +86,23 @@ const PORT =
     : Number(process.env.DEFAULT_APP_PORT) || 3000;
 const IS_PRODUCTION =
   process.env.NODE_ENV === 'production' || process.env.SERVE_STATIC_DIST === 'true';
-const TEMP_ROOT = path.join(os.tmpdir(), 'voicelab_ai_storage');
-const UPLOAD_DIR = path.join(TEMP_ROOT, 'uploads');
-const GENERATED_DIR = path.join(TEMP_ROOT, 'generated');
-const SAMPLES_DIR = path.join(TEMP_ROOT, 'samples');
+const LEGACY_TEMP_ROOT = path.join(os.tmpdir(), 'voicelab_ai_storage');
 
-for (const dir of [TEMP_ROOT, UPLOAD_DIR, GENERATED_DIR, SAMPLES_DIR]) {
+// Permanent workspace-anchored persistent root (survives server restarts & never wiped by TTL)
+const PERSISTENT_DATA_ROOT = path.resolve(process.cwd(), '.voicelab_persistent');
+const UPLOAD_DIR = path.join(PERSISTENT_DATA_ROOT, 'uploads');
+const GENERATED_DIR = path.join(PERSISTENT_DATA_ROOT, 'generated');
+const SAMPLES_DIR = path.join(PERSISTENT_DATA_ROOT, 'samples');
+const VOICE_VAULT_DIR = path.join(PERSISTENT_DATA_ROOT, 'voice_vault');
+const SAVED_VOICES_INDEX_FILE = path.join(PERSISTENT_DATA_ROOT, 'saved_voices_index.json');
+
+for (const dir of [
+  PERSISTENT_DATA_ROOT,
+  UPLOAD_DIR,
+  GENERATED_DIR,
+  SAMPLES_DIR,
+  VOICE_VAULT_DIR
+]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -595,20 +664,9 @@ function handleAudioUploadMiddleware(
   });
 }
 
-// Automatic temporary file cleanup every 15 minutes (removes uploads/generated older than 30 minutes)
-const cleanupIntervalTimer = setInterval(async () => {
+// Periodic in-memory maintenance (rate limits & old SSE progress only — NEVER deletes saved/uploaded/generated user audio)
+const cleanupIntervalTimer = setInterval(() => {
   const now = Date.now();
-  const ttlMs = 30 * 60 * 1000;
-  for (const [fileId, entry] of uploadedFilesRegistry.entries()) {
-    if (!fileId.startsWith('sample_ref_') && now - entry.createdAtMs > ttlMs) {
-      await fs.promises.unlink(entry.filePath).catch(() => {});
-      const metaPath = resolveSafeChildPath(UPLOAD_DIR, `${fileId}.meta.json`);
-      if (metaPath) {
-        await fs.promises.unlink(metaPath).catch(() => {});
-      }
-      uploadedFilesRegistry.delete(fileId);
-    }
-  }
   // Prune stale rate limit buckets
   for (const store of [generalRateBuckets, computeRateBuckets]) {
     for (const [key, bucket] of store.entries()) {
@@ -668,10 +726,10 @@ async function startServer() {
       if (isAllowedOrigin) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
         res.setHeader(
           'Access-Control-Allow-Headers',
-          'Content-Type, Accept, X-Requested-With, X-VoiceLab-Session, X-VoiceLab-Operation-Id'
+          'Content-Type, Accept, Authorization, X-Requested-With, X-VoiceLab-Session, X-VoiceLab-Operation-Id'
         );
         res.setHeader('Access-Control-Expose-Headers', 'X-VoiceLab-Session-Token');
         res.setHeader('Vary', 'Origin');
@@ -808,18 +866,962 @@ async function startServer() {
     next();
   });
 
-  // Heavy AI compute rate-limiter middleware (25 requests / 60s per IP)
+  // Server-side Governance, Ownership, Feature Paywall, Payment & Token Store (Fail-Closed Owner Security)
+  interface ServerGovernancePolicy {
+    maintenanceMode: boolean;
+    maintenanceNotice: string;
+    allowVoiceCloning: boolean;
+    allowSrtGeneration: boolean;
+    requireAuthForCompute: boolean;
+    maxScriptChars: number;
+    rateLimitPerMinute: number;
+    enforceZeroGeminiQuota: boolean;
+  }
+
+  interface ServerOwnershipState {
+    primaryOwnerUid: string;
+    primaryOwnerEmail: string;
+    organizationName: string;
+    ownershipLocked: boolean;
+  }
+
+  type FeatureGateKey = 'voice_cloning' | 'long_script' | 'srt_generator';
+  type PackageFeatureKey = FeatureGateKey | 'pro_bundle';
+  type PaymentMethodId = 'bkash' | 'nagad';
+
+  interface ServerFeatureFlagConfig {
+    key: FeatureGateKey;
+    title: string;
+    description: string;
+    enabled: boolean;
+    isPaid: boolean;
+    tokenCost: number;
+  }
+
+  interface ServerFeaturePackage {
+    id: string;
+    featureKey: PackageFeatureKey;
+    title: string;
+    description: string;
+    priceBdt: number;
+    durationDays: number;
+    enabled: boolean;
+  }
+
+  interface ServerTokenPackage {
+    id: string;
+    title: string;
+    description: string;
+    tokens: number;
+    priceBdt: number;
+    enabled: boolean;
+  }
+
+  interface ServerPaymentSettings {
+    bkashEnabled: boolean;
+    bkashNumber: string;
+    bkashAccountType: 'Personal' | 'Merchant' | 'Agent';
+    bkashInstructions: string;
+    nagadEnabled: boolean;
+    nagadNumber: string;
+    nagadAccountType: 'Personal' | 'Merchant' | 'Agent';
+    nagadInstructions: string;
+  }
+
+  interface ServerUserRecord {
+    uid: string;
+    email: string;
+    displayName: string;
+    role: 'owner' | 'user';
+    accountStatus: 'active' | 'suspended';
+    createdAt: string;
+    lastSeenAt: string;
+  }
+
+  interface ServerUserEntitlement {
+    uid: string;
+    email: string;
+    tokenBalance: number;
+    voiceCloningUnlocked: boolean;
+    voiceCloningExpiresAtMs: number;
+    longScriptUnlocked: boolean;
+    longScriptExpiresAtMs: number;
+    srtGeneratorUnlocked: boolean;
+    srtGeneratorExpiresAtMs: number;
+    proBundleUnlocked: boolean;
+    proBundleExpiresAtMs: number;
+    updatedAt: string;
+  }
+
+  interface ServerPaymentRequest {
+    orderId: string;
+    userUid: string;
+    userEmail: string;
+    userName: string;
+    itemType: 'feature_package' | 'token_package';
+    itemId: string;
+    itemTitle: string;
+    featureKey?: PackageFeatureKey;
+    amountBdt: number;
+    tokensGranted: number;
+    durationDays: number;
+    paymentMethod: PaymentMethodId;
+    senderNumber: string;
+    trxId: string;
+    receiverNumber: string;
+    note: string;
+    status: 'pending' | 'approved' | 'rejected';
+    credited: boolean;
+    reviewedByUid: string;
+    rejectionReason: string;
+    createdAt: string;
+    updatedAt: string;
+  }
+
+  interface ServerTokenLedgerEntry {
+    entryId: string;
+    userUid: string;
+    userEmail: string;
+    delta: number;
+    balanceAfter: number;
+    type: 'purchase_credit' | 'admin_grant' | 'admin_revoke' | 'feature_debit' | 'refund';
+    reason: string;
+    actorUid: string;
+    createdAt: string;
+  }
+
+  interface ServerAuditLogEntry {
+    logId: string;
+    actorUid: string;
+    actorEmail: string;
+    action: string;
+    target: string;
+    details: string;
+    createdAt: string;
+  }
+
+  const GOVERNANCE_STATE_FILE = path.join(PERSISTENT_DATA_ROOT, 'server_governance_state.json');
+  const LEGACY_GOVERNANCE_STATE_FILE = path.join(LEGACY_TEMP_ROOT, 'server_governance_state.json');
+  if (!fs.existsSync(GOVERNANCE_STATE_FILE) && fs.existsSync(LEGACY_GOVERNANCE_STATE_FILE)) {
+    try {
+      fs.copyFileSync(LEGACY_GOVERNANCE_STATE_FILE, GOVERNANCE_STATE_FILE);
+    } catch {
+      // Non-fatal migration fallback
+    }
+  }
+
+  let serverGovernancePolicy: ServerGovernancePolicy = {
+    maintenanceMode: false,
+    maintenanceNotice: 'VoiceLab AI is currently undergoing scheduled owner maintenance.',
+    allowVoiceCloning: true,
+    allowSrtGeneration: true,
+    requireAuthForCompute: false,
+    maxScriptChars: 12000,
+    rateLimitPerMinute: 25,
+    enforceZeroGeminiQuota: true
+  };
+
+  let serverOwnershipState: ServerOwnershipState = {
+    primaryOwnerUid: '',
+    primaryOwnerEmail: PRIMARY_DEFAULT_OWNER_EMAIL,
+    organizationName: 'VoiceLab AI',
+    ownershipLocked: true
+  };
+
+  let serverFeatureConfigs: Record<FeatureGateKey, ServerFeatureFlagConfig> = {
+    voice_cloning: {
+      key: 'voice_cloning',
+      title: 'Voice Cloning Studio',
+      description: 'Same-language neural voice cloning for Bengali, Hindi, and English.',
+      enabled: true,
+      isPaid: false,
+      tokenCost: 0
+    },
+    long_script: {
+      key: 'long_script',
+      title: 'Long-Script Pro (>1,000 Chars)',
+      description: 'Auto-chunked synthesis for scripts longer than 1,000 spoken characters.',
+      enabled: true,
+      isPaid: false,
+      tokenCost: 0
+    },
+    srt_generator: {
+      key: 'srt_generator',
+      title: 'Audio to SRT Generator',
+      description: 'Multilingual audio transcription and SubRip subtitle timing.',
+      enabled: true,
+      isPaid: false,
+      tokenCost: 0
+    }
+  };
+
+  let serverFeaturePackages: ServerFeaturePackage[] = [
+    {
+      id: 'pkg_voice_cloning',
+      featureKey: 'voice_cloning',
+      title: 'Voice Cloning Pass',
+      description: 'Full access to same-language neural Voice Cloning Studio',
+      priceBdt: 299,
+      durationDays: 30,
+      enabled: true
+    },
+    {
+      id: 'pkg_long_script',
+      featureKey: 'long_script',
+      title: 'Long-Script Pro (>1,000 Chars)',
+      description: 'Synthesize long narration scripts beyond 1,000 characters',
+      priceBdt: 249,
+      durationDays: 30,
+      enabled: true
+    },
+    {
+      id: 'pkg_srt_generator',
+      featureKey: 'srt_generator',
+      title: 'Audio to SRT Generator',
+      description: 'Multilingual speech-to-subtitle workflow & SRT export',
+      priceBdt: 199,
+      durationDays: 30,
+      enabled: true
+    },
+    {
+      id: 'pkg_pro_bundle',
+      featureKey: 'pro_bundle',
+      title: 'All-in-One Pro Bundle',
+      description: 'Unlock Voice Cloning, Long-Script Pro, and Audio-to-SRT together',
+      priceBdt: 499,
+      durationDays: 30,
+      enabled: true
+    }
+  ];
+
+  let serverTokenPackages: ServerTokenPackage[] = [
+    {
+      id: 'tok_starter_50',
+      title: 'Starter 50 Tokens',
+      description: '50 compute tokens for Voice Cloning and Audio-to-SRT jobs',
+      tokens: 50,
+      priceBdt: 149,
+      enabled: true
+    },
+    {
+      id: 'tok_creator_150',
+      title: 'Creator 150 Tokens',
+      description: '150 compute tokens for regular studio creators',
+      tokens: 150,
+      priceBdt: 349,
+      enabled: true
+    },
+    {
+      id: 'tok_studio_500',
+      title: 'Studio 500 Tokens',
+      description: '500 compute tokens for high-volume production pipelines',
+      tokens: 500,
+      priceBdt: 899,
+      enabled: true
+    }
+  ];
+
+  let serverPaymentSettings: ServerPaymentSettings = {
+    bkashEnabled: true,
+    bkashNumber: '',
+    bkashAccountType: 'Personal',
+    bkashInstructions:
+      'bKash App বা *247# ডায়াল করে উপরের নম্বরে Send Money / Payment করুন। এরপর Transaction ID (TrxID) ও আপনার বিকাশ নম্বর দিয়ে সাবমিট করুন।',
+    nagadEnabled: true,
+    nagadNumber: '',
+    nagadAccountType: 'Personal',
+    nagadInstructions:
+      'Nagad App বা *167# ডায়াল করে উপরের নম্বরে Send Money / Payment করুন। এরপর Transaction ID (TrxID) ও আপনার নগদ নম্বর দিয়ে সাবমিট করুন।'
+  };
+
+  let serverUsersRegistry: Record<string, ServerUserRecord> = {};
+  let serverUserEntitlements: Record<string, ServerUserEntitlement> = {};
+  let serverPaymentRequests: ServerPaymentRequest[] = [];
+  let serverTokenLedger: ServerTokenLedgerEntry[] = [];
+  let serverAuditLogs: ServerAuditLogEntry[] = [];
+  let usedPaymentTrxIds: Record<
+    string,
+    { orderId: string; paymentMethod: PaymentMethodId; userUid: string; status: string }
+  > = {};
+
+  try {
+    if (fs.existsSync(GOVERNANCE_STATE_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(GOVERNANCE_STATE_FILE, 'utf8'));
+      if (saved?.governance) {
+        serverGovernancePolicy = { ...serverGovernancePolicy, ...saved.governance };
+      }
+      if (saved?.ownership) {
+        serverOwnershipState = {
+          ...serverOwnershipState,
+          primaryOwnerUid: saved.ownership.primaryOwnerUid || '',
+          primaryOwnerEmail:
+            OWNER_EMAIL_ALLOWLIST.size > 0 && process.env.OWNER_EMAIL
+              ? PRIMARY_DEFAULT_OWNER_EMAIL
+              : saved.ownership.primaryOwnerEmail || PRIMARY_DEFAULT_OWNER_EMAIL,
+          organizationName: saved.ownership.organizationName || 'VoiceLab AI',
+          ownershipLocked:
+            typeof saved.ownership.ownershipLocked === 'boolean'
+              ? saved.ownership.ownershipLocked
+              : true
+        };
+      }
+      if (saved?.featureConfigs) {
+        serverFeatureConfigs = {
+          voice_cloning: { ...serverFeatureConfigs.voice_cloning, ...saved.featureConfigs.voice_cloning },
+          long_script: { ...serverFeatureConfigs.long_script, ...saved.featureConfigs.long_script },
+          srt_generator: { ...serverFeatureConfigs.srt_generator, ...saved.featureConfigs.srt_generator }
+        };
+      }
+      if (Array.isArray(saved?.featurePackages) && saved.featurePackages.length > 0) {
+        serverFeaturePackages = saved.featurePackages;
+      }
+      if (Array.isArray(saved?.tokenPackages) && saved.tokenPackages.length > 0) {
+        serverTokenPackages = saved.tokenPackages;
+      }
+      if (saved?.paymentSettings) {
+        serverPaymentSettings = { ...serverPaymentSettings, ...saved.paymentSettings };
+      } else if (saved?.monetization) {
+        // Migrate legacy bKash settings cleanly if present
+        serverPaymentSettings.bkashEnabled = Boolean(saved.monetization.bkashEnabled ?? true);
+        serverPaymentSettings.bkashNumber = String(saved.monetization.bkashNumber || '');
+        serverPaymentSettings.bkashAccountType = saved.monetization.bkashAccountType || 'Personal';
+        serverPaymentSettings.bkashInstructions =
+          saved.monetization.bkashInstructions || serverPaymentSettings.bkashInstructions;
+      }
+      if (saved?.usersRegistry && typeof saved.usersRegistry === 'object') {
+        serverUsersRegistry = saved.usersRegistry;
+      }
+      if (saved?.entitlements && typeof saved.entitlements === 'object') {
+        serverUserEntitlements = saved.entitlements;
+      }
+      if (Array.isArray(saved?.paymentRequests)) {
+        serverPaymentRequests = saved.paymentRequests;
+      }
+      if (Array.isArray(saved?.tokenLedger)) {
+        serverTokenLedger = saved.tokenLedger;
+      }
+      if (Array.isArray(saved?.auditLogs)) {
+        serverAuditLogs = saved.auditLogs;
+      }
+      if (saved?.usedPaymentTrxIds && typeof saved.usedPaymentTrxIds === 'object') {
+        usedPaymentTrxIds = saved.usedPaymentTrxIds;
+      }
+    }
+  } catch {
+    // Use defaults cleanly
+  }
+
+  async function persistGovernanceState(): Promise<void> {
+    await fs.promises
+      .writeFile(
+        GOVERNANCE_STATE_FILE,
+        JSON.stringify(
+          {
+            governance: serverGovernancePolicy,
+            ownership: serverOwnershipState,
+            featureConfigs: serverFeatureConfigs,
+            featurePackages: serverFeaturePackages,
+            tokenPackages: serverTokenPackages,
+            paymentSettings: serverPaymentSettings,
+            usersRegistry: serverUsersRegistry,
+            entitlements: serverUserEntitlements,
+            paymentRequests: serverPaymentRequests.slice(0, 300),
+            tokenLedger: serverTokenLedger.slice(0, 500),
+            auditLogs: serverAuditLogs.slice(0, 200),
+            usedPaymentTrxIds
+          },
+          null,
+          2
+        ),
+        'utf8'
+      )
+      .catch(() => {});
+  }
+
+  // Persistent User-Specific Saved Voice Profiles Registry & Secure UID-Isolated Vault
+  interface ServerSavedVoiceRecord extends SavedVoiceProfile {
+    referenceAnalysis: AudioSignalAnalysis;
+  }
+
+  const savedVoicesRegistry = new Map<string, ServerSavedVoiceRecord>();
+
+  function resolveVaultVoicePaths(
+    ownerUid: string,
+    voiceId: string
+  ): {
+    dir: string;
+    refWavPath: string;
+    promptWavPath: string;
+    profileJsonPath: string;
+    storageKey: string;
+  } | null {
+    const cleanUid = path.basename(String(ownerUid || '').trim());
+    const cleanVoiceId = path.basename(String(voiceId || '').trim());
+    if (
+      !/^[a-zA-Z0-9_-]{3,128}$/.test(cleanUid) ||
+      !/^[a-zA-Z0-9_-]{3,128}$/.test(cleanVoiceId)
+    ) {
+      return null;
+    }
+    const vaultBase = path.resolve(VOICE_VAULT_DIR);
+    const dir = path.resolve(vaultBase, cleanUid, cleanVoiceId);
+    if (!dir.startsWith(vaultBase + path.sep)) {
+      return null;
+    }
+    return {
+      dir,
+      refWavPath: path.join(dir, 'reference.wav'),
+      promptWavPath: path.join(dir, 'prompt_5s.wav'),
+      profileJsonPath: path.join(dir, 'profile.json'),
+      storageKey: `${cleanUid}/${cleanVoiceId}`
+    };
+  }
+
+  function hasVaultConditioningAudio(rec: ServerSavedVoiceRecord): boolean {
+    const paths = resolveVaultVoicePaths(rec.ownerUid, rec.voiceId);
+    if (!paths) return false;
+    return fs.existsSync(paths.refWavPath) && fs.existsSync(paths.promptWavPath);
+  }
+
+  function serializeSavedVoiceProfile(
+    rec: ServerSavedVoiceRecord,
+    overrideHasConditioningAudio?: boolean
+  ): SavedVoiceProfile {
+    return {
+      voiceId: rec.voiceId,
+      ownerUid: rec.ownerUid,
+      ownerEmail: rec.ownerEmail,
+      name: rec.name,
+      language: rec.language,
+      languageName: rec.languageName,
+      conditioningMethod: rec.conditioningMethod,
+      modelCheckpoint: rec.modelCheckpoint,
+      speakerConditioningSha256: rec.speakerConditioningSha256,
+      promptConditioningSha256: rec.promptConditioningSha256,
+      referenceTranscript: rec.referenceTranscript,
+      referenceDurationSec: rec.referenceDurationSec,
+      promptDurationSec: rec.promptDurationSec,
+      fundamentalFreqHz: rec.fundamentalFreqHz,
+      pitchMinHz: rec.pitchMinHz,
+      pitchMaxHz: rec.pitchMaxHz,
+      spectralWarmthRatio: rec.spectralWarmthRatio,
+      estimatedSnrDb: rec.estimatedSnrDb,
+      qualityGrade: rec.qualityGrade,
+      sourceType: rec.sourceType,
+      sourceFileName: rec.sourceFileName,
+      storageKey: rec.storageKey,
+      consentConfirmed: rec.consentConfirmed,
+      usageCount: rec.usageCount,
+      hasConditioningAudio:
+        typeof overrideHasConditioningAudio === 'boolean'
+          ? overrideHasConditioningAudio
+          : hasVaultConditioningAudio(rec),
+      lastUsedAt: rec.lastUsedAt,
+      createdAt: rec.createdAt,
+      updatedAt: rec.updatedAt
+    };
+  }
+
+  function buildSyntheticAnalysisFromProfile(profile: SavedVoiceProfile): AudioSignalAnalysis {
+    return {
+      fileId: profile.voiceId,
+      fileName: profile.sourceFileName || `${profile.voiceId}.wav`,
+      mimeType: 'audio/wav',
+      formatName: 'wav',
+      codecName: 'pcm_s16le',
+      fileSizeBytes: 0,
+      durationSeconds: Number(profile.referenceDurationSec) || 5,
+      sampleRateHz: 24000,
+      channels: 1,
+      bitRateKbps: 384,
+      rmsLevelDb: -20,
+      peakLevelDb: -3,
+      noiseFloorDb: -45,
+      estimatedSnrDb: Number(profile.estimatedSnrDb) || 25,
+      silenceRatio: 0.1,
+      fundamentalFreqHz: Number(profile.fundamentalFreqHz) || 160,
+      pitchRangeHz: [Number(profile.pitchMinHz) || 100, Number(profile.pitchMaxHz) || 240],
+      spectralWarmthRatio: Number(profile.spectralWarmthRatio) || 1,
+      qualityGrade: profile.qualityGrade || 'Good',
+      qualityWarnings: [],
+      isValid: true,
+      previewUrl: `/api/voices/${encodeURIComponent(profile.voiceId)}/preview`
+    };
+  }
+
+  function loadSavedVoicesFromVaultDisk(): void {
+    try {
+      if (fs.existsSync(SAVED_VOICES_INDEX_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(SAVED_VOICES_INDEX_FILE, 'utf8'));
+        if (Array.isArray(parsed?.voices)) {
+          for (const rec of parsed.voices) {
+            if (rec?.voiceId && rec?.ownerUid && rec?.referenceAnalysis) {
+              savedVoicesRegistry.set(rec.voiceId, rec as ServerSavedVoiceRecord);
+            }
+          }
+        }
+      }
+      // Also scan vault user folders to guarantee zero lost records after restarts
+      const uidDirs = fs.readdirSync(VOICE_VAULT_DIR, { withFileTypes: true });
+      for (const uidEntry of uidDirs) {
+        if (!uidEntry.isDirectory() || !/^[a-zA-Z0-9_-]{3,128}$/.test(uidEntry.name)) continue;
+        const userDir = path.join(VOICE_VAULT_DIR, uidEntry.name);
+        const voiceDirs = fs.readdirSync(userDir, { withFileTypes: true });
+        for (const vEntry of voiceDirs) {
+          if (!vEntry.isDirectory() || !/^[a-zA-Z0-9_-]{3,128}$/.test(vEntry.name)) continue;
+          const profilePath = path.join(userDir, vEntry.name, 'profile.json');
+          if (fs.existsSync(profilePath) && !savedVoicesRegistry.has(vEntry.name)) {
+            try {
+              const rec = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+              if (rec?.voiceId === vEntry.name && rec?.ownerUid === uidEntry.name) {
+                savedVoicesRegistry.set(rec.voiceId, rec as ServerSavedVoiceRecord);
+              }
+            } catch {
+              // Ignore corrupted individual profile file
+            }
+          }
+        }
+      }
+    } catch {
+      // Keep clean empty map if disk vault uninitialized
+    }
+  }
+  loadSavedVoicesFromVaultDisk();
+
+  async function persistSavedVoicesIndex(): Promise<void> {
+    const tmpFile = `${SAVED_VOICES_INDEX_FILE}.tmp`;
+    const payload = JSON.stringify(
+      {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        voices: Array.from(savedVoicesRegistry.values())
+      },
+      null,
+      2
+    );
+    await fs.promises.writeFile(tmpFile, payload, 'utf8');
+    await fs.promises.rename(tmpFile, SAVED_VOICES_INDEX_FILE);
+  }
+
+  async function persistSavedVoiceProfileRecord(rec: ServerSavedVoiceRecord): Promise<void> {
+    const paths = resolveVaultVoicePaths(rec.ownerUid, rec.voiceId);
+    if (paths) {
+      await fs.promises.mkdir(paths.dir, { recursive: true });
+      await fs.promises.writeFile(paths.profileJsonPath, JSON.stringify(rec, null, 2), 'utf8');
+    }
+    savedVoicesRegistry.set(rec.voiceId, rec);
+    await persistSavedVoicesIndex().catch(() => {});
+  }
+
+  const voiceHydrationInFlight = new Map<string, Promise<ServerSavedVoiceRecord | null>>();
+
+  async function ensureSavedVoiceHydratedOnServer(
+    voiceId: string,
+    identity: VerifiedFirebaseIdentity,
+    bearerToken: string | null
+  ): Promise<ServerSavedVoiceRecord | null> {
+    const existing = savedVoicesRegistry.get(voiceId);
+    if (existing) {
+      if (existing.ownerUid !== identity.uid) {
+        return existing; // Caller checks ownership and returns 403
+      }
+      if (hasVaultConditioningAudio(existing)) {
+        return existing;
+      }
+    }
+
+    if (!bearerToken) {
+      return existing || null;
+    }
+
+    const lockKey = `${identity.uid}:${voiceId}`;
+    const pending = voiceHydrationInFlight.get(lockKey);
+    if (pending) {
+      return pending;
+    }
+
+    const work = (async (): Promise<ServerSavedVoiceRecord | null> => {
+      try {
+        const vaultPaths = resolveVaultVoicePaths(identity.uid, voiceId);
+        if (!vaultPaths) return existing || null;
+
+        const hydrated = await hydrateSavedVoiceFilesFromFirestore({
+          bearerToken,
+          voiceId,
+          ownerUid: identity.uid,
+          vaultDir: vaultPaths.dir,
+          refWavPath: vaultPaths.refWavPath,
+          promptWavPath: vaultPaths.promptWavPath
+        });
+
+        if (!hydrated.profile) {
+          return existing || null;
+        }
+
+        let refAnalysis = existing?.referenceAnalysis;
+        if (hydrated.hydrated && fs.existsSync(vaultPaths.refWavPath)) {
+          refAnalysis = await inspectAndValidateAudioFile(
+            vaultPaths.refWavPath,
+            voiceId,
+            hydrated.profile.sourceFileName || `${voiceId}.wav`,
+            'audio/wav',
+            `/api/voices/${encodeURIComponent(voiceId)}/preview`
+          ).catch(() => buildSyntheticAnalysisFromProfile(hydrated.profile!));
+        } else if (!refAnalysis) {
+          refAnalysis = buildSyntheticAnalysisFromProfile(hydrated.profile);
+        }
+
+        const record: ServerSavedVoiceRecord = {
+          ...(existing || {}),
+          ...hydrated.profile,
+          hasConditioningAudio:
+            fs.existsSync(vaultPaths.refWavPath) && fs.existsSync(vaultPaths.promptWavPath),
+          referenceAnalysis: {
+            ...refAnalysis,
+            fileId: voiceId,
+            previewUrl: `/api/voices/${encodeURIComponent(voiceId)}/preview`
+          }
+        };
+
+        await persistSavedVoiceProfileRecord(record);
+        return record;
+      } catch (err) {
+        console.warn(`[VoiceLab VaultHydrate] Failed hydrating ${voiceId}:`, err);
+        return existing || null;
+      } finally {
+        voiceHydrationInFlight.delete(lockKey);
+      }
+    })();
+
+    voiceHydrationInFlight.set(lockKey, work);
+    return work;
+  }
+
+  function ensureUserEntitlementRecord(uid: string, email: string): ServerUserEntitlement {
+    const existing = serverUserEntitlements[uid];
+    if (existing) {
+      if (typeof existing.tokenBalance !== 'number' || !Number.isFinite(existing.tokenBalance)) {
+        existing.tokenBalance = 0;
+      }
+      if (!existing.email && email) existing.email = email;
+      return existing;
+    }
+    const created: ServerUserEntitlement = {
+      uid,
+      email,
+      tokenBalance: 0,
+      voiceCloningUnlocked: false,
+      voiceCloningExpiresAtMs: 0,
+      longScriptUnlocked: false,
+      longScriptExpiresAtMs: 0,
+      srtGeneratorUnlocked: false,
+      srtGeneratorExpiresAtMs: 0,
+      proBundleUnlocked: false,
+      proBundleExpiresAtMs: 0,
+      updatedAt: new Date().toISOString()
+    };
+    serverUserEntitlements[uid] = created;
+    return created;
+  }
+
+  function recordServerAuditLog(
+    actorUid: string,
+    actorEmail: string,
+    action: string,
+    target: string,
+    details: string
+  ) {
+    serverAuditLogs.unshift({
+      logId: `log_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      actorUid,
+      actorEmail,
+      action: action.slice(0, 120),
+      target: target.slice(0, 254),
+      details: details.slice(0, 500),
+      createdAt: new Date().toISOString()
+    });
+    if (serverAuditLogs.length > 200) {
+      serverAuditLogs.length = 200;
+    }
+  }
+
+  interface VerifiedFirebaseIdentity {
+    uid: string;
+    email: string;
+    displayName: string;
+    emailVerified: boolean;
+    role: 'owner' | 'user';
+  }
+
+  const recentSecurityEvents: Array<{
+    timestamp: string;
+    event: string;
+    actor: string;
+    detail: string;
+  }> = [];
+  function recordServerSecurityEvent(event: string, actor: string, detail: string) {
+    recentSecurityEvents.unshift({
+      timestamp: new Date().toISOString(),
+      event,
+      actor,
+      detail
+    });
+    if (recentSecurityEvents.length > 50) {
+      recentSecurityEvents.length = 50;
+    }
+  }
+
+  function isOwnerIdentityEmail(emailLower: string): boolean {
+    if (!emailLower) return false;
+    return (
+      OWNER_EMAIL_ALLOWLIST.has(emailLower) ||
+      emailLower === serverOwnershipState.primaryOwnerEmail.toLowerCase()
+    );
+  }
+
+  async function extractVerifiedFirebaseIdentity(
+    req: express.Request
+  ): Promise<VerifiedFirebaseIdentity | null> {
+    if (!FIREBASE_PROJECT_ID) return null;
+    const authHeader = String(req.headers.authorization || '').trim();
+    if (!authHeader.toLowerCase().startsWith('bearer ')) return null;
+    const token = authHeader.slice(7).trim();
+    if (!token || token.length < 32) return null;
+
+    try {
+      const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
+        issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
+        audience: FIREBASE_PROJECT_ID
+      });
+      const uid = typeof payload.sub === 'string' ? payload.sub : '';
+      const email = typeof payload.email === 'string' ? payload.email.toLowerCase() : '';
+      const emailVerified = payload.email_verified === true;
+      const displayName =
+        typeof payload.name === 'string' && payload.name.trim()
+          ? payload.name.trim().slice(0, 120)
+          : email.split('@')[0] || 'User';
+      if (!uid || !email || !emailVerified) return null;
+
+      // Owner-only role assignment: verified exclusively against server-side Owner allowlist
+      const role: 'owner' | 'user' = isOwnerIdentityEmail(email) ? 'owner' : 'user';
+      if (role === 'owner' && !serverOwnershipState.primaryOwnerUid) {
+        serverOwnershipState.primaryOwnerUid = uid;
+        serverOwnershipState.primaryOwnerEmail = email;
+      }
+
+      return { uid, email, displayName, emailVerified, role };
+    } catch {
+      return null;
+    }
+  }
+
+  async function requireVerifiedUser(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) {
+    const identity = await extractVerifiedFirebaseIdentity(req);
+    if (!identity) {
+      res.status(401).type('application/json').json({
+        error: 'Verified Google Sign-In required.',
+        code: 'AUTH_REQUIRED'
+      });
+      return;
+    }
+    const existingUser = serverUsersRegistry[identity.uid];
+    if (existingUser && existingUser.accountStatus === 'suspended' && identity.role !== 'owner') {
+      res.status(423).type('application/json').json({
+        error: 'Your account has been suspended by the workspace owner.',
+        code: 'ACCOUNT_SUSPENDED'
+      });
+      return;
+    }
+    (req as any).firebaseIdentity = identity;
+    next();
+  }
+
+  async function requirePrimaryOwner(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) {
+    const identity = await extractVerifiedFirebaseIdentity(req);
+    if (!identity) {
+      res.status(401).type('application/json').json({
+        error: 'Verified Owner authentication required.',
+        code: 'OWNER_AUTH_REQUIRED'
+      });
+      return;
+    }
+    if (identity.role !== 'owner') {
+      recordServerSecurityEvent('UNAUTHORIZED_ADMIN_ATTEMPT', identity.email, req.originalUrl);
+      res.status(401).type('application/json').json({
+        error: 'Access denied. Administrator controls are restricted exclusively to the Owner.',
+        code: 'OWNER_FORBIDDEN'
+      });
+      return;
+    }
+    (req as any).firebaseAdmin = identity;
+    next();
+  }
+
+  async function enforceGovernanceComputeGuard(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) {
+    const identity = await extractVerifiedFirebaseIdentity(req);
+    const isOwnerActor = identity?.role === 'owner';
+
+    if (identity && !isOwnerActor) {
+      const userRec = serverUsersRegistry[identity.uid];
+      if (userRec?.accountStatus === 'suspended') {
+        res.status(423).type('application/json').json({
+          error: 'Your account is suspended. Contact workspace support to restore access.',
+          code: 'ACCOUNT_SUSPENDED'
+        });
+        return;
+      }
+    }
+
+    if (serverGovernancePolicy.maintenanceMode && !isOwnerActor) {
+      res.status(423).type('application/json').json({
+        error:
+          serverGovernancePolicy.maintenanceNotice ||
+          'VoiceLab AI is currently undergoing scheduled maintenance.',
+        code: 'MAINTENANCE_MODE'
+      });
+      return;
+    }
+
+    if (serverGovernancePolicy.requireAuthForCompute && !identity) {
+      res.status(401).type('application/json').json({
+        error: 'Verified Google Sign-In is required before running audio processing jobs.',
+        code: 'COMPUTE_AUTH_REQUIRED'
+      });
+      return;
+    }
+
+    (req as any).firebaseIdentity = identity;
+    next();
+  }
+
+  function isEntitlementActive(unlocked: boolean | undefined, expiresAtMs: number | undefined): boolean {
+    if (!unlocked) return false;
+    if (!expiresAtMs || expiresAtMs === 0) return true;
+    return expiresAtMs > Date.now();
+  }
+
+  function checkFeatureAccessGate(
+    fbIdentity: VerifiedFirebaseIdentity | null,
+    featureKey: FeatureGateKey
+  ): {
+    allowed: boolean;
+    statusCode: number;
+    code?: string;
+    error?: string;
+    tokenCost: number;
+  } {
+    const cfg = serverFeatureConfigs[featureKey];
+    const isOwnerActor = fbIdentity?.role === 'owner';
+
+    if (!cfg.enabled && !isOwnerActor) {
+      return {
+        allowed: false,
+        statusCode: 423,
+        code: 'FEATURE_DISABLED_BY_ADMIN',
+        error: `${cfg.title} is currently disabled by administrator policy.`,
+        tokenCost: cfg.tokenCost
+      };
+    }
+
+    if (isOwnerActor) {
+      return { allowed: true, statusCode: 200, tokenCost: 0 };
+    }
+
+    if (cfg.isPaid) {
+      if (!fbIdentity) {
+        return {
+          allowed: false,
+          statusCode: 401,
+          code: 'AUTH_REQUIRED_FOR_PAID_FEATURE',
+          error: `${cfg.title} is a premium feature. Sign in with Google to upgrade or request access.`,
+          tokenCost: cfg.tokenCost
+        };
+      }
+      const ent = serverUserEntitlements[fbIdentity.uid];
+      const hasBundle = ent ? isEntitlementActive(ent.proBundleUnlocked, ent.proBundleExpiresAtMs) : false;
+      const hasSpecific = ent
+        ? featureKey === 'voice_cloning'
+          ? isEntitlementActive(ent.voiceCloningUnlocked, ent.voiceCloningExpiresAtMs)
+          : featureKey === 'long_script'
+          ? isEntitlementActive(ent.longScriptUnlocked, ent.longScriptExpiresAtMs)
+          : isEntitlementActive(ent.srtGeneratorUnlocked, ent.srtGeneratorExpiresAtMs)
+        : false;
+      if (!hasBundle && !hasSpecific) {
+        return {
+          allowed: false,
+          statusCode: 402,
+          code: 'PAYMENT_REQUIRED',
+          error: `${cfg.title} requires an active premium entitlement. Open Upgrade / Request Access to purchase via bKash or Nagad.`,
+          tokenCost: cfg.tokenCost
+        };
+      }
+    }
+
+    return { allowed: true, statusCode: 200, tokenCost: cfg.tokenCost };
+  }
+
+  function applyAtomicTokenDelta(params: {
+    uid: string;
+    email: string;
+    delta: number;
+    type: ServerTokenLedgerEntry['type'];
+    reason: string;
+    actorUid: string;
+  }): { ok: boolean; balanceAfter: number; entry?: ServerTokenLedgerEntry; error?: string } {
+    const ent = ensureUserEntitlementRecord(params.uid, params.email);
+    const nextBalance = ent.tokenBalance + params.delta;
+    if (nextBalance < 0) {
+      return {
+        ok: false,
+        balanceAfter: ent.tokenBalance,
+        error: `Insufficient token balance (required ${Math.abs(params.delta)}, available ${ent.tokenBalance}).`
+      };
+    }
+    ent.tokenBalance = nextBalance;
+    ent.updatedAt = new Date().toISOString();
+
+    const entry: ServerTokenLedgerEntry = {
+      entryId: `tok_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      userUid: params.uid,
+      userEmail: params.email || ent.email,
+      delta: params.delta,
+      balanceAfter: nextBalance,
+      type: params.type,
+      reason: params.reason.slice(0, 240),
+      actorUid: params.actorUid,
+      createdAt: new Date().toISOString()
+    };
+    serverTokenLedger.unshift(entry);
+    if (serverTokenLedger.length > 500) {
+      serverTokenLedger.length = 500;
+    }
+    return { ok: true, balanceAfter: nextBalance, entry };
+  }
+
+  // Heavy AI compute rate-limiter middleware (governed dynamically by Owner policy)
   function enforceComputeRateLimit(
     req: express.Request,
     res: express.Response,
     next: express.NextFunction
   ) {
     const clientIp = String(req.ip || req.socket.remoteAddress || '127.0.0.1');
-    const status = checkSlidingRateLimit(computeRateBuckets, clientIp, 25, 60_000);
+    const limitPerMin = Math.max(1, Math.min(60, serverGovernancePolicy.rateLimitPerMinute || 25));
+    const status = checkSlidingRateLimit(computeRateBuckets, clientIp, limitPerMin, 60_000);
     if (!status.allowed) {
       res.status(429).type('application/json').json({
-        error:
-          'AI synthesis/transcription rate limit reached (25 requests/minute). Please wait before submitting another job.',
+        error: `AI synthesis/transcription rate limit reached (${limitPerMin} requests/minute). Please wait before submitting another job.`,
         retryAfterSeconds: status.resetSeconds
       });
       return;
@@ -852,7 +1854,7 @@ async function startServer() {
         sameLanguageCloningLanguages: ['bn', 'hi', 'en'],
         multilingualSrtTranscription: true
       },
-      storagePolicy: 'Ephemeral temporary storage (auto-purged after 30 minutes)',
+      storagePolicy: 'Permanent Cloud FLAC Vault (Firestore) + Persistent Workspace Storage (no auto-expiry)',
       activeTemporaryFiles: uploadedFilesRegistry.size
     });
   });
@@ -1011,6 +2013,7 @@ async function startServer() {
   app.post(
     '/api/audio/upload',
     requireAuthenticatedSession,
+    enforceGovernanceComputeGuard,
     handleAudioUploadMiddleware,
     async (req, res) => {
       const operationId = extractOperationIdFromReq(req);
@@ -1217,32 +2220,113 @@ async function startServer() {
     }
   );
 
+  interface VoiceCloneJobRecord {
+    jobId: string;
+    operationId: string | null;
+    sessionId: string;
+    uid: string | null;
+    status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+    result?: VoiceCloneResult;
+    error?: string;
+    code?: string;
+    httpStatus?: number;
+    retryAfterText?: string;
+    deductedTokens: number;
+    deductedUser: VerifiedFirebaseIdentity | null;
+    refunded: boolean;
+    abortController: AbortController;
+    createdAtMs: number;
+    updatedAtMs: number;
+    latestProgress?: ServerOperationProgress;
+  }
+
+  const voiceCloneJobsRegistry = new Map<string, VoiceCloneJobRecord>();
+
+  function pruneOldVoiceCloneJobs(): void {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [id, rec] of voiceCloneJobsRegistry.entries()) {
+      if (rec.status !== 'running' && rec.updatedAtMs < cutoff) {
+        voiceCloneJobsRegistry.delete(id);
+      }
+    }
+    if (voiceCloneJobsRegistry.size > 300) {
+      const oldest = Array.from(voiceCloneJobsRegistry.values())
+        .filter((r) => r.status !== 'running')
+        .sort((a, b) => a.updatedAtMs - b.updatedAtMs);
+      for (const r of oldest.slice(0, voiceCloneJobsRegistry.size - 220)) {
+        voiceCloneJobsRegistry.delete(r.jobId);
+      }
+    }
+  }
+
+  async function refundVoiceCloneJobTokensOnce(job: VoiceCloneJobRecord, reason: string): Promise<void> {
+    if (job.refunded || job.deductedTokens <= 0 || !job.deductedUser) return;
+    job.refunded = true;
+    applyAtomicTokenDelta({
+      uid: job.deductedUser.uid,
+      email: job.deductedUser.email,
+      delta: job.deductedTokens,
+      type: 'refund',
+      reason,
+      actorUid: 'system'
+    });
+    await persistGovernanceState();
+  }
+
   // 7. WORKSPACE A — Same-Language AI Voice Cloning Generation
   app.post(
     '/api/voice-clone/generate',
     requireAuthenticatedSession,
+    enforceGovernanceComputeGuard,
     enforceComputeRateLimit,
     async (req, res) => {
+      req.setTimeout?.(20 * 60 * 1000);
+      res.setTimeout?.(20 * 60 * 1000);
+      let deductedTokens = 0;
+      let deductedUser: VerifiedFirebaseIdentity | null = null;
       try {
+        const fbIdentity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity | null;
+        const sess = (req as any).voicelabSession as VerifiedSessionState | undefined;
+        const isOwnerActor = fbIdentity?.role === 'owner';
+        if (!serverGovernancePolicy.allowVoiceCloning && !isOwnerActor) {
+          res.status(423).type('application/json').json({
+            error: 'Voice Cloning is currently paused by the Administrator.',
+            code: 'FEATURE_DISABLED_BY_ADMIN'
+          });
+          return;
+        }
+
         const {
           referenceFileId,
+          savedVoiceId,
           language,
           text,
           referenceTranscript,
+          audioQuality = 'studio',
           preservePitchContour = true,
           preserveSpectralTimbre = true,
           reuseCompletedChunks = true,
           consentConfirmed = false,
           localEndpointUrl,
           localNodeToken,
-          enableCloudVerification = false
+          enableCloudVerification = false,
+          asyncJob = false
         } = req.body || {};
 
+        const validatedAudioQuality: VoiceAudioQualityMode =
+          audioQuality === 'standard' || audioQuality === 'studio_plus' ? audioQuality : 'studio';
+
         if (!consentConfirmed) {
-          // Use 400 instead of 403 so Nginx proxy_intercept_errors does not replace JSON with /forbidden.html
           res.status(400).type('application/json').json({
             error:
               'Consent confirmation required: You must confirm that you own or have explicit authorization to clone this reference voice.'
+          });
+          return;
+        }
+
+        if (String(text || '').length > serverGovernancePolicy.maxScriptChars) {
+          res.status(400).type('application/json').json({
+            error: `Script exceeds the administrator limit of ${serverGovernancePolicy.maxScriptChars} characters.`
           });
           return;
         }
@@ -1254,33 +2338,327 @@ async function startServer() {
           return;
         }
 
-        const refEntry =
-          uploadedFilesRegistry.get(referenceFileId) ||
-          (await resolveUploadedFileEntry(referenceFileId));
-        if (!refEntry || !fs.existsSync(refEntry.filePath)) {
-          res.status(404).type('application/json').json({
-            error: 'Reference audio recording not found. Please upload or select a reference voice.'
+        const vcGate = checkFeatureAccessGate(fbIdentity, 'voice_cloning');
+        if (!vcGate.allowed) {
+          res.status(vcGate.statusCode).type('application/json').json({
+            error: vcGate.error,
+            code: vcGate.code,
+            featureKey: 'voice_cloning'
           });
           return;
         }
 
+        const spokenCharsCount = String(text || '').replace(/\[[^\]]+\]/g, '').trim().length;
+        let longScriptTokenCost = 0;
+        if (spokenCharsCount > 1000) {
+          const longGate = checkFeatureAccessGate(fbIdentity, 'long_script');
+          if (!longGate.allowed) {
+            res.status(longGate.statusCode).type('application/json').json({
+              error: longGate.error,
+              code: longGate.code,
+              featureKey: 'long_script'
+            });
+            return;
+          }
+          longScriptTokenCost = longGate.tokenCost;
+        }
+
+        let refEntry: { filePath: string; analysis: AudioSignalAnalysis; createdAtMs: number } | null = null;
+        let preConditionedPromptPath: string | undefined;
+        let effectiveSavedVoiceId: string | undefined;
+        let effectiveReferenceTranscript =
+          typeof referenceTranscript === 'string' ? referenceTranscript : undefined;
+
+        const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+        const cleanSavedVoiceId = typeof savedVoiceId === 'string' ? savedVoiceId.trim() : '';
+        if (cleanSavedVoiceId) {
+          if (!SAFE_IDENTIFIER_REGEX.test(cleanSavedVoiceId)) {
+            res.status(400).type('application/json').json({
+              error: 'Invalid saved voice profile identifier.'
+            });
+            return;
+          }
+          if (!fbIdentity) {
+            res.status(401).type('application/json').json({
+              error: 'Verified Google Sign-In required to generate using a saved voice profile.',
+              code: 'AUTH_REQUIRED_FOR_SAVED_VOICE'
+            });
+            return;
+          }
+          const savedRec = await ensureSavedVoiceHydratedOnServer(
+            cleanSavedVoiceId,
+            fbIdentity,
+            bearerToken
+          );
+          if (!savedRec) {
+            res.status(404).type('application/json').json({
+              error: 'Saved voice profile not found.',
+              code: 'SAVED_VOICE_NOT_FOUND'
+            });
+            return;
+          }
+          if (savedRec.ownerUid !== fbIdentity.uid) {
+            recordServerSecurityEvent(
+              'UNAUTHORIZED_SAVED_VOICE_USE',
+              fbIdentity.email,
+              `Attempted to clone using savedVoiceId=${cleanSavedVoiceId} owned by another UID`
+            );
+            res.status(403).type('application/json').json({
+              error: 'Access denied: You can only generate audio using your own saved voice profiles.',
+              code: 'VOICE_FORBIDDEN'
+            });
+            return;
+          }
+          if (!savedRec.consentConfirmed) {
+            res.status(400).type('application/json').json({
+              error: 'Saved voice profile lacks valid authorization consent.',
+              code: 'CONSENT_REQUIRED'
+            });
+            return;
+          }
+          if (savedRec.language !== language) {
+            res.status(400).type('application/json').json({
+              error: `Cross-Language Blocked: Saved voice "${savedRec.name}" is locked to ${savedRec.languageName} (${savedRec.language.toUpperCase()}), not ${String(language).toUpperCase()}.`,
+              code: 'CROSS_LANGUAGE_CLONING_BLOCKED'
+            });
+            return;
+          }
+          const vaultPaths = resolveVaultVoicePaths(savedRec.ownerUid, savedRec.voiceId);
+          if (
+            !vaultPaths ||
+            !fs.existsSync(vaultPaths.refWavPath) ||
+            !fs.existsSync(vaultPaths.promptWavPath)
+          ) {
+            res.status(422).type('application/json').json({
+              error:
+                'Saved voice speaker-conditioning audio is unavailable on server storage and cloud vault. VoiceLab AI refuses to substitute a generic TTS voice — please re-upload or record this voice again.',
+              code: 'SAVED_VOICE_AUDIO_MISSING'
+            });
+            return;
+          }
+          refEntry = {
+            filePath: vaultPaths.refWavPath,
+            analysis: {
+              ...savedRec.referenceAnalysis,
+              fileId: savedRec.voiceId,
+              previewUrl: `/api/voices/${encodeURIComponent(savedRec.voiceId)}/preview`
+            },
+            createdAtMs: Date.now()
+          };
+          preConditionedPromptPath = vaultPaths.promptWavPath;
+          effectiveSavedVoiceId = savedRec.voiceId;
+          if (!effectiveReferenceTranscript || !effectiveReferenceTranscript.trim()) {
+            effectiveReferenceTranscript = savedRec.referenceTranscript || undefined;
+          }
+        } else {
+          refEntry =
+            uploadedFilesRegistry.get(referenceFileId) ||
+            (await resolveUploadedFileEntry(referenceFileId));
+          if (!refEntry || !fs.existsSync(refEntry.filePath)) {
+            res.status(404).type('application/json').json({
+              error: 'Reference audio recording not found. Please upload or select a reference voice.'
+            });
+            return;
+          }
+        }
+
+        const totalRequiredTokens = isOwnerActor ? 0 : vcGate.tokenCost + longScriptTokenCost;
+        if (totalRequiredTokens > 0) {
+          if (!fbIdentity) {
+            res.status(401).type('application/json').json({
+              error: 'Sign in with Google required to use token-gated Voice Cloning.',
+              code: 'AUTH_REQUIRED_FOR_TOKEN_FEATURE',
+              requiredTokens: totalRequiredTokens
+            });
+            return;
+          }
+          const debit = applyAtomicTokenDelta({
+            uid: fbIdentity.uid,
+            email: fbIdentity.email,
+            delta: -totalRequiredTokens,
+            type: 'feature_debit',
+            reason: `Voice Cloning synthesis (${spokenCharsCount} chars)`,
+            actorUid: fbIdentity.uid
+          });
+          if (!debit.ok) {
+            res.status(402).type('application/json').json({
+              error: debit.error,
+              code: 'INSUFFICIENT_TOKENS',
+              requiredTokens: totalRequiredTokens,
+              tokenBalance: debit.balanceAfter
+            });
+            return;
+          }
+          deductedTokens = totalRequiredTokens;
+          deductedUser = fbIdentity;
+          await persistGovernanceState();
+        }
+
+        const effectiveCloudVerification = serverGovernancePolicy.enforceZeroGeminiQuota
+          ? false
+          : Boolean(enableCloudVerification);
+
         const operationId = extractOperationIdFromReq(req);
         const jobId = `clone_${language}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        const abortController = new AbortController();
+
+        if (asyncJob === true) {
+          pruneOldVoiceCloneJobs();
+          const jobRecord: VoiceCloneJobRecord = {
+            jobId,
+            operationId,
+            sessionId: sess?.sessionId || '',
+            uid: fbIdentity?.uid || null,
+            status: 'running',
+            deductedTokens,
+            deductedUser,
+            refunded: false,
+            abortController,
+            createdAtMs: Date.now(),
+            updatedAtMs: Date.now()
+          };
+          voiceCloneJobsRegistry.set(jobId, jobRecord);
+
+          // Prevent duplicate refund in outer catch once background runner owns the lifecycle
+          deductedTokens = 0;
+          deductedUser = null;
+
+          res.status(202).type('application/json').json({
+            status: 'queued',
+            jobId,
+            operationId
+          });
+
+          void (async () => {
+            try {
+              const result = await executeSameLanguageVoiceCloning({
+                jobId,
+                referenceFilePath: refEntry.filePath,
+                preConditionedPromptPath,
+                savedVoiceId: effectiveSavedVoiceId,
+                referenceAnalysis: refEntry.analysis,
+                language: language as CloningLanguageCode,
+                text: String(text || ''),
+                referenceTranscript: effectiveReferenceTranscript,
+                audioQuality: validatedAudioQuality,
+                preservePitchContour: Boolean(preservePitchContour),
+                preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
+                reuseCompletedChunks: Boolean(reuseCompletedChunks),
+                outputDir: GENERATED_DIR,
+                localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
+                localNodeToken: typeof localNodeToken === 'string' ? localNodeToken : undefined,
+                enableCloudVerification: effectiveCloudVerification,
+                abortSignal: abortController.signal,
+                onProgress: (ev) => {
+                  const snap: ServerOperationProgress = {
+                    operationId: operationId || jobId,
+                    ...ev,
+                    status: 'running',
+                    updatedAtMs: Date.now()
+                  };
+                  jobRecord.latestProgress = snap;
+                  jobRecord.updatedAtMs = snap.updatedAtMs;
+                  emitServerOperationProgress(operationId, {
+                    ...ev,
+                    status: 'running'
+                  });
+                }
+              });
+
+              if (jobRecord.status === 'cancelled' || abortController.signal.aborted) {
+                await refundVoiceCloneJobTokensOnce(
+                  jobRecord,
+                  'Automatic refund: Voice Cloning job was cancelled'
+                );
+                return;
+              }
+
+              if (effectiveSavedVoiceId) {
+                const sv = savedVoicesRegistry.get(effectiveSavedVoiceId);
+                if (sv) {
+                  const usedIso = new Date().toISOString();
+                  sv.usageCount = (sv.usageCount || 0) + 1;
+                  sv.lastUsedAt = usedIso;
+                  sv.updatedAt = usedIso;
+                  await persistSavedVoiceProfileRecord(sv);
+                  if (bearerToken) {
+                    void incrementSavedVoiceUsageInFirestore(bearerToken, effectiveSavedVoiceId);
+                  }
+                }
+              }
+
+              jobRecord.status = 'succeeded';
+              jobRecord.result = result;
+              jobRecord.updatedAtMs = Date.now();
+              emitServerOperationProgress(operationId, {
+                stageIndex: 4,
+                stageLabel: 'Voice cloning completed',
+                progressPct: 100,
+                progressSource: 'completed',
+                status: 'succeeded'
+              });
+            } catch (err: any) {
+              const wasCancelled =
+                jobRecord.status === 'cancelled' ||
+                abortController.signal.aborted ||
+                err?.code === 'JOB_CANCELLED';
+              await refundVoiceCloneJobTokensOnce(
+                jobRecord,
+                wasCancelled
+                  ? 'Automatic refund: Voice Cloning job cancelled'
+                  : 'Automatic refund: Voice Cloning pipeline failed before completion'
+              );
+              const quotaInfo = extractQuotaExhaustedInfo(err);
+              const rawStatus =
+                typeof err?.httpStatus === 'number'
+                  ? err.httpStatus
+                  : quotaInfo.isQuotaExhausted
+                  ? 429
+                  : 400;
+              const safeStatus = rawStatus === 403 ? 401 : rawStatus;
+              jobRecord.status = wasCancelled ? 'cancelled' : 'failed';
+              jobRecord.error = err?.message || 'Voice cloning pipeline failed.';
+              jobRecord.code =
+                err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED');
+              jobRecord.httpStatus = safeStatus;
+              jobRecord.retryAfterText = err?.retryAfterText || quotaInfo.retryAfterText;
+              jobRecord.updatedAtMs = Date.now();
+              emitServerOperationProgress(operationId, {
+                stageIndex: 1,
+                stageLabel: jobRecord.error || 'Voice cloning failed',
+                progressPct: null,
+                progressSource: 'indeterminate-inference',
+                status: 'failed'
+              });
+            }
+          })();
+          return;
+        }
+
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            abortController.abort();
+          }
+        });
+
         const result = await executeSameLanguageVoiceCloning({
           jobId,
           referenceFilePath: refEntry.filePath,
+          preConditionedPromptPath,
+          savedVoiceId: effectiveSavedVoiceId,
           referenceAnalysis: refEntry.analysis,
           language: language as CloningLanguageCode,
           text: String(text || ''),
-          referenceTranscript:
-            typeof referenceTranscript === 'string' ? referenceTranscript : undefined,
+          referenceTranscript: effectiveReferenceTranscript,
+          audioQuality: validatedAudioQuality,
           preservePitchContour: Boolean(preservePitchContour),
           preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
           reuseCompletedChunks: Boolean(reuseCompletedChunks),
           outputDir: GENERATED_DIR,
           localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
           localNodeToken: typeof localNodeToken === 'string' ? localNodeToken : undefined,
-          enableCloudVerification: Boolean(enableCloudVerification),
+          enableCloudVerification: effectiveCloudVerification,
+          abortSignal: abortController.signal,
           onProgress: (ev) => {
             emitServerOperationProgress(operationId, {
               ...ev,
@@ -1288,6 +2666,20 @@ async function startServer() {
             });
           }
         });
+
+        if (effectiveSavedVoiceId) {
+          const sv = savedVoicesRegistry.get(effectiveSavedVoiceId);
+          if (sv) {
+            const usedIso = new Date().toISOString();
+            sv.usageCount = (sv.usageCount || 0) + 1;
+            sv.lastUsedAt = usedIso;
+            sv.updatedAt = usedIso;
+            await persistSavedVoiceProfileRecord(sv);
+            if (bearerToken) {
+              void incrementSavedVoiceUsageInFirestore(bearerToken, effectiveSavedVoiceId);
+            }
+          }
+        }
 
         emitServerOperationProgress(operationId, {
           stageIndex: 4,
@@ -1297,8 +2689,21 @@ async function startServer() {
           status: 'succeeded'
         });
 
-        res.status(200).type('application/json').json({ result });
+        if (!res.headersSent) {
+          res.status(200).type('application/json').json({ result });
+        }
       } catch (err: any) {
+        if (deductedTokens > 0 && deductedUser) {
+          applyAtomicTokenDelta({
+            uid: deductedUser.uid,
+            email: deductedUser.email,
+            delta: deductedTokens,
+            type: 'refund',
+            reason: 'Automatic refund: Voice Cloning pipeline failed before completion',
+            actorUid: 'system'
+          });
+          await persistGovernanceState();
+        }
         const operationId = extractOperationIdFromReq(req);
         const quotaInfo = extractQuotaExhaustedInfo(err);
         const rawStatus =
@@ -1316,14 +2721,97 @@ async function startServer() {
           progressSource: 'indeterminate-inference',
           status: 'failed'
         });
-        res.status(safeStatus).type('application/json').json({
-          error: err?.message || 'Voice cloning pipeline failed.',
-          code: err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED'),
-          retryAfterText: err?.retryAfterText || quotaInfo.retryAfterText
-        });
+        if (!res.headersSent) {
+          res.status(safeStatus).type('application/json').json({
+            error: err?.message || 'Voice cloning pipeline failed.',
+            code: err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED'),
+            retryAfterText: err?.retryAfterText || quotaInfo.retryAfterText
+          });
+        }
       }
     }
   );
+
+  // 7b. Poll status / result of an async Voice Cloning job (session/user scoped)
+  app.get('/api/voice-clone/jobs/:jobId', requireAuthenticatedSession, (req, res) => {
+    const jobId = String(req.params.jobId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(jobId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid job identifier.' });
+      return;
+    }
+    const job = voiceCloneJobsRegistry.get(jobId);
+    if (!job) {
+      res.status(404).type('application/json').json({
+        error: 'Voice cloning job not found or expired.',
+        code: 'JOB_NOT_FOUND'
+      });
+      return;
+    }
+    const sess = (req as any).voicelabSession as VerifiedSessionState | undefined;
+    const fbIdentity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity | null;
+    const ownsBySession = Boolean(sess?.sessionId && job.sessionId && sess.sessionId === job.sessionId);
+    const ownsByUid = Boolean(fbIdentity?.uid && job.uid && fbIdentity.uid === job.uid);
+    if (!ownsBySession && !ownsByUid) {
+      res.status(403).type('application/json').json({
+        error: 'Access denied for this voice cloning job.',
+        code: 'JOB_FORBIDDEN'
+      });
+      return;
+    }
+
+    res.status(200).type('application/json').json({
+      jobId: job.jobId,
+      status: job.status,
+      operation: job.latestProgress || null,
+      result: job.status === 'succeeded' ? job.result : undefined,
+      error: job.status === 'failed' || job.status === 'cancelled' ? job.error : undefined,
+      code: job.code,
+      httpStatus: job.httpStatus,
+      retryAfterText: job.retryAfterText
+    });
+  });
+
+  // 7c. Cancel a running async Voice Cloning job cleanly
+  app.post('/api/voice-clone/jobs/:jobId/cancel', requireAuthenticatedSession, async (req, res) => {
+    const jobId = String(req.params.jobId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(jobId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid job identifier.' });
+      return;
+    }
+    const job = voiceCloneJobsRegistry.get(jobId);
+    if (!job) {
+      res.status(404).type('application/json').json({ error: 'Voice cloning job not found.' });
+      return;
+    }
+    const sess = (req as any).voicelabSession as VerifiedSessionState | undefined;
+    const fbIdentity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity | null;
+    const ownsBySession = Boolean(sess?.sessionId && job.sessionId && sess.sessionId === job.sessionId);
+    const ownsByUid = Boolean(fbIdentity?.uid && job.uid && fbIdentity.uid === job.uid);
+    if (!ownsBySession && !ownsByUid) {
+      res.status(403).type('application/json').json({ error: 'Access denied for this voice cloning job.' });
+      return;
+    }
+
+    if (job.status === 'running') {
+      job.status = 'cancelled';
+      job.error = 'Cancelled by user';
+      job.code = 'JOB_CANCELLED';
+      job.updatedAtMs = Date.now();
+      job.abortController.abort();
+      await refundVoiceCloneJobTokensOnce(
+        job,
+        'Automatic refund: Voice Cloning job cancelled by user'
+      );
+      emitServerOperationProgress(job.operationId, {
+        stageIndex: 1,
+        stageLabel: 'Voice cloning cancelled',
+        progressPct: null,
+        progressSource: 'indeterminate-inference',
+        status: 'failed'
+      });
+    }
+    res.status(200).type('application/json').json({ status: job.status, jobId: job.jobId });
+  });
 
   // 8. WORKSPACE B — Universal Multilingual Audio-to-SRT Transcription
   // Supports both direct multipart File/Blob upload ('audio' field) AND uploaded fileId JSON reference.
@@ -1408,32 +2896,58 @@ async function startServer() {
         return;
       }
 
-      const jobId = `srt_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-      const result = await executeMultilingualSrtPipeline({
-        jobId,
-        filePath: targetFilePath,
-        originalFileName: targetFileName,
-        durationSeconds: targetDurationSeconds,
-        requestedLanguage,
-        audioPreviewUrl: targetPreviewUrl,
-        onProgress: (ev) => {
-          emitServerOperationProgress(operationId, {
-            ...ev,
-            status: 'running'
-          });
+      res.setTimeout?.(10 * 60 * 1000);
+      const abortController = new AbortController();
+      const handleResponseClose = () => {
+        if (!res.writableEnded) {
+          abortController.abort();
         }
-      });
+      };
+      res.on('close', handleResponseClose);
 
-      emitServerOperationProgress(operationId, {
-        stageIndex: 2,
-        stageLabel: `Generated ${result.segments.length} SRT subtitle blocks`,
-        progressPct: 100,
-        progressSource: 'completed',
-        status: 'succeeded'
-      });
+      const jobId = `srt_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      try {
+        const result = await executeMultilingualSrtPipeline({
+          jobId,
+          filePath: targetFilePath,
+          originalFileName: targetFileName,
+          durationSeconds: targetDurationSeconds,
+          requestedLanguage,
+          audioPreviewUrl: targetPreviewUrl,
+          signal: abortController.signal,
+          onProgress: (ev) => {
+            emitServerOperationProgress(operationId, {
+              ...ev,
+              status: 'running'
+            });
+          }
+        });
 
-      res.status(200).type('application/json').json({ result });
+        emitServerOperationProgress(operationId, {
+          stageIndex: 2,
+          stageLabel: `Generated ${result.segments.length} SRT subtitle blocks`,
+          progressPct: 100,
+          progressSource: 'completed',
+          status: 'succeeded'
+        });
+
+        if (!res.headersSent && !res.writableEnded) {
+          res.status(200).type('application/json').json({ result });
+        }
+      } finally {
+        res.off('close', handleResponseClose);
+      }
     } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        emitServerOperationProgress(operationId, {
+          stageIndex: 1,
+          stageLabel: 'SRT transcription cancelled',
+          progressPct: null,
+          progressSource: 'indeterminate-inference',
+          status: 'failed'
+        });
+        return;
+      }
       emitServerOperationProgress(operationId, {
         stageIndex: 1,
         stageLabel: err?.message || 'SRT transcription failed',
@@ -1441,25 +2955,110 @@ async function startServer() {
         progressSource: 'indeterminate-inference',
         status: 'failed'
       });
-      res.status(422).type('application/json').json({
-        error: err?.message || 'Multilingual SRT transcription failed for the uploaded audio.'
+      const errMsg = err?.message || 'Multilingual SRT transcription failed for the uploaded audio.';
+      const statusCode =
+        typeof err?.httpStatus === 'number' && [400, 422, 429, 503].includes(err.httpStatus)
+          ? err.httpStatus
+          : /HTTP 503|UNAVAILABLE/i.test(errMsg)
+          ? 503
+          : 422;
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(statusCode).type('application/json').json({
+          error: errMsg
+        });
+      }
+    }
+  };
+
+  const guardedSrtHandler = async (req: express.Request, res: express.Response) => {
+    const fbIdentity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity | null;
+    const isOwnerActor = fbIdentity?.role === 'owner';
+    if (!serverGovernancePolicy.allowSrtGeneration && !isOwnerActor) {
+      res.status(423).type('application/json').json({
+        error: 'Audio-to-SRT is currently paused by the Administrator.',
+        code: 'FEATURE_DISABLED_BY_ADMIN'
       });
+      return;
+    }
+    const srtGate = checkFeatureAccessGate(fbIdentity, 'srt_generator');
+    if (!srtGate.allowed) {
+      res.status(srtGate.statusCode).type('application/json').json({
+        error: srtGate.error,
+        code: srtGate.code,
+        featureKey: 'srt_generator'
+      });
+      return;
+    }
+
+    let deductedTokens = 0;
+    if (!isOwnerActor && srtGate.tokenCost > 0) {
+      if (!fbIdentity) {
+        res.status(401).type('application/json').json({
+          error: 'Sign in with Google required to use token-gated Audio-to-SRT.',
+          code: 'AUTH_REQUIRED_FOR_TOKEN_FEATURE',
+          requiredTokens: srtGate.tokenCost
+        });
+        return;
+      }
+      const debit = applyAtomicTokenDelta({
+        uid: fbIdentity.uid,
+        email: fbIdentity.email,
+        delta: -srtGate.tokenCost,
+        type: 'feature_debit',
+        reason: 'Audio-to-SRT transcription job',
+        actorUid: fbIdentity.uid
+      });
+      if (!debit.ok) {
+        res.status(402).type('application/json').json({
+          error: debit.error,
+          code: 'INSUFFICIENT_TOKENS',
+          requiredTokens: srtGate.tokenCost,
+          tokenBalance: debit.balanceAfter
+        });
+        return;
+      }
+      deductedTokens = srtGate.tokenCost;
+      await persistGovernanceState();
+    }
+
+    // Track response outcome so unexpected pre-completion errors refund deducted tokens
+    const origStatus = res.status.bind(res);
+    let capturedStatus = 200;
+    (res as any).status = (code: number) => {
+      capturedStatus = code;
+      return origStatus(code);
+    };
+
+    await handleSrtTranscriptionRequest(req, res);
+
+    if (deductedTokens > 0 && fbIdentity && capturedStatus >= 400) {
+      applyAtomicTokenDelta({
+        uid: fbIdentity.uid,
+        email: fbIdentity.email,
+        delta: deductedTokens,
+        type: 'refund',
+        reason: 'Automatic refund: Audio-to-SRT request did not complete',
+        actorUid: 'system'
+      });
+      await persistGovernanceState();
     }
   };
 
   app.post(
     '/api/srt/transcribe',
     requireAuthenticatedSession,
+    enforceGovernanceComputeGuard,
     enforceComputeRateLimit,
     handleAudioUploadMiddleware,
-    handleSrtTranscriptionRequest
+    guardedSrtHandler
   );
   app.post(
     '/api/srt/generate',
     requireAuthenticatedSession,
+    enforceGovernanceComputeGuard,
     enforceComputeRateLimit,
     handleAudioUploadMiddleware,
-    handleSrtTranscriptionRequest
+    guardedSrtHandler
   );
 
   // 9. Ephemeral Storage Manual Purge Endpoint
@@ -1492,7 +3091,1333 @@ async function startServer() {
     res.status(200).type('application/json').json({
       status: 'cleaned',
       deletedFilesCount: deletedCount,
-      message: 'All temporary user uploads and generated audio files have been permanently removed.'
+      message: 'All temporary user uploads and generated audio files have been permanently removed. Persistent saved voice profiles remain intact.'
+    });
+  });
+
+  // 9b. Persistent User-Specific Saved Voice Profiles Endpoints (Strictly Owner-Isolated + Cloud Permanent)
+  app.get('/api/voices', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+
+    const localForUser = Array.from(savedVoicesRegistry.values()).filter(
+      (v) => v.ownerUid === identity.uid
+    );
+    const mergedByVoiceId = new Map<string, SavedVoiceProfile>();
+    for (const rec of localForUser) {
+      mergedByVoiceId.set(rec.voiceId, serializeSavedVoiceProfile(rec));
+    }
+
+    if (bearerToken) {
+      const cloudProfiles = await listUserSavedVoicesFromFirestore(bearerToken, identity.uid);
+      await Promise.all(
+        cloudProfiles.map(async (cp) => {
+          const localRec = savedVoicesRegistry.get(cp.voiceId);
+          if (localRec && hasVaultConditioningAudio(localRec)) {
+            mergedByVoiceId.set(cp.voiceId, serializeSavedVoiceProfile(localRec, true));
+            // Automatically backfill cloud lossless FLAC chunks for any older voice saved before cloud audio sync
+            const vp = resolveVaultVoicePaths(identity.uid, cp.voiceId);
+            if (vp) {
+              void checkCloudConditioningExists(bearerToken, cp.voiceId, identity.uid).then(
+                (hasCloud) => {
+                  if (!hasCloud) {
+                    void persistSavedVoiceAndAudioToFirestore({
+                      bearerToken,
+                      profile: serializeSavedVoiceProfile(localRec, true),
+                      refWavPath: vp.refWavPath,
+                      promptWavPath: vp.promptWavPath,
+                      vaultDir: vp.dir
+                    });
+                  }
+                }
+              );
+            }
+            return;
+          }
+
+          // Cold server restart or cross-device login: verify cloud conditioning chunks and warm disk vault
+          const hasCloudChunks = await checkCloudConditioningExists(
+            bearerToken,
+            cp.voiceId,
+            identity.uid
+          );
+          const syntheticRec: ServerSavedVoiceRecord = {
+            ...cp,
+            hasConditioningAudio: hasCloudChunks,
+            referenceAnalysis: buildSyntheticAnalysisFromProfile(cp)
+          };
+          savedVoicesRegistry.set(cp.voiceId, syntheticRec);
+          mergedByVoiceId.set(cp.voiceId, serializeSavedVoiceProfile(syntheticRec, hasCloudChunks));
+
+          if (hasCloudChunks) {
+            void ensureSavedVoiceHydratedOnServer(cp.voiceId, identity, bearerToken);
+          }
+        })
+      );
+    }
+
+    const voices = Array.from(mergedByVoiceId.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+
+    res.status(200).type('application/json').json({ voices });
+  });
+
+  app.post('/api/voices', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+    try {
+      const {
+        referenceFileId,
+        name,
+        language,
+        referenceTranscript,
+        modelCheckpoint,
+        sourceType = 'cloned_output',
+        consentConfirmed = false,
+        deduplicateByPromptHash = false
+      } = req.body || {};
+
+      if (!consentConfirmed) {
+        res.status(400).type('application/json').json({
+          error:
+            'Consent confirmation required: You must confirm ownership or explicit authorization before saving a voice profile.'
+        });
+        return;
+      }
+
+      if (!['bn', 'hi', 'en'].includes(language)) {
+        res.status(400).type('application/json').json({
+          error: 'Invalid language for saved voice profile. Supported: bn, hi, en.'
+        });
+        return;
+      }
+
+      const cleanRefId = typeof referenceFileId === 'string' ? referenceFileId.trim() : '';
+      if (!cleanRefId || !SAFE_IDENTIFIER_REGEX.test(cleanRefId)) {
+        res.status(400).type('application/json').json({
+          error: 'Valid reference audio identifier is required to save a voice profile.'
+        });
+        return;
+      }
+
+      const refEntry =
+        uploadedFilesRegistry.get(cleanRefId) || (await resolveUploadedFileEntry(cleanRefId));
+      if (!refEntry || !fs.existsSync(refEntry.filePath)) {
+        res.status(404).type('application/json').json({
+          error:
+            'Reference audio recording was not found. Please upload or record reference audio before saving.'
+        });
+        return;
+      }
+
+      const detectedRefCode = refEntry.analysis.detectedSpokenLanguage?.code;
+      if (
+        detectedRefCode &&
+        ['bn', 'hi', 'en'].includes(detectedRefCode) &&
+        detectedRefCode !== language
+      ) {
+        res.status(400).type('application/json').json({
+          error: `Cross-Language Blocked: Reference audio language (${detectedRefCode.toUpperCase()}) does not match selected language (${String(language).toUpperCase()}).`
+        });
+        return;
+      }
+
+      const existingCountForUser = Array.from(savedVoicesRegistry.values()).filter(
+        (v) => v.ownerUid === identity.uid
+      ).length;
+      if (existingCountForUser >= 50) {
+        res.status(400).type('application/json').json({
+          error: 'Maximum limit of 50 saved voice profiles per account reached. Delete an unused profile first.'
+        });
+        return;
+      }
+
+      const langLabels: Record<CloningLanguageCode, string> = {
+        bn: 'বাংলা (Bengali)',
+        hi: 'हिन्दी (Hindi)',
+        en: 'English'
+      };
+      const voiceId = `vp_${language}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const vaultPaths = resolveVaultVoicePaths(identity.uid, voiceId);
+      if (!vaultPaths) {
+        res.status(400).type('application/json').json({ error: 'Invalid user or voice profile identifier.' });
+        return;
+      }
+
+      await fs.promises.mkdir(vaultPaths.dir, { recursive: true });
+
+      // Canonical 24kHz mono PCM WAV conversion
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          refEntry.filePath,
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          vaultPaths.refWavPath
+        ],
+        { timeout: 15_000 }
+      );
+
+      const refBytes = await fs.promises.readFile(vaultPaths.refWavPath);
+      const speakerConditioningSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+
+      // Extract & persist exact canonical silence-trimmed 5.5s conditioning prompt WAV
+      const promptBytes = await prepareCanonicalSpeakerPromptWav(
+        refBytes,
+        vaultPaths.dir,
+        speakerConditioningSha256
+      );
+      await fs.promises.writeFile(vaultPaths.promptWavPath, promptBytes);
+      const promptConditioningSha256 = crypto
+        .createHash('sha256')
+        .update(promptBytes)
+        .digest('hex');
+
+      // Check deterministic speaker deduplication if auto-saving after generation
+      if (deduplicateByPromptHash) {
+        const duplicate = Array.from(savedVoicesRegistry.values()).find(
+          (v) =>
+            v.ownerUid === identity.uid &&
+            v.language === language &&
+            (v.promptConditioningSha256 === promptConditioningSha256 ||
+              v.speakerConditioningSha256 === speakerConditioningSha256)
+        );
+        if (duplicate && hasVaultConditioningAudio(duplicate)) {
+          await fs.promises.rm(vaultPaths.dir, { recursive: true, force: true }).catch(() => {});
+          const nowIso = new Date().toISOString();
+          duplicate.usageCount = (duplicate.usageCount || 0) + 1;
+          duplicate.lastUsedAt = nowIso;
+          duplicate.updatedAt = nowIso;
+          await persistSavedVoiceProfileRecord(duplicate);
+
+          const dupVaultPaths = resolveVaultVoicePaths(duplicate.ownerUid, duplicate.voiceId);
+          if (bearerToken && dupVaultPaths) {
+            void persistSavedVoiceAndAudioToFirestore({
+              bearerToken,
+              profile: serializeSavedVoiceProfile(duplicate, true),
+              refWavPath: dupVaultPaths.refWavPath,
+              promptWavPath: dupVaultPaths.promptWavPath,
+              vaultDir: dupVaultPaths.dir
+            });
+            void incrementSavedVoiceUsageInFirestore(bearerToken, duplicate.voiceId);
+          }
+
+          res.status(200).type('application/json').json({
+            voice: serializeSavedVoiceProfile(duplicate, true),
+            deduplicated: true,
+            cloudSynced: true
+          });
+          return;
+        }
+      }
+
+      const canonicalAnalysis = await inspectAndValidateAudioFile(
+        vaultPaths.refWavPath,
+        voiceId,
+        refEntry.analysis.fileName || `${voiceId}.wav`,
+        'audio/wav',
+        `/api/voices/${encodeURIComponent(voiceId)}/preview`
+      );
+      if (refEntry.analysis.detectedSpokenLanguage) {
+        canonicalAnalysis.detectedSpokenLanguage = refEntry.analysis.detectedSpokenLanguage;
+      }
+
+      const promptDurationSec = Number(
+        Math.max(0.3, (promptBytes.length - 44) / (24000 * 2)).toFixed(2)
+      );
+
+      const cleanNameRaw = String(name || '').trim().slice(0, 80);
+      const defaultName = `${langLabels[language as CloningLanguageCode]} Voice #${existingCountForUser + 1}`;
+      const finalName = cleanNameRaw.length >= 1 ? cleanNameRaw : defaultName;
+
+      const cleanTranscript = String(
+        referenceTranscript ||
+          refEntry.analysis.detectedSpokenLanguage?.transcriptExcerpt ||
+          ''
+      )
+        .trim()
+        .slice(0, 1000);
+
+      const validSourceTypes: SavedVoiceSourceType[] = [
+        'cloned_output',
+        'reference_upload',
+        'microphone',
+        'studio_sample'
+      ];
+      const safeSourceType: SavedVoiceSourceType = validSourceTypes.includes(sourceType)
+        ? sourceType
+        : cleanRefId.startsWith('sample_ref_')
+        ? 'studio_sample'
+        : String(refEntry.analysis.fileName || '').startsWith('mic_reference_')
+        ? 'microphone'
+        : 'reference_upload';
+
+      const defaultModelCheckpoint =
+        language === 'en'
+          ? 'SWivid/F5-TTS · ChatterboxTTS Zero-Shot'
+          : language === 'hi'
+          ? 'ai4bharat/IndicF5 (Zero-Shot Flow-Matching DiT)'
+          : 'ai4bharat/IndicF5 · Fun-CosyVoice3 Bengali Zero-Shot';
+
+      const nowIso = new Date().toISOString();
+      const record: ServerSavedVoiceRecord = {
+        voiceId,
+        ownerUid: identity.uid,
+        ownerEmail: identity.email,
+        name: finalName,
+        language: language as CloningLanguageCode,
+        languageName: langLabels[language as CloningLanguageCode],
+        conditioningMethod: 'zero-shot-canonical-wav-v1',
+        modelCheckpoint:
+          String(modelCheckpoint || defaultModelCheckpoint).trim().slice(0, 160) ||
+          defaultModelCheckpoint,
+        speakerConditioningSha256,
+        promptConditioningSha256,
+        referenceTranscript: cleanTranscript,
+        referenceDurationSec: Number(canonicalAnalysis.durationSeconds || refEntry.analysis.durationSeconds || 1),
+        promptDurationSec,
+        fundamentalFreqHz: Number(canonicalAnalysis.fundamentalFreqHz || refEntry.analysis.fundamentalFreqHz || 0),
+        pitchMinHz: Number(canonicalAnalysis.pitchRangeHz?.[0] || 0),
+        pitchMaxHz: Number(canonicalAnalysis.pitchRangeHz?.[1] || 0),
+        spectralWarmthRatio: Number(canonicalAnalysis.spectralWarmthRatio || 0),
+        estimatedSnrDb: Number(canonicalAnalysis.estimatedSnrDb || 0),
+        qualityGrade: canonicalAnalysis.qualityGrade || 'Good',
+        sourceType: safeSourceType,
+        sourceFileName: String(refEntry.analysis.fileName || `${voiceId}.wav`).slice(0, 160),
+        storageKey: vaultPaths.storageKey,
+        consentConfirmed: true,
+        usageCount: 0,
+        hasConditioningAudio: true,
+        lastUsedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        referenceAnalysis: {
+          ...canonicalAnalysis,
+          fileId: voiceId,
+          previewUrl: `/api/voices/${encodeURIComponent(voiceId)}/preview`
+        }
+      };
+
+      await persistSavedVoiceProfileRecord(record);
+      const serialized = serializeSavedVoiceProfile(record, true);
+
+      // Persist BOTH metadata and lossless FLAC conditioning audio chunks to Firestore immediately
+      const cloudPersist = await persistSavedVoiceAndAudioToFirestore({
+        bearerToken,
+        profile: serialized,
+        refWavPath: vaultPaths.refWavPath,
+        promptWavPath: vaultPaths.promptWavPath,
+        vaultDir: vaultPaths.dir
+      });
+
+      if (!cloudPersist.synced) {
+        console.warn(
+          `[VoiceLab VaultSync] Cloud persistence notice for ${record.voiceId}:`,
+          cloudPersist.error
+        );
+      }
+
+      recordServerSecurityEvent(
+        'VOICE_PROFILE_SAVED',
+        identity.email,
+        `Saved ${record.voiceId} (${record.language}, promptSha=${promptConditioningSha256.slice(0, 10)}, cloudSynced=${cloudPersist.synced})`
+      );
+
+      res.status(201).type('application/json').json({
+        voice: serialized,
+        cloudSynced: cloudPersist.synced,
+        cloudSyncWarning: cloudPersist.synced ? undefined : cloudPersist.error
+      });
+    } catch (err: any) {
+      res.status(400).type('application/json').json({
+        error: err?.message || 'Failed to save persistent voice profile.'
+      });
+    }
+  });
+
+  app.patch('/api/voices/:voiceId', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+    const voiceId = String(req.params.voiceId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(voiceId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid voice profile identifier.' });
+      return;
+    }
+
+    const existing =
+      savedVoicesRegistry.get(voiceId) ||
+      (await ensureSavedVoiceHydratedOnServer(voiceId, identity, bearerToken));
+    if (!existing) {
+      res.status(404).type('application/json').json({ error: 'Saved voice profile not found.' });
+      return;
+    }
+    if (existing.ownerUid !== identity.uid) {
+      recordServerSecurityEvent(
+        'UNAUTHORIZED_VOICE_RENAME',
+        identity.email,
+        `Blocked rename attempt on ${voiceId}`
+      );
+      res.status(403).type('application/json').json({
+        error: 'Access denied: You can only rename your own saved voice profiles.',
+        code: 'VOICE_FORBIDDEN'
+      });
+      return;
+    }
+
+    const nextName = String(req.body?.name || '').trim().slice(0, 80);
+    if (!nextName) {
+      res.status(400).type('application/json').json({ error: 'Voice profile name cannot be empty.' });
+      return;
+    }
+
+    existing.name = nextName;
+    existing.updatedAt = new Date().toISOString();
+    await persistSavedVoiceProfileRecord(existing);
+    if (bearerToken) {
+      await renameSavedVoiceInFirestore(bearerToken, voiceId, nextName).catch(() => {});
+    }
+
+    res.status(200).type('application/json').json({
+      voice: serializeSavedVoiceProfile(existing)
+    });
+  });
+
+  app.delete('/api/voices/:voiceId', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+    const voiceId = String(req.params.voiceId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(voiceId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid voice profile identifier.' });
+      return;
+    }
+
+    let existing: ServerSavedVoiceRecord | SavedVoiceProfile | undefined =
+      savedVoicesRegistry.get(voiceId);
+    if (!existing && bearerToken) {
+      const cloudDoc = await fetchSingleSavedVoiceFromFirestore(bearerToken, voiceId);
+      if (cloudDoc) existing = cloudDoc;
+    }
+    if (!existing) {
+      res.status(404).type('application/json').json({ error: 'Saved voice profile not found.' });
+      return;
+    }
+    if (existing.ownerUid !== identity.uid) {
+      recordServerSecurityEvent(
+        'UNAUTHORIZED_VOICE_DELETE',
+        identity.email,
+        `Blocked delete attempt on ${voiceId}`
+      );
+      res.status(403).type('application/json').json({
+        error: 'Access denied: You can only delete your own saved voice profiles.',
+        code: 'VOICE_FORBIDDEN'
+      });
+      return;
+    }
+
+    const vaultPaths = resolveVaultVoicePaths(existing.ownerUid, existing.voiceId);
+    if (vaultPaths) {
+      await fs.promises.rm(vaultPaths.dir, { recursive: true, force: true }).catch(() => {});
+    }
+    savedVoicesRegistry.delete(voiceId);
+    await persistSavedVoicesIndex().catch(() => {});
+    await deleteSavedVoiceFromFirestore(bearerToken, voiceId, identity.uid);
+
+    recordServerSecurityEvent(
+      'VOICE_PROFILE_DELETED',
+      identity.email,
+      `Deleted ${voiceId} and associated conditioning audio`
+    );
+
+    res.status(200).type('application/json').json({
+      ok: true,
+      deletedVoiceId: voiceId
+    });
+  });
+
+  // Private owner-only audio preview stream (hydrates automatically from cloud vault on cold server restarts)
+  app.get('/api/voices/:voiceId/preview', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+    const voiceId = String(req.params.voiceId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(voiceId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid voice profile identifier.' });
+      return;
+    }
+
+    const existing = await ensureSavedVoiceHydratedOnServer(voiceId, identity, bearerToken);
+    if (!existing) {
+      res.status(404).type('application/json').json({ error: 'Saved voice profile not found.' });
+      return;
+    }
+    if (existing.ownerUid !== identity.uid) {
+      recordServerSecurityEvent(
+        'UNAUTHORIZED_VOICE_PREVIEW',
+        identity.email,
+        `Blocked preview stream on ${voiceId}`
+      );
+      res.status(403).type('application/json').json({
+        error: 'Access denied: Reference audio previews are strictly private to the profile owner.',
+        code: 'VOICE_FORBIDDEN'
+      });
+      return;
+    }
+
+    const vaultPaths = resolveVaultVoicePaths(existing.ownerUid, existing.voiceId);
+    if (!vaultPaths || !fs.existsSync(vaultPaths.refWavPath)) {
+      res.status(404).type('application/json').json({
+        error: 'Stored speaker reference audio file was not found.'
+      });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Cache-Control', 'private, no-store');
+    fs.createReadStream(vaultPaths.refWavPath).pipe(res);
+  });
+
+  // 10. Verified User Identity, Public Catalog, and Purchase Endpoints (Zero Owner/Payment Secrets Leaked)
+  app.get('/api/auth/me', requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const nowIso = new Date().toISOString();
+    const existing = serverUsersRegistry[identity.uid];
+    serverUsersRegistry[identity.uid] = {
+      uid: identity.uid,
+      email: identity.email,
+      displayName: identity.displayName || existing?.displayName || identity.email.split('@')[0],
+      role: identity.role,
+      accountStatus: existing?.accountStatus || 'active',
+      createdAt: existing?.createdAt || nowIso,
+      lastSeenAt: nowIso
+    };
+    const ent = ensureUserEntitlementRecord(identity.uid, identity.email);
+    await persistGovernanceState();
+
+    const myRequests = serverPaymentRequests
+      .filter((r) => r.userUid === identity.uid)
+      .slice(0, 25);
+    const myLedger = serverTokenLedger
+      .filter((l) => l.userUid === identity.uid)
+      .slice(0, 25);
+
+    res.status(200).type('application/json').json({
+      authenticated: true,
+      uid: identity.uid,
+      email: identity.email,
+      displayName: serverUsersRegistry[identity.uid].displayName,
+      isOwner: identity.role === 'owner',
+      role: identity.role,
+      accountStatus: serverUsersRegistry[identity.uid].accountStatus,
+      entitlement: ent,
+      tokenBalance: ent.tokenBalance,
+      tokenLedger: myLedger,
+      paymentRequests: myRequests
+    });
+  });
+
+  app.get('/api/governance/public', (_req, res) => {
+    res.status(200).type('application/json').json({
+      governance: serverGovernancePolicy,
+      organizationName: serverOwnershipState.organizationName
+    });
+  });
+
+  app.get('/api/catalog/public', async (_req, res) => {
+    const availableMethods: PaymentMethodId[] = [];
+    if (serverPaymentSettings.bkashEnabled && serverPaymentSettings.bkashNumber.trim().length >= 11) {
+      availableMethods.push('bkash');
+    }
+    if (serverPaymentSettings.nagadEnabled && serverPaymentSettings.nagadNumber.trim().length >= 11) {
+      availableMethods.push('nagad');
+    }
+
+    res.status(200).type('application/json').json({
+      governance: serverGovernancePolicy,
+      features: serverFeatureConfigs,
+      featurePackages: serverFeaturePackages.filter((p) => p.enabled),
+      tokenPackages: serverTokenPackages.filter((p) => p.enabled),
+      availablePaymentMethods: availableMethods
+    });
+  });
+
+  app.get('/api/payments/my', requireAuthenticatedSession, requireVerifiedUser, (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const ent = ensureUserEntitlementRecord(identity.uid, identity.email);
+    res.status(200).type('application/json').json({
+      uid: identity.uid,
+      tokenBalance: ent.tokenBalance,
+      entitlement: ent,
+      paymentRequests: serverPaymentRequests.filter((r) => r.userUid === identity.uid).slice(0, 30),
+      tokenLedger: serverTokenLedger.filter((l) => l.userUid === identity.uid).slice(0, 30)
+    });
+  });
+
+  // Returns payment instructions strictly for the specific chosen package and method
+  app.post('/api/payments/instructions', requireAuthenticatedSession, requireVerifiedUser, (req, res) => {
+    const { itemType, itemId, paymentMethod } = req.body || {};
+    if (!['feature_package', 'token_package'].includes(itemType)) {
+      res.status(400).type('application/json').json({ error: 'Invalid purchase type.' });
+      return;
+    }
+    if (!['bkash', 'nagad'].includes(paymentMethod)) {
+      res.status(400).type('application/json').json({ error: 'Select bKash or Nagad payment method.' });
+      return;
+    }
+
+    const method = paymentMethod as PaymentMethodId;
+    const methodEnabled =
+      method === 'bkash' ? serverPaymentSettings.bkashEnabled : serverPaymentSettings.nagadEnabled;
+    const receiverNumber = (
+      method === 'bkash' ? serverPaymentSettings.bkashNumber : serverPaymentSettings.nagadNumber
+    ).trim();
+    const accountType =
+      method === 'bkash' ? serverPaymentSettings.bkashAccountType : serverPaymentSettings.nagadAccountType;
+    const instructions =
+      method === 'bkash'
+        ? serverPaymentSettings.bkashInstructions
+        : serverPaymentSettings.nagadInstructions;
+
+    if (!methodEnabled || receiverNumber.length < 11) {
+      res.status(423).type('application/json').json({
+        error: `${method === 'bkash' ? 'bKash' : 'Nagad'} payment is currently not configured or disabled by the administrator.`
+      });
+      return;
+    }
+
+    if (itemType === 'feature_package') {
+      const pkg = serverFeaturePackages.find((p) => p.id === itemId && p.enabled);
+      if (!pkg) {
+        res.status(404).type('application/json').json({ error: 'Feature package not found or disabled.' });
+        return;
+      }
+      res.status(200).type('application/json').json({
+        itemType,
+        itemId: pkg.id,
+        itemTitle: pkg.title,
+        amountBdt: pkg.priceBdt,
+        tokensGranted: 0,
+        durationDays: pkg.durationDays,
+        paymentMethod: method,
+        accountType,
+        receiverNumber,
+        instructions
+      });
+      return;
+    }
+
+    const tokPkg = serverTokenPackages.find((p) => p.id === itemId && p.enabled);
+    if (!tokPkg) {
+      res.status(404).type('application/json').json({ error: 'Token package not found or disabled.' });
+      return;
+    }
+    res.status(200).type('application/json').json({
+      itemType,
+      itemId: tokPkg.id,
+      itemTitle: tokPkg.title,
+      amountBdt: tokPkg.priceBdt,
+      tokensGranted: tokPkg.tokens,
+      durationDays: 0,
+      paymentMethod: method,
+      accountType,
+      receiverNumber,
+      instructions
+    });
+  });
+
+  // Creates a PENDING payment request — NEVER grants access or tokens before Owner approval!
+  app.post('/api/payments/submit', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const { itemType, itemId, paymentMethod, senderNumber, trxId, note } = req.body || {};
+
+    if (!['feature_package', 'token_package'].includes(itemType)) {
+      res.status(400).type('application/json').json({ error: 'Invalid purchase type.' });
+      return;
+    }
+    if (!['bkash', 'nagad'].includes(paymentMethod)) {
+      res.status(400).type('application/json').json({ error: 'Select bKash or Nagad payment method.' });
+      return;
+    }
+
+    const method = paymentMethod as PaymentMethodId;
+    const methodEnabled =
+      method === 'bkash' ? serverPaymentSettings.bkashEnabled : serverPaymentSettings.nagadEnabled;
+    const receiverNumber = (
+      method === 'bkash' ? serverPaymentSettings.bkashNumber : serverPaymentSettings.nagadNumber
+    ).trim();
+
+    if (!methodEnabled || receiverNumber.length < 11) {
+      res.status(423).type('application/json').json({
+        error: `${method === 'bkash' ? 'bKash' : 'Nagad'} payment is currently unavailable.`
+      });
+      return;
+    }
+
+    const cleanSender = String(senderNumber || '').trim();
+    if (!/^01[3-9][0-9]{8}$/.test(cleanSender)) {
+      res.status(400).type('application/json').json({
+        error: 'সঠিক ১১ সংখ্যার বাংলাদেশী মোবাইল নম্বর দিন (যেমন: 017XXXXXXXX)।'
+      });
+      return;
+    }
+
+    const cleanTrx = String(trxId || '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{8,16}$/.test(cleanTrx)) {
+      res.status(400).type('application/json').json({
+        error: 'সঠিক Transaction ID (TrxID) দিন (৮–১৬ অক্ষরের ইংরেজি অক্ষর ও সংখ্যা)।'
+      });
+      return;
+    }
+
+    const trxCompositeKey = `${method}:${cleanTrx}`;
+    const existingTrx = usedPaymentTrxIds[trxCompositeKey] || usedPaymentTrxIds[cleanTrx];
+    if (existingTrx && existingTrx.status !== 'rejected') {
+      res.status(409).type('application/json').json({
+        error: 'এই Transaction ID আগে থেকেই ব্যবহৃত বা যাচাইয়ের জন্য জমা দেওয়া হয়েছে।'
+      });
+      return;
+    }
+
+    let itemTitle = '';
+    let amountBdt = 0;
+    let tokensGranted = 0;
+    let durationDays = 0;
+    let featureKey: PackageFeatureKey | undefined;
+
+    if (itemType === 'feature_package') {
+      const pkg = serverFeaturePackages.find((p) => p.id === itemId && p.enabled);
+      if (!pkg) {
+        res.status(404).type('application/json').json({ error: 'Feature package not found or disabled.' });
+        return;
+      }
+      itemTitle = pkg.title;
+      amountBdt = pkg.priceBdt;
+      durationDays = pkg.durationDays;
+      featureKey = pkg.featureKey;
+    } else {
+      const tokPkg = serverTokenPackages.find((p) => p.id === itemId && p.enabled);
+      if (!tokPkg) {
+        res.status(404).type('application/json').json({ error: 'Token package not found or disabled.' });
+        return;
+      }
+      itemTitle = tokPkg.title;
+      amountBdt = tokPkg.priceBdt;
+      tokensGranted = tokPkg.tokens;
+    }
+
+    if (amountBdt < 1) {
+      res.status(400).type('application/json').json({ error: 'Selected package amount must be at least ৳1.' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const orderId = `${method}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const newRequest: ServerPaymentRequest = {
+      orderId,
+      userUid: identity.uid,
+      userEmail: identity.email,
+      userName: identity.displayName,
+      itemType,
+      itemId,
+      itemTitle,
+      featureKey,
+      amountBdt,
+      tokensGranted,
+      durationDays,
+      paymentMethod: method,
+      senderNumber: cleanSender,
+      trxId: cleanTrx,
+      receiverNumber,
+      note: String(note || '').trim().slice(0, 200),
+      status: 'pending',
+      credited: false,
+      reviewedByUid: '',
+      rejectionReason: '',
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+
+    serverPaymentRequests.unshift(newRequest);
+    usedPaymentTrxIds[trxCompositeKey] = {
+      orderId,
+      paymentMethod: method,
+      userUid: identity.uid,
+      status: 'pending'
+    };
+    if (!serverUsersRegistry[identity.uid]) {
+      serverUsersRegistry[identity.uid] = {
+        uid: identity.uid,
+        email: identity.email,
+        displayName: identity.displayName,
+        role: identity.role,
+        accountStatus: 'active',
+        createdAt: nowIso,
+        lastSeenAt: nowIso
+      };
+    }
+
+    await persistGovernanceState();
+    recordServerSecurityEvent(
+      'PAYMENT_REQUEST_SUBMITTED',
+      identity.email,
+      `${method.toUpperCase()} ৳${amountBdt} · ${itemTitle} (${cleanTrx})`
+    );
+
+    res.status(200).type('application/json').json({
+      ok: true,
+      request: newRequest
+    });
+  });
+
+  // 11. Owner-Only Admin Panel Endpoints (Strictly requirePrimaryOwner on every endpoint)
+  app.get('/api/admin/overview', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const uploadFiles = await fs.promises.readdir(UPLOAD_DIR).catch(() => []);
+    const genFiles = await fs.promises.readdir(GENERATED_DIR).catch(() => []);
+    const cacheFiles = await fs.promises
+      .readdir(path.join(GENERATED_DIR, 'chunk_cache'))
+      .catch(() => []);
+
+    let totalTempBytes = 0;
+    for (const f of uploadFiles) {
+      const st = await fs.promises.stat(path.join(UPLOAD_DIR, f)).catch(() => null);
+      if (st?.isFile()) totalTempBytes += st.size;
+    }
+    for (const f of genFiles) {
+      const st = await fs.promises.stat(path.join(GENERATED_DIR, f)).catch(() => null);
+      if (st?.isFile()) totalTempBytes += st.size;
+    }
+
+    res.status(200).type('application/json').json({
+      actor: {
+        uid: owner.uid,
+        email: owner.email,
+        role: owner.role
+      },
+      ownership: {
+        primaryOwnerEmail: serverOwnershipState.primaryOwnerEmail,
+        primaryOwnerUid: serverOwnershipState.primaryOwnerUid || owner.uid,
+        organizationName: serverOwnershipState.organizationName,
+        ownershipLocked: serverOwnershipState.ownershipLocked
+      },
+      governance: serverGovernancePolicy,
+      features: serverFeatureConfigs,
+      featurePackages: serverFeaturePackages,
+      tokenPackages: serverTokenPackages,
+      paymentSettings: serverPaymentSettings,
+      users: Object.values(serverUsersRegistry),
+      entitlements: Object.values(serverUserEntitlements),
+      paymentRequests: serverPaymentRequests.slice(0, 150),
+      tokenLedger: serverTokenLedger.slice(0, 150),
+      auditLogs: serverAuditLogs.slice(0, 100),
+      runtime: {
+        uptimeSeconds: Math.round(process.uptime()),
+        ffmpegAvailable: ffmpegBinaryVerified,
+        ffprobeAvailable: ffprobeBinaryVerified,
+        sessionSecretSource: SESSION_CONFIG.source,
+        sessionSecretEntropyBits: SESSION_CONFIG.entropyBits,
+        uploadedFileCount: uploadFiles.length,
+        generatedFileCount: genFiles.length,
+        cachedChunkCount: cacheFiles.length,
+        totalTempStorageMb: Number((totalTempBytes / (1024 * 1024)).toFixed(2)),
+        activeRateBuckets: computeRateBuckets.size
+      },
+      recentSecurityEvents
+    });
+  });
+
+  app.post('/api/admin/features', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const b = req.body || {};
+    const clampCost = (v: unknown, fb: number) =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(1000, Math.round(v))) : fb;
+
+    for (const key of ['voice_cloning', 'long_script', 'srt_generator'] as FeatureGateKey[]) {
+      const incomingCfg = b[key] || b?.features?.[key];
+      if (incomingCfg && typeof incomingCfg === 'object') {
+        serverFeatureConfigs[key] = {
+          ...serverFeatureConfigs[key],
+          enabled:
+            typeof incomingCfg.enabled === 'boolean'
+              ? incomingCfg.enabled
+              : serverFeatureConfigs[key].enabled,
+          isPaid:
+            typeof incomingCfg.isPaid === 'boolean'
+              ? incomingCfg.isPaid
+              : serverFeatureConfigs[key].isPaid,
+          tokenCost: clampCost(incomingCfg.tokenCost, serverFeatureConfigs[key].tokenCost)
+        };
+      }
+    }
+
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_PREMIUM_FEATURES',
+      'system/catalog',
+      `vcPaid=${serverFeatureConfigs.voice_cloning.isPaid}(${serverFeatureConfigs.voice_cloning.tokenCost}t), longPaid=${serverFeatureConfigs.long_script.isPaid}(${serverFeatureConfigs.long_script.tokenCost}t), srtPaid=${serverFeatureConfigs.srt_generator.isPaid}(${serverFeatureConfigs.srt_generator.tokenCost}t)`
+    );
+    recordServerSecurityEvent('PREMIUM_FEATURES_UPDATED', owner.email, 'Feature paywall & token costs saved');
+    res.status(200).type('application/json').json({ ok: true, features: serverFeatureConfigs });
+  });
+
+  app.post('/api/admin/plans', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const { featurePackages, tokenPackages } = req.body || {};
+
+    if (Array.isArray(featurePackages)) {
+      const sanitized: ServerFeaturePackage[] = [];
+      for (const raw of featurePackages.slice(0, 20)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const fk = raw.featureKey;
+        if (!['voice_cloning', 'long_script', 'srt_generator', 'pro_bundle'].includes(fk)) continue;
+        const rawId = typeof raw.id === 'string' && /^[a-zA-Z0-9_-]{3,64}$/.test(raw.id.trim())
+          ? raw.id.trim()
+          : `pkg_${fk}_${crypto.randomBytes(3).toString('hex')}`;
+        sanitized.push({
+          id: rawId,
+          featureKey: fk,
+          title: String(raw.title || 'Feature Plan').trim().slice(0, 80) || 'Feature Plan',
+          description: String(raw.description || '').trim().slice(0, 200),
+          priceBdt: Math.max(1, Math.min(50000, Math.round(Number(raw.priceBdt) || 199))),
+          durationDays: Math.max(0, Math.min(3650, Math.round(Number(raw.durationDays) || 0))),
+          enabled: raw.enabled !== false
+        });
+      }
+      if (sanitized.length > 0) {
+        serverFeaturePackages = sanitized;
+      }
+    }
+
+    if (Array.isArray(tokenPackages)) {
+      const sanitizedTok: ServerTokenPackage[] = [];
+      for (const raw of tokenPackages.slice(0, 20)) {
+        if (!raw || typeof raw !== 'object') continue;
+        const rawId = typeof raw.id === 'string' && /^[a-zA-Z0-9_-]{3,64}$/.test(raw.id.trim())
+          ? raw.id.trim()
+          : `tok_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+        sanitizedTok.push({
+          id: rawId,
+          title: String(raw.title || 'Token Pack').trim().slice(0, 80) || 'Token Pack',
+          description: String(raw.description || '').trim().slice(0, 200),
+          tokens: Math.max(1, Math.min(100000, Math.round(Number(raw.tokens) || 50))),
+          priceBdt: Math.max(1, Math.min(50000, Math.round(Number(raw.priceBdt) || 99))),
+          enabled: raw.enabled !== false
+        });
+      }
+      serverTokenPackages = sanitizedTok;
+    }
+
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_PLANS_PRICING',
+      'system/plans',
+      `featurePlans=${serverFeaturePackages.length}, tokenPackages=${serverTokenPackages.length}`
+    );
+    res.status(200).type('application/json').json({
+      ok: true,
+      featurePackages: serverFeaturePackages,
+      tokenPackages: serverTokenPackages
+    });
+  });
+
+  app.post('/api/admin/payment-settings', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const b = req.body || {};
+    serverPaymentSettings = {
+      bkashEnabled:
+        typeof b.bkashEnabled === 'boolean' ? b.bkashEnabled : serverPaymentSettings.bkashEnabled,
+      bkashNumber:
+        typeof b.bkashNumber === 'string'
+          ? b.bkashNumber.trim().slice(0, 20)
+          : serverPaymentSettings.bkashNumber,
+      bkashAccountType: ['Personal', 'Merchant', 'Agent'].includes(b.bkashAccountType)
+        ? b.bkashAccountType
+        : serverPaymentSettings.bkashAccountType,
+      bkashInstructions:
+        typeof b.bkashInstructions === 'string'
+          ? b.bkashInstructions.trim().slice(0, 500)
+          : serverPaymentSettings.bkashInstructions,
+      nagadEnabled:
+        typeof b.nagadEnabled === 'boolean' ? b.nagadEnabled : serverPaymentSettings.nagadEnabled,
+      nagadNumber:
+        typeof b.nagadNumber === 'string'
+          ? b.nagadNumber.trim().slice(0, 20)
+          : serverPaymentSettings.nagadNumber,
+      nagadAccountType: ['Personal', 'Merchant', 'Agent'].includes(b.nagadAccountType)
+        ? b.nagadAccountType
+        : serverPaymentSettings.nagadAccountType,
+      nagadInstructions:
+        typeof b.nagadInstructions === 'string'
+          ? b.nagadInstructions.trim().slice(0, 500)
+          : serverPaymentSettings.nagadInstructions
+    };
+
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_PAYMENT_SETTINGS',
+      'system/paymentSettings',
+      `bkash=${serverPaymentSettings.bkashEnabled}, nagad=${serverPaymentSettings.nagadEnabled}`
+    );
+    recordServerSecurityEvent('PAYMENT_SETTINGS_UPDATED', owner.email, 'bKash/Nagad settings saved');
+    res.status(200).type('application/json').json({ ok: true, paymentSettings: serverPaymentSettings });
+  });
+
+  // Atomic Owner Payment Verification (Approve / Reject — strictly prevents duplicate approval or double credit)
+  app.post('/api/admin/payments/review', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const { orderId, decision, rejectionReason } = req.body || {};
+
+    if (!orderId || typeof orderId !== 'string') {
+      res.status(400).type('application/json').json({ error: 'Valid orderId is required.' });
+      return;
+    }
+    if (!['approved', 'rejected'].includes(decision)) {
+      res.status(400).type('application/json').json({ error: 'Decision must be approved or rejected.' });
+      return;
+    }
+
+    const reqRecord = serverPaymentRequests.find((r) => r.orderId === orderId.trim());
+    if (!reqRecord) {
+      res.status(404).type('application/json').json({ error: 'Payment request not found.' });
+      return;
+    }
+
+    // Strict synchronous idempotency guard: prevent duplicate approvals or re-opening terminal requests
+    if (reqRecord.status !== 'pending' || reqRecord.credited) {
+      res.status(409).type('application/json').json({
+        error: `Payment request ${reqRecord.orderId} has already been ${reqRecord.status} and cannot be processed again.`,
+        code: 'PAYMENT_ALREADY_REVIEWED'
+      });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    reqRecord.status = decision;
+    reqRecord.reviewedByUid = owner.uid;
+    reqRecord.updatedAt = nowIso;
+
+    const trxKey = `${reqRecord.paymentMethod}:${reqRecord.trxId}`;
+    if (usedPaymentTrxIds[trxKey]) {
+      usedPaymentTrxIds[trxKey].status = decision;
+    }
+
+    let updatedEntitlement: ServerUserEntitlement | null = null;
+    if (decision === 'approved') {
+      reqRecord.credited = true;
+      reqRecord.rejectionReason = '';
+      const ent = ensureUserEntitlementRecord(reqRecord.userUid, reqRecord.userEmail);
+
+      if (reqRecord.itemType === 'token_package' && reqRecord.tokensGranted > 0) {
+        applyAtomicTokenDelta({
+          uid: reqRecord.userUid,
+          email: reqRecord.userEmail,
+          delta: reqRecord.tokensGranted,
+          type: 'purchase_credit',
+          reason: `${reqRecord.paymentMethod.toUpperCase()} TrxID ${reqRecord.trxId} (${reqRecord.itemTitle})`,
+          actorUid: owner.uid
+        });
+      } else if (reqRecord.itemType === 'feature_package' && reqRecord.featureKey) {
+        const expMs =
+          reqRecord.durationDays > 0
+            ? Date.now() + reqRecord.durationDays * 24 * 60 * 60 * 1000
+            : 0;
+        if (reqRecord.featureKey === 'voice_cloning') {
+          ent.voiceCloningUnlocked = true;
+          ent.voiceCloningExpiresAtMs = expMs;
+        } else if (reqRecord.featureKey === 'long_script') {
+          ent.longScriptUnlocked = true;
+          ent.longScriptExpiresAtMs = expMs;
+        } else if (reqRecord.featureKey === 'srt_generator') {
+          ent.srtGeneratorUnlocked = true;
+          ent.srtGeneratorExpiresAtMs = expMs;
+        } else if (reqRecord.featureKey === 'pro_bundle') {
+          ent.proBundleUnlocked = true;
+          ent.proBundleExpiresAtMs = expMs;
+        }
+        ent.updatedAt = nowIso;
+      }
+
+      updatedEntitlement = ent;
+      recordServerAuditLog(
+        owner.uid,
+        owner.email,
+        'APPROVE_PAYMENT',
+        `${reqRecord.userEmail} (${reqRecord.trxId})`,
+        `${reqRecord.paymentMethod.toUpperCase()} ৳${reqRecord.amountBdt} -> ${reqRecord.itemTitle}`
+      );
+      recordServerSecurityEvent(
+        'PAYMENT_APPROVED',
+        owner.email,
+        `${reqRecord.orderId} (${reqRecord.trxId}) -> ${reqRecord.userEmail}`
+      );
+    } else {
+      reqRecord.credited = false;
+      reqRecord.rejectionReason = String(
+        rejectionReason || 'Transaction verification failed or amount mismatch.'
+      )
+        .trim()
+        .slice(0, 250);
+      recordServerAuditLog(
+        owner.uid,
+        owner.email,
+        'REJECT_PAYMENT',
+        `${reqRecord.userEmail} (${reqRecord.trxId})`,
+        `reason=${reqRecord.rejectionReason}`
+      );
+      recordServerSecurityEvent(
+        'PAYMENT_REJECTED',
+        owner.email,
+        `${reqRecord.orderId} (${reqRecord.trxId})`
+      );
+    }
+
+    await persistGovernanceState();
+    res.status(200).type('application/json').json({
+      ok: true,
+      request: reqRecord,
+      entitlement: updatedEntitlement
+    });
+  });
+
+  // Owner Token Management (Grant / Revoke Tokens + Immutable Ledger)
+  app.post('/api/admin/tokens/adjust', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const { targetUid, targetEmail, delta, reason } = req.body || {};
+    const cleanUid = typeof targetUid === 'string' ? targetUid.trim() : '';
+    const cleanEmail = typeof targetEmail === 'string' ? targetEmail.trim().toLowerCase() : '';
+    const numericDelta = Math.round(Number(delta));
+
+    if (!cleanUid || !SAFE_IDENTIFIER_REGEX.test(cleanUid) || !cleanEmail.includes('@')) {
+      res.status(400).type('application/json').json({ error: 'Valid user UID and email are required.' });
+      return;
+    }
+    if (!Number.isFinite(numericDelta) || numericDelta === 0 || Math.abs(numericDelta) > 1000000) {
+      res.status(400).type('application/json').json({ error: 'Token adjustment delta must be non-zero (-1M to +1M).' });
+      return;
+    }
+
+    const result = applyAtomicTokenDelta({
+      uid: cleanUid,
+      email: cleanEmail,
+      delta: numericDelta,
+      type: numericDelta > 0 ? 'admin_grant' : 'admin_revoke',
+      reason: String(reason || (numericDelta > 0 ? 'Owner token grant' : 'Owner token revocation')).trim(),
+      actorUid: owner.uid
+    });
+    if (!result.ok) {
+      res.status(400).type('application/json').json({ error: result.error });
+      return;
+    }
+
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      numericDelta > 0 ? 'GRANT_TOKENS' : 'REVOKE_TOKENS',
+      cleanEmail,
+      `delta=${numericDelta}, balanceAfter=${result.balanceAfter}`
+    );
+    res.status(200).type('application/json').json({
+      ok: true,
+      tokenBalance: result.balanceAfter,
+      ledgerEntry: result.entry
+    });
+  });
+
+  // Owner Manual Feature Entitlement Grant / Revoke
+  app.post('/api/admin/entitlements/grant', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const b = req.body || {};
+    const targetUid = typeof b.uid === 'string' ? b.uid.trim() : '';
+    const targetEmail = typeof b.email === 'string' ? b.email.trim().toLowerCase() : '';
+    if (!targetUid || !SAFE_IDENTIFIER_REGEX.test(targetUid) || !targetEmail.includes('@')) {
+      res.status(400).type('application/json').json({ error: 'Valid target UID and email required.' });
+      return;
+    }
+
+    const durationDays = Math.max(0, Math.min(3650, Math.round(Number(b.durationDays) || 0)));
+    const expMs = durationDays > 0 ? Date.now() + durationDays * 24 * 60 * 60 * 1000 : 0;
+    const existing = ensureUserEntitlementRecord(targetUid, targetEmail);
+
+    serverUserEntitlements[targetUid] = {
+      ...existing,
+      uid: targetUid,
+      email: targetEmail,
+      voiceCloningUnlocked: Boolean(b.voiceCloningUnlocked),
+      voiceCloningExpiresAtMs: b.voiceCloningUnlocked ? expMs : 0,
+      longScriptUnlocked: Boolean(b.longScriptUnlocked),
+      longScriptExpiresAtMs: b.longScriptUnlocked ? expMs : 0,
+      srtGeneratorUnlocked: Boolean(b.srtGeneratorUnlocked),
+      srtGeneratorExpiresAtMs: b.srtGeneratorUnlocked ? expMs : 0,
+      proBundleUnlocked: Boolean(b.proBundleUnlocked),
+      proBundleExpiresAtMs: b.proBundleUnlocked ? expMs : 0,
+      updatedAt: new Date().toISOString()
+    };
+
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_USER_ENTITLEMENT',
+      targetEmail,
+      `vc=${Boolean(b.voiceCloningUnlocked)}, long=${Boolean(b.longScriptUnlocked)}, srt=${Boolean(b.srtGeneratorUnlocked)}, bundle=${Boolean(b.proBundleUnlocked)}, days=${durationDays}`
+    );
+    res.status(200).type('application/json').json({
+      ok: true,
+      entitlement: serverUserEntitlements[targetUid]
+    });
+  });
+
+  app.post('/api/admin/users/status', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const { targetUid, accountStatus } = req.body || {};
+    const cleanUid = typeof targetUid === 'string' ? targetUid.trim() : '';
+    if (!cleanUid || !['active', 'suspended'].includes(accountStatus)) {
+      res.status(400).type('application/json').json({ error: 'Valid targetUid and accountStatus required.' });
+      return;
+    }
+    if (cleanUid === owner.uid) {
+      res.status(400).type('application/json').json({ error: 'Cannot suspend the active Owner account.' });
+      return;
+    }
+    if (!serverUsersRegistry[cleanUid]) {
+      res.status(404).type('application/json').json({ error: 'User record not found.' });
+      return;
+    }
+    serverUsersRegistry[cleanUid].accountStatus = accountStatus;
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      accountStatus === 'suspended' ? 'SUSPEND_USER' : 'ACTIVATE_USER',
+      serverUsersRegistry[cleanUid].email,
+      `accountStatus=${accountStatus}`
+    );
+    res.status(200).type('application/json').json({ ok: true, user: serverUsersRegistry[cleanUid] });
+  });
+
+  app.post('/api/admin/governance', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const b = req.body || {};
+    serverGovernancePolicy = {
+      maintenanceMode:
+        typeof b.maintenanceMode === 'boolean'
+          ? b.maintenanceMode
+          : serverGovernancePolicy.maintenanceMode,
+      maintenanceNotice:
+        typeof b.maintenanceNotice === 'string'
+          ? b.maintenanceNotice.trim().slice(0, 300)
+          : serverGovernancePolicy.maintenanceNotice,
+      allowVoiceCloning:
+        typeof b.allowVoiceCloning === 'boolean'
+          ? b.allowVoiceCloning
+          : serverGovernancePolicy.allowVoiceCloning,
+      allowSrtGeneration:
+        typeof b.allowSrtGeneration === 'boolean'
+          ? b.allowSrtGeneration
+          : serverGovernancePolicy.allowSrtGeneration,
+      requireAuthForCompute:
+        typeof b.requireAuthForCompute === 'boolean'
+          ? b.requireAuthForCompute
+          : serverGovernancePolicy.requireAuthForCompute,
+      maxScriptChars:
+        typeof b.maxScriptChars === 'number'
+          ? Math.max(1000, Math.min(25000, Math.round(b.maxScriptChars)))
+          : serverGovernancePolicy.maxScriptChars,
+      rateLimitPerMinute:
+        typeof b.rateLimitPerMinute === 'number'
+          ? Math.max(1, Math.min(60, Math.round(b.rateLimitPerMinute)))
+          : serverGovernancePolicy.rateLimitPerMinute,
+      enforceZeroGeminiQuota:
+        typeof b.enforceZeroGeminiQuota === 'boolean'
+          ? b.enforceZeroGeminiQuota
+          : serverGovernancePolicy.enforceZeroGeminiQuota
+    };
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_GOVERNANCE',
+      'system/governance',
+      `maintenance=${serverGovernancePolicy.maintenanceMode}, cloning=${serverGovernancePolicy.allowVoiceCloning}, srt=${serverGovernancePolicy.allowSrtGeneration}`
+    );
+    res.status(200).type('application/json').json({
+      ok: true,
+      governance: serverGovernancePolicy
+    });
+  });
+
+  app.post('/api/admin/ownership', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    const b = req.body || {};
+    if (!serverOwnershipState.primaryOwnerUid) {
+      serverOwnershipState.primaryOwnerUid = owner.uid;
+      serverOwnershipState.primaryOwnerEmail = owner.email;
+    }
+    const nextOrg =
+      typeof b.organizationName === 'string' && b.organizationName.trim().length >= 2
+        ? b.organizationName.trim().slice(0, 120)
+        : serverOwnershipState.organizationName;
+    const nextLocked =
+      typeof b.ownershipLocked === 'boolean'
+        ? b.ownershipLocked
+        : serverOwnershipState.ownershipLocked;
+    serverOwnershipState.organizationName = nextOrg;
+    serverOwnershipState.ownershipLocked = nextLocked;
+    await persistGovernanceState();
+    recordServerAuditLog(
+      owner.uid,
+      owner.email,
+      'UPDATE_OWNERSHIP',
+      'system/ownership',
+      `org=${nextOrg}, locked=${nextLocked}`
+    );
+    res.status(200).type('application/json').json({
+      ok: true,
+      ownership: serverOwnershipState
+    });
+  });
+
+  app.post('/api/admin/storage/purge', requireAuthenticatedSession, requirePrimaryOwner, async (req, res) => {
+    const owner = (req as any).firebaseAdmin as VerifiedFirebaseIdentity;
+    let deletedCount = 0;
+    for (const [fileId, entry] of uploadedFilesRegistry.entries()) {
+      if (!fileId.startsWith('sample_ref_')) {
+        await fs.promises.unlink(entry.filePath).catch(() => {});
+        const metaPath = resolveSafeChildPath(UPLOAD_DIR, `${fileId}.meta.json`);
+        if (metaPath) await fs.promises.unlink(metaPath).catch(() => {});
+        uploadedFilesRegistry.delete(fileId);
+        deletedCount++;
+      }
+    }
+    for (const dir of [UPLOAD_DIR, GENERATED_DIR, path.join(GENERATED_DIR, 'chunk_cache')]) {
+      const files = await fs.promises.readdir(dir).catch(() => []);
+      for (const f of files) {
+        const p = resolveSafeChildPath(dir, f);
+        if (p) {
+          const st = await fs.promises.stat(p).catch(() => null);
+          if (st?.isFile()) {
+            await fs.promises.unlink(p).catch(() => {});
+            deletedCount++;
+          }
+        }
+      }
+    }
+    recordServerAuditLog(owner.uid, owner.email, 'ADMIN_STORAGE_PURGE', 'server/temp_storage', `deleted=${deletedCount}`);
+    res.status(200).type('application/json').json({
+      ok: true,
+      deletedFilesCount: deletedCount
     });
   });
 

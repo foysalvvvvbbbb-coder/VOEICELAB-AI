@@ -1,0 +1,642 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Identity & Validation Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedOwner() {
+      return isVerifiedUser() && request.auth.token.email == 'foysalvvvvbbbb@gmail.com';
+    }
+
+    function isOwner() {
+      return isBootstrappedOwner() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/system/ownership) &&
+        get(/databases/$(database)/documents/system/ownership).data.primaryOwnerUid == request.auth.uid &&
+        get(/databases/$(database)/documents/system/ownership).data.primaryOwnerEmail == request.auth.token.email
+      );
+    }
+
+    function isDocOwner(uid) {
+      return isVerifiedUser() && request.auth.uid == uid;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidOwnershipRecord(data) {
+      return data.keys().hasAll([
+          'primaryOwnerUid', 'primaryOwnerEmail', 'organizationName',
+          'ownershipLocked', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'primaryOwnerUid', 'primaryOwnerEmail', 'organizationName',
+          'ownershipLocked', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.primaryOwnerUid) &&
+        data.primaryOwnerEmail is string && data.primaryOwnerEmail.size() >= 5 && data.primaryOwnerEmail.size() <= 254 &&
+        data.organizationName is string && data.organizationName.size() >= 2 && data.organizationName.size() <= 120 &&
+        data.ownershipLocked is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGovernanceConfig(data) {
+      return data.keys().hasAll([
+          'maintenanceMode', 'maintenanceNotice', 'allowVoiceCloning',
+          'allowSrtGeneration', 'requireAuthForCompute', 'maxScriptChars',
+          'rateLimitPerMinute', 'enforceZeroGeminiQuota', 'updatedByUid', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'maintenanceMode', 'maintenanceNotice', 'allowVoiceCloning',
+          'allowSrtGeneration', 'requireAuthForCompute', 'maxScriptChars',
+          'rateLimitPerMinute', 'enforceZeroGeminiQuota', 'updatedByUid', 'updatedAt'
+        ]) &&
+        data.maintenanceMode is bool &&
+        data.maintenanceNotice is string && data.maintenanceNotice.size() <= 300 &&
+        data.allowVoiceCloning is bool &&
+        data.allowSrtGeneration is bool &&
+        data.requireAuthForCompute is bool &&
+        data.maxScriptChars is int && data.maxScriptChars >= 1000 && data.maxScriptChars <= 25000 &&
+        data.rateLimitPerMinute is int && data.rateLimitPerMinute >= 1 && data.rateLimitPerMinute <= 60 &&
+        data.enforceZeroGeminiQuota is bool &&
+        isValidId(data.updatedByUid) &&
+        data.updatedByUid == request.auth.uid &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPlatformCatalog(data) {
+      return data.keys().hasAll([
+          'currency', 'voiceCloningEnabled', 'voiceCloningPaid', 'voiceCloningTokenCost',
+          'longScriptEnabled', 'longScriptPaid', 'longScriptTokenCost',
+          'srtGeneratorEnabled', 'srtGeneratorPaid', 'srtGeneratorTokenCost',
+          'updatedByUid', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'currency', 'voiceCloningEnabled', 'voiceCloningPaid', 'voiceCloningTokenCost',
+          'longScriptEnabled', 'longScriptPaid', 'longScriptTokenCost',
+          'srtGeneratorEnabled', 'srtGeneratorPaid', 'srtGeneratorTokenCost',
+          'updatedByUid', 'updatedAt'
+        ]) &&
+        data.currency == 'BDT' &&
+        data.voiceCloningEnabled is bool &&
+        data.voiceCloningPaid is bool &&
+        data.voiceCloningTokenCost is int && data.voiceCloningTokenCost >= 0 && data.voiceCloningTokenCost <= 1000 &&
+        data.longScriptEnabled is bool &&
+        data.longScriptPaid is bool &&
+        data.longScriptTokenCost is int && data.longScriptTokenCost >= 0 && data.longScriptTokenCost <= 1000 &&
+        data.srtGeneratorEnabled is bool &&
+        data.srtGeneratorPaid is bool &&
+        data.srtGeneratorTokenCost is int && data.srtGeneratorTokenCost >= 0 && data.srtGeneratorTokenCost <= 1000 &&
+        isValidId(data.updatedByUid) &&
+        data.updatedByUid == request.auth.uid &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPaymentSettings(data) {
+      return data.keys().hasAll([
+          'bkashEnabled', 'bkashNumber', 'bkashAccountType', 'bkashInstructions',
+          'nagadEnabled', 'nagadNumber', 'nagadAccountType', 'nagadInstructions',
+          'updatedByUid', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'bkashEnabled', 'bkashNumber', 'bkashAccountType', 'bkashInstructions',
+          'nagadEnabled', 'nagadNumber', 'nagadAccountType', 'nagadInstructions',
+          'updatedByUid', 'updatedAt'
+        ]) &&
+        data.bkashEnabled is bool &&
+        data.bkashNumber is string && data.bkashNumber.size() <= 20 &&
+        data.bkashAccountType in ['Personal', 'Merchant', 'Agent'] &&
+        data.bkashInstructions is string && data.bkashInstructions.size() <= 500 &&
+        data.nagadEnabled is bool &&
+        data.nagadNumber is string && data.nagadNumber.size() <= 20 &&
+        data.nagadAccountType in ['Personal', 'Merchant', 'Agent'] &&
+        data.nagadInstructions is string && data.nagadInstructions.size() <= 500 &&
+        isValidId(data.updatedByUid) &&
+        data.updatedByUid == request.auth.uid &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserProfile(data, targetUid) {
+      return data.keys().hasAll([
+          'uid', 'email', 'displayName', 'photoURL',
+          'role', 'accountStatus', 'lastSeenAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'photoURL',
+          'role', 'accountStatus', 'lastSeenAt', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.uid == targetUid &&
+        data.email is string && data.email.size() >= 5 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() <= 120 &&
+        data.photoURL is string && data.photoURL.size() <= 512 &&
+        data.role in ['owner', 'user'] &&
+        data.accountStatus in ['active', 'suspended'] &&
+        data.lastSeenAt is timestamp &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPaymentRequest(data, targetOrderId) {
+      return data.keys().hasAll([
+          'orderId', 'userUid', 'userEmail', 'userName',
+          'itemType', 'itemId', 'itemTitle', 'amountBdt', 'tokensGranted', 'durationDays',
+          'paymentMethod', 'senderNumber', 'trxId', 'receiverNumber',
+          'note', 'status', 'reviewedByUid', 'rejectionReason', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'orderId', 'userUid', 'userEmail', 'userName',
+          'itemType', 'itemId', 'itemTitle', 'amountBdt', 'tokensGranted', 'durationDays',
+          'paymentMethod', 'senderNumber', 'trxId', 'receiverNumber',
+          'note', 'status', 'reviewedByUid', 'rejectionReason', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.orderId) &&
+        data.orderId == targetOrderId &&
+        isValidId(data.userUid) &&
+        data.userEmail is string && data.userEmail.size() >= 5 && data.userEmail.size() <= 254 &&
+        data.userName is string && data.userName.size() <= 120 &&
+        data.itemType in ['feature_package', 'token_package'] &&
+        isValidId(data.itemId) &&
+        data.itemTitle is string && data.itemTitle.size() >= 2 && data.itemTitle.size() <= 120 &&
+        data.amountBdt is int && data.amountBdt >= 1 && data.amountBdt <= 50000 &&
+        data.tokensGranted is int && data.tokensGranted >= 0 && data.tokensGranted <= 1000000 &&
+        data.durationDays is int && data.durationDays >= 0 && data.durationDays <= 3650 &&
+        data.paymentMethod in ['bkash', 'nagad'] &&
+        data.senderNumber is string && data.senderNumber.size() == 11 && data.senderNumber.matches('^01[3-9][0-9]{8}$') &&
+        data.trxId is string && data.trxId.size() >= 8 && data.trxId.size() <= 16 && data.trxId.matches('^[A-Z0-9]{8,16}$') &&
+        data.receiverNumber is string && data.receiverNumber.size() >= 11 && data.receiverNumber.size() <= 20 &&
+        data.note is string && data.note.size() <= 200 &&
+        data.status in ['pending', 'approved', 'rejected'] &&
+        data.reviewedByUid is string && data.reviewedByUid.size() <= 128 &&
+        data.rejectionReason is string && data.rejectionReason.size() <= 250 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserEntitlement(data, targetUid) {
+      return data.keys().hasAll([
+          'uid', 'email', 'tokenBalance',
+          'voiceCloningUnlocked', 'voiceCloningExpiresAtMs',
+          'longScriptUnlocked', 'longScriptExpiresAtMs',
+          'srtGeneratorUnlocked', 'srtGeneratorExpiresAtMs',
+          'proBundleUnlocked', 'proBundleExpiresAtMs',
+          'grantedByUid', 'lastOrderId', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'tokenBalance',
+          'voiceCloningUnlocked', 'voiceCloningExpiresAtMs',
+          'longScriptUnlocked', 'longScriptExpiresAtMs',
+          'srtGeneratorUnlocked', 'srtGeneratorExpiresAtMs',
+          'proBundleUnlocked', 'proBundleExpiresAtMs',
+          'grantedByUid', 'lastOrderId', 'updatedAt'
+        ]) &&
+        isValidId(data.uid) &&
+        data.uid == targetUid &&
+        data.email is string && data.email.size() >= 5 && data.email.size() <= 254 &&
+        data.tokenBalance is int && data.tokenBalance >= 0 && data.tokenBalance <= 10000000 &&
+        data.voiceCloningUnlocked is bool &&
+        data.voiceCloningExpiresAtMs is int && data.voiceCloningExpiresAtMs >= 0 &&
+        data.longScriptUnlocked is bool &&
+        data.longScriptExpiresAtMs is int && data.longScriptExpiresAtMs >= 0 &&
+        data.srtGeneratorUnlocked is bool &&
+        data.srtGeneratorExpiresAtMs is int && data.srtGeneratorExpiresAtMs >= 0 &&
+        data.proBundleUnlocked is bool &&
+        data.proBundleExpiresAtMs is int && data.proBundleExpiresAtMs >= 0 &&
+        isValidId(data.grantedByUid) &&
+        data.lastOrderId is string && data.lastOrderId.size() <= 128 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTokenLedgerEntry(data, targetEntryId) {
+      return data.keys().hasAll([
+          'entryId', 'userUid', 'userEmail', 'delta', 'balanceAfter',
+          'type', 'reason', 'actorUid', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'entryId', 'userUid', 'userEmail', 'delta', 'balanceAfter',
+          'type', 'reason', 'actorUid', 'createdAt'
+        ]) &&
+        isValidId(data.entryId) &&
+        data.entryId == targetEntryId &&
+        isValidId(data.userUid) &&
+        data.userEmail is string && data.userEmail.size() >= 5 && data.userEmail.size() <= 254 &&
+        data.delta is int && data.delta >= -1000000 && data.delta <= 1000000 &&
+        data.balanceAfter is int && data.balanceAfter >= 0 && data.balanceAfter <= 10000000 &&
+        data.type in ['purchase_credit', 'admin_grant', 'admin_revoke', 'feature_debit', 'refund'] &&
+        data.reason is string && data.reason.size() >= 2 && data.reason.size() <= 240 &&
+        isValidId(data.actorUid) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAuditLog(data, targetLogId) {
+      return data.keys().hasAll([
+          'logId', 'actorUid', 'actorEmail', 'actorRole',
+          'action', 'target', 'details', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'logId', 'actorUid', 'actorEmail', 'actorRole',
+          'action', 'target', 'details', 'createdAt'
+        ]) &&
+        isValidId(data.logId) &&
+        data.logId == targetLogId &&
+        isValidId(data.actorUid) &&
+        data.actorUid == request.auth.uid &&
+        data.actorEmail is string && data.actorEmail.size() >= 5 && data.actorEmail.size() <= 254 &&
+        data.actorEmail == request.auth.token.email &&
+        data.actorRole == 'owner' &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 120 &&
+        data.target is string && data.target.size() >= 1 && data.target.size() <= 254 &&
+        data.details is string && data.details.size() <= 500 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidSavedVoiceProfile(data, targetVoiceId) {
+      return data.keys().hasAll([
+          'voiceId', 'ownerUid', 'ownerEmail', 'name', 'language', 'languageName',
+          'conditioningMethod', 'modelCheckpoint', 'speakerConditioningSha256',
+          'promptConditioningSha256', 'referenceTranscript', 'referenceDurationSec',
+          'promptDurationSec', 'fundamentalFreqHz', 'pitchMinHz', 'pitchMaxHz',
+          'spectralWarmthRatio', 'estimatedSnrDb', 'qualityGrade', 'sourceType',
+          'sourceFileName', 'storageKey', 'consentConfirmed', 'usageCount',
+          'lastUsedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'voiceId', 'ownerUid', 'ownerEmail', 'name', 'language', 'languageName',
+          'conditioningMethod', 'modelCheckpoint', 'speakerConditioningSha256',
+          'promptConditioningSha256', 'referenceTranscript', 'referenceDurationSec',
+          'promptDurationSec', 'fundamentalFreqHz', 'pitchMinHz', 'pitchMaxHz',
+          'spectralWarmthRatio', 'estimatedSnrDb', 'qualityGrade', 'sourceType',
+          'sourceFileName', 'storageKey', 'consentConfirmed', 'usageCount',
+          'lastUsedAt', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.voiceId) &&
+        data.voiceId == targetVoiceId &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.ownerEmail is string && data.ownerEmail.size() >= 5 && data.ownerEmail.size() <= 254 &&
+        data.ownerEmail.lower() == request.auth.token.email.lower() &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        data.language in ['bn', 'hi', 'en'] &&
+        data.languageName is string && data.languageName.size() >= 2 && data.languageName.size() <= 64 &&
+        data.conditioningMethod is string && data.conditioningMethod.size() >= 2 && data.conditioningMethod.size() <= 80 &&
+        data.modelCheckpoint is string && data.modelCheckpoint.size() >= 2 && data.modelCheckpoint.size() <= 160 &&
+        data.speakerConditioningSha256 is string && data.speakerConditioningSha256.size() == 64 && data.speakerConditioningSha256.matches('^[a-f0-9]{64}$') &&
+        data.promptConditioningSha256 is string && data.promptConditioningSha256.size() == 64 && data.promptConditioningSha256.matches('^[a-f0-9]{64}$') &&
+        data.referenceTranscript is string && data.referenceTranscript.size() <= 1000 &&
+        data.referenceDurationSec is number && data.referenceDurationSec >= 0.1 && data.referenceDurationSec <= 1800 &&
+        data.promptDurationSec is number && data.promptDurationSec >= 0.1 && data.promptDurationSec <= 60 &&
+        data.fundamentalFreqHz is number && data.fundamentalFreqHz >= 0 && data.fundamentalFreqHz <= 1000 &&
+        data.pitchMinHz is number && data.pitchMinHz >= 0 && data.pitchMinHz <= 1000 &&
+        data.pitchMaxHz is number && data.pitchMaxHz >= 0 && data.pitchMaxHz <= 2000 &&
+        data.spectralWarmthRatio is number && data.spectralWarmthRatio >= 0 && data.spectralWarmthRatio <= 1000 &&
+        data.estimatedSnrDb is number && data.estimatedSnrDb >= -100 && data.estimatedSnrDb <= 200 &&
+        data.qualityGrade in ['Studio Grade', 'Good', 'Acceptable (Noisy)', 'Poor / Corrupted'] &&
+        data.sourceType in ['cloned_output', 'reference_upload', 'microphone', 'studio_sample'] &&
+        data.sourceFileName is string && data.sourceFileName.size() >= 1 && data.sourceFileName.size() <= 160 &&
+        data.storageKey is string && data.storageKey.size() >= 5 && data.storageKey.size() <= 200 && data.storageKey.matches('^[a-zA-Z0-9_\\-/]+$') &&
+        data.consentConfirmed == true &&
+        data.usageCount is int && data.usageCount >= 0 && data.usageCount <= 1000000 &&
+        data.lastUsedAt is timestamp &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSavedVoiceConditioningChunk(data, targetVoiceId, targetChunkId) {
+      return data.keys().hasAll([
+          'chunkId', 'voiceId', 'ownerUid', 'assetKind', 'codec',
+          'chunkIndex', 'totalChunks', 'assetSha256', 'targetWavSha256',
+          'payload', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'chunkId', 'voiceId', 'ownerUid', 'assetKind', 'codec',
+          'chunkIndex', 'totalChunks', 'assetSha256', 'targetWavSha256',
+          'payload', 'createdAt'
+        ]) &&
+        isValidId(data.chunkId) &&
+        data.chunkId == targetChunkId &&
+        isValidId(data.voiceId) &&
+        data.voiceId == targetVoiceId &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.assetKind in ['prompt_flac', 'ref_flac'] &&
+        data.codec == 'flac' &&
+        data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex < 32 &&
+        data.totalChunks is int && data.totalChunks >= 1 && data.totalChunks <= 32 &&
+        data.chunkIndex < data.totalChunks &&
+        data.assetSha256 is string && data.assetSha256.size() == 64 && data.assetSha256.matches('^[a-f0-9]{64}$') &&
+        data.targetWavSha256 is string && data.targetWavSha256.size() == 64 && data.targetWavSha256.matches('^[a-f0-9]{64}$') &&
+        data.payload is bytes && data.payload.size() >= 1 && data.payload.size() <= 524288 &&
+        data.createdAt is timestamp;
+    }
+
+    // 4. Collection Rules
+
+    // Singleton Ownership Lock: Strictly Owner-only read/write; never deletable.
+    match /system/ownership {
+      allow get: if isOwner();
+      allow list: if false;
+      allow create: if isBootstrappedOwner() &&
+        isValidOwnershipRecord(incoming()) &&
+        incoming().primaryOwnerUid == request.auth.uid &&
+        incoming().primaryOwnerEmail == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isOwner() &&
+        isValidOwnershipRecord(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'primaryOwnerUid', 'primaryOwnerEmail', 'organizationName', 'ownershipLocked', 'updatedAt'
+        ]) &&
+        (!existing().ownershipLocked || (
+          incoming().primaryOwnerUid == existing().primaryOwnerUid &&
+          incoming().primaryOwnerEmail == existing().primaryOwnerEmail
+        ));
+      allow delete: if false;
+    }
+
+    // Singleton Platform Governance Config (zero PII)
+    match /system/governance {
+      allow get: if isSignedIn();
+      allow list: if false;
+      allow create: if isOwner() &&
+        isValidGovernanceConfig(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow update: if isOwner() &&
+        isValidGovernanceConfig(incoming()) &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'maintenanceMode', 'maintenanceNotice', 'allowVoiceCloning',
+          'allowSrtGeneration', 'requireAuthForCompute', 'maxScriptChars',
+          'rateLimitPerMinute', 'enforceZeroGeminiQuota', 'updatedByUid', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Singleton Public-Safe Feature & Token Requirement Flags (zero payment numbers/secrets)
+    match /system/catalog {
+      allow get: if isSignedIn();
+      allow list: if false;
+      allow create: if isOwner() &&
+        isValidPlatformCatalog(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow update: if isOwner() &&
+        isValidPlatformCatalog(incoming()) &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'currency', 'voiceCloningEnabled', 'voiceCloningPaid', 'voiceCloningTokenCost',
+          'longScriptEnabled', 'longScriptPaid', 'longScriptTokenCost',
+          'srtGeneratorEnabled', 'srtGeneratorPaid', 'srtGeneratorTokenCost',
+          'updatedByUid', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Singleton Payment Settings (bKash / Nagad numbers & instructions) — Strictly Owner-only!
+    match /system/paymentSettings {
+      allow get: if isOwner();
+      allow list: if false;
+      allow create: if isOwner() &&
+        isValidPaymentSettings(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow update: if isOwner() &&
+        isValidPaymentSettings(incoming()) &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'bkashEnabled', 'bkashNumber', 'bkashAccountType', 'bkashInstructions',
+          'nagadEnabled', 'nagadNumber', 'nagadAccountType', 'nagadInstructions',
+          'updatedByUid', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Authenticated Users Registry (PII protected: self or Owner only; zero self-escalation)
+    match /users/{uid} {
+      allow get: if isValidId(uid) && (isDocOwner(uid) || isOwner());
+      allow list: if isOwner();
+      allow create: if isValidId(uid) &&
+        isVerifiedUser() &&
+        isValidUserProfile(incoming(), uid) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().lastSeenAt == request.time &&
+        (
+          (isDocOwner(uid) &&
+            incoming().email == request.auth.token.email &&
+            incoming().accountStatus == 'active' &&
+            (isBootstrappedOwner() ? incoming().role in ['owner', 'user'] : incoming().role == 'user')
+          ) ||
+          isOwner()
+        );
+      allow update: if isValidId(uid) &&
+        isValidUserProfile(incoming(), uid) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (isOwner() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName', 'photoURL', 'role', 'accountStatus', 'lastSeenAt', 'updatedAt'
+          ])) ||
+          (isDocOwner(uid) &&
+            incoming().role == existing().role &&
+            incoming().accountStatus == existing().accountStatus &&
+            incoming().lastSeenAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'photoURL', 'lastSeenAt', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if false;
+    }
+
+    // User-submitted bKash & Nagad Payment Requests (Self-submit pending; Owner verify/reject; Terminal lock)
+    match /paymentRequests/{orderId} {
+      allow get: if isValidId(orderId) && (
+        isOwner() ||
+        (isVerifiedUser() && existing().userUid == request.auth.uid)
+      );
+      allow list: if isOwner() || (
+        isVerifiedUser() && resource.data.userUid == request.auth.uid
+      );
+      allow create: if isValidId(orderId) &&
+        isVerifiedUser() &&
+        isValidPaymentRequest(incoming(), orderId) &&
+        incoming().userUid == request.auth.uid &&
+        incoming().userEmail == request.auth.token.email &&
+        incoming().status == 'pending' &&
+        incoming().reviewedByUid == '' &&
+        incoming().rejectionReason == '' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(orderId) &&
+        isOwner() &&
+        isValidPaymentRequest(incoming(), orderId) &&
+        existing().status == 'pending' &&
+        incoming().orderId == existing().orderId &&
+        incoming().userUid == existing().userUid &&
+        incoming().userEmail == existing().userEmail &&
+        incoming().trxId == existing().trxId &&
+        incoming().amountBdt == existing().amountBdt &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().reviewedByUid == request.auth.uid &&
+        incoming().status in ['approved', 'rejected'] &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'reviewedByUid', 'rejectionReason', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Paid Feature Entitlements & Token Balance per User (Read by self or Owner; writable exclusively by Owner)
+    match /entitlements/{uid} {
+      allow get: if isValidId(uid) && (isDocOwner(uid) || isOwner());
+      allow list: if isOwner();
+      allow create: if isValidId(uid) &&
+        isOwner() &&
+        isValidUserEntitlement(incoming(), uid) &&
+        incoming().grantedByUid == request.auth.uid &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(uid) &&
+        isOwner() &&
+        isValidUserEntitlement(incoming(), uid) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().grantedByUid == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'tokenBalance',
+          'voiceCloningUnlocked', 'voiceCloningExpiresAtMs',
+          'longScriptUnlocked', 'longScriptExpiresAtMs',
+          'srtGeneratorUnlocked', 'srtGeneratorExpiresAtMs',
+          'proBundleUnlocked', 'proBundleExpiresAtMs',
+          'grantedByUid', 'lastOrderId', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // Append-Only Token Accounting Ledger (Read by self or Owner; write strictly by Owner)
+    match /tokenLedger/{entryId} {
+      allow get: if isValidId(entryId) && (
+        isOwner() ||
+        (isVerifiedUser() && existing().userUid == request.auth.uid)
+      );
+      allow list: if isOwner() || (
+        isVerifiedUser() && resource.data.userUid == request.auth.uid
+      );
+      allow create: if isValidId(entryId) &&
+        isOwner() &&
+        isValidTokenLedgerEntry(incoming(), entryId) &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // Immutable Append-Only Owner Security Audit Log
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && isOwner();
+      allow list: if isOwner();
+      allow create: if isValidId(logId) &&
+        isOwner() &&
+        isValidAuditLog(incoming(), logId) &&
+        incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // Persistent User-Isolated Saved Voice Profiles (Strictly owned and accessible by ownerUid only)
+    match /savedVoices/{voiceId} {
+      allow get: if isValidId(voiceId) && isVerifiedUser() && existing().ownerUid == request.auth.uid;
+      allow list: if isVerifiedUser() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(voiceId) &&
+        isVerifiedUser() &&
+        isValidSavedVoiceProfile(incoming(), voiceId) &&
+        incoming().usageCount == 0 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().lastUsedAt == request.time;
+      allow update: if isValidId(voiceId) &&
+        isVerifiedUser() &&
+        isDocOwner(existing().ownerUid) &&
+        isValidSavedVoiceProfile(incoming(), voiceId) &&
+        incoming().voiceId == existing().voiceId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().ownerEmail == existing().ownerEmail &&
+        incoming().language == existing().language &&
+        incoming().languageName == existing().languageName &&
+        incoming().conditioningMethod == existing().conditioningMethod &&
+        incoming().modelCheckpoint == existing().modelCheckpoint &&
+        incoming().speakerConditioningSha256 == existing().speakerConditioningSha256 &&
+        incoming().promptConditioningSha256 == existing().promptConditioningSha256 &&
+        incoming().referenceTranscript == existing().referenceTranscript &&
+        incoming().referenceDurationSec == existing().referenceDurationSec &&
+        incoming().promptDurationSec == existing().promptDurationSec &&
+        incoming().fundamentalFreqHz == existing().fundamentalFreqHz &&
+        incoming().pitchMinHz == existing().pitchMinHz &&
+        incoming().pitchMaxHz == existing().pitchMaxHz &&
+        incoming().spectralWarmthRatio == existing().spectralWarmthRatio &&
+        incoming().estimatedSnrDb == existing().estimatedSnrDb &&
+        incoming().qualityGrade == existing().qualityGrade &&
+        incoming().sourceType == existing().sourceType &&
+        incoming().sourceFileName == existing().sourceFileName &&
+        incoming().storageKey == existing().storageKey &&
+        incoming().consentConfirmed == existing().consentConfirmed &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']) ||
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['usageCount', 'lastUsedAt', 'updatedAt']) &&
+            incoming().usageCount == existing().usageCount + 1 &&
+            incoming().lastUsedAt == request.time
+          )
+        );
+      allow delete: if isValidId(voiceId) && isVerifiedUser() && existing().ownerUid == request.auth.uid;
+
+      // Immutable User-Isolated Conditioning Binary Chunks (Master-gated to parent ownerUid)
+      match /conditioningChunks/{chunkId} {
+        allow get: if isValidId(voiceId) &&
+          isValidId(chunkId) &&
+          isVerifiedUser() &&
+          existing().ownerUid == request.auth.uid &&
+          get(/databases/$(database)/documents/savedVoices/$(voiceId)).data.ownerUid == request.auth.uid;
+        allow list: if isVerifiedUser() && resource.data.ownerUid == request.auth.uid;
+        allow create: if isValidId(voiceId) &&
+          isValidId(chunkId) &&
+          isVerifiedUser() &&
+          isValidSavedVoiceConditioningChunk(incoming(), voiceId, chunkId) &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/savedVoices/$(voiceId)) &&
+          get(/databases/$(database)/documents/savedVoices/$(voiceId)).data.ownerUid == request.auth.uid;
+        allow update: if false;
+        allow delete: if isValidId(voiceId) &&
+          isValidId(chunkId) &&
+          isVerifiedUser() &&
+          existing().ownerUid == request.auth.uid;
+      }
+    }
+  }
+}

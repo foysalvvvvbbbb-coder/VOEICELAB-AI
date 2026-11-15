@@ -88,10 +88,72 @@ export interface VoiceCloneEmotionTagReport {
   honestCapabilityNote?: string;
 }
 
+export type SavedVoiceSourceType =
+  | 'cloned_output'
+  | 'reference_upload'
+  | 'microphone'
+  | 'studio_sample';
+
+export interface SavedVoiceProfile {
+  voiceId: string;
+  ownerUid: string;
+  ownerEmail: string;
+  name: string;
+  language: CloningLanguageCode;
+  languageName: string;
+  conditioningMethod: string;
+  modelCheckpoint: string;
+  speakerConditioningSha256: string;
+  promptConditioningSha256: string;
+  referenceTranscript: string;
+  referenceDurationSec: number;
+  promptDurationSec: number;
+  fundamentalFreqHz: number;
+  pitchMinHz: number;
+  pitchMaxHz: number;
+  spectralWarmthRatio: number;
+  estimatedSnrDb: number;
+  qualityGrade: 'Studio Grade' | 'Good' | 'Acceptable (Noisy)' | 'Poor / Corrupted';
+  sourceType: SavedVoiceSourceType;
+  sourceFileName: string;
+  storageKey: string;
+  consentConfirmed: boolean;
+  usageCount: number;
+  hasConditioningAudio: boolean;
+  lastUsedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type VoiceAudioQualityMode = 'standard' | 'studio' | 'studio_plus';
+
+export interface VoiceAudioEnhancementReport {
+  qualityMode: VoiceAudioQualityMode;
+  qualityLabel: string;
+  adaptiveDecisions: string[];
+  inputNoiseFloorDb: number;
+  outputNoiseFloorDb: number;
+  inputEstimatedSnrDb: number;
+  outputEstimatedSnrDb: number;
+  inputIntegratedLufs: number;
+  outputIntegratedLufs: number;
+  outputLoudnessRangeLu: number;
+  outputTruePeakDb: number;
+  inputPitchHz: number;
+  outputPitchHz: number;
+  outputSampleRateHz: number;
+  eqAppliedSummary: string;
+  deEsserApplied: boolean;
+  noiseReductionDbApplied: number;
+  compressionSummary: string;
+}
+
 export interface VoiceCloneRequest {
-  referenceFileId: string;
+  referenceFileId?: string;
+  savedVoiceId?: string;
   language: CloningLanguageCode;
   text: string;
+  audioQuality?: VoiceAudioQualityMode;
   preservePitchContour: boolean;
   preserveSpectralTimbre: boolean;
   reuseCompletedChunks?: boolean;
@@ -106,6 +168,9 @@ export interface VoiceCloneResult {
   language: CloningLanguageCode;
   cloningMode: 'local-neural-zero-shot' | 'cloud-persona-conditioned-tts';
   routedModelUsed: string;
+  audioQuality?: VoiceAudioQualityMode;
+  usedSavedVoiceId?: string;
+  speakerPromptSha256?: string;
   inputCharCount: number;
   spokenCharCount?: number;
   spokenWordCount?: number;
@@ -116,6 +181,7 @@ export interface VoiceCloneResult {
   chunkCount?: number;
   chunks?: VoiceCloneChunkStatus[];
   emotionTagReport?: VoiceCloneEmotionTagReport;
+  audioEnhancementReport?: VoiceAudioEnhancementReport;
   speakerConditioningInfo: {
     embeddingExtractorUsed: string;
     neuralEmbeddingDimension: number;

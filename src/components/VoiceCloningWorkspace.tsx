@@ -22,13 +22,26 @@ import {
   Layers,
   Copy,
   Check,
-  Terminal
+  Terminal,
+  BookmarkPlus,
+  Pencil,
+  Trash2,
+  Play,
+  LogIn,
+  UserCheck,
+  Captions,
+  ArrowRight
 } from 'lucide-react';
 import {
   AudioSignalAnalysis,
   CloningLanguageCode,
+  SavedVoiceProfile,
+  SavedVoiceSourceType,
+  SrtSegment,
+  VoiceAudioQualityMode,
   VoiceCloneResult
 } from '../types/voicelab';
+import { useFirebaseAuth } from '../contexts/FirebaseAuthContext';
 import {
   CLONING_LANGUAGES,
   validateSameLanguageText
@@ -37,11 +50,16 @@ import { buildColabOneCellSetupScript } from '../data/colabSetupScript';
 import {
   ALL_RECOGNIZED_TAG_LIST,
   buildEmotionPreservingChunks,
+  DEFAULT_CLONING_CHUNK_MAX_CHARS,
   MAX_SUPPORTED_CLONING_SCRIPT_CHARS,
   parseEmotionTaggedScript,
   RECOGNIZED_EMOTION_TAGS,
   tokenizeScriptForLiveEditor
 } from '../utils/emotionTagParser';
+import {
+  buildSrtSegmentsFromVoiceClone,
+  formatSegmentsToSrtString
+} from '../utils/voiceToSrt';
 import { fetchApiJson } from '../utils/apiClient';
 import {
   completeOperation,
@@ -50,11 +68,23 @@ import {
   recordOperationRetry,
   startOperation,
   updateOperationStage,
-  updateUploadBytes
+  updateUploadBytes,
+  useLiveActivityState
 } from '../utils/activityManager';
+
+export interface VoiceToSrtHandoff {
+  fileName: string;
+  audioUrl: string;
+  languageCode: string;
+  languageName: string;
+  scriptName: string;
+  durationSeconds: number;
+  segments: SrtSegment[];
+}
 
 interface VoiceCloningWorkspaceProps {
   onNavigateBackToDashboard?: () => void;
+  onSendToSrtEditor?: (handoff: VoiceToSrtHandoff) => void;
   onActivityComplete?: (info: {
     languageLabel: string;
     downloadUrl: string;
@@ -78,20 +108,68 @@ function splitPreviewSentences(text: string): string[] {
 }
 
 export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
+  onSendToSrtEditor,
   onActivityComplete
 }) => {
+  const {
+    user,
+    savedVoices,
+    savedVoicesLoading,
+    saveVoiceProfile,
+    renameSavedVoiceProfile,
+    deleteSavedVoiceProfile,
+    recordSavedVoiceUsage,
+    fetchSavedVoicePreviewBlobUrl,
+    signInWithGoogle
+  } = useFirebaseAuth();
+
   const [selectedLang, setSelectedLang] = useState<CloningLanguageCode>('bn');
   const [referenceAnalysis, setReferenceAnalysis] = useState<AudioSignalAnalysis | null>(null);
   const [referenceTranscript, setReferenceTranscript] = useState<string>('');
+  const [lastReferenceSourceType, setLastReferenceSourceType] =
+    useState<SavedVoiceSourceType>('reference_upload');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Persistent Saved Voice Profiles UI State
+  const [selectedSavedVoiceId, setSelectedSavedVoiceId] = useState<string | null>(null);
+  const [newVoiceNameInput, setNewVoiceNameInput] = useState<string>('');
+  const [isSavingVoice, setIsSavingVoice] = useState<boolean>(false);
+  const [saveVoiceFeedback, setSaveVoiceFeedback] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+  const [renamingVoiceId, setRenamingVoiceId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState<string>('');
+  const [renameLoadingId, setRenameLoadingId] = useState<string | null>(null);
+  const [deletingVoiceId, setDeletingVoiceId] = useState<string | null>(null);
+  const [deleteLoadingId, setDeleteLoadingId] = useState<string | null>(null);
+  const [previewVoiceId, setPreviewVoiceId] = useState<string | null>(null);
+  const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
+  const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   const [inputText, setInputText] = useState<string>(
     CLONING_LANGUAGES.bn.sampleTexts[0].text
   );
+  const [audioQuality, setAudioQuality] = useState<VoiceAudioQualityMode>(() => {
+    try {
+      const saved = window.localStorage.getItem('voicelab_audio_quality');
+      if (saved === 'standard' || saved === 'studio' || saved === 'studio_plus') return saved;
+    } catch {
+      // Ignore storage errors
+    }
+    return 'studio';
+  });
   const preservePitchContour = false;
   const preserveSpectralTimbre = false;
-  const [localEndpointUrl, setLocalEndpointUrl] = useState<string>('');
+  const [localEndpointUrl, setLocalEndpointUrl] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem('voicelab_local_node_url') || '';
+    } catch {
+      return '';
+    }
+  });
   const [localNodeToken, setLocalNodeToken] = useState<string>('voicelab-local-token');
   const [enableCloudVerification, setEnableCloudVerification] = useState<boolean>(false);
   const [showColabGuide, setShowColabGuide] = useState<boolean>(false);
@@ -106,6 +184,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   const [showSignalDetails, setShowSignalDetails] = useState(false);
   const [showDetailedMetrics, setShowDetailedMetrics] = useState(false);
   const [showChunkBreakdown, setShowChunkBreakdown] = useState(false);
+  const [showAllActiveTags, setShowAllActiveTags] = useState(false);
+  const [showAllUnsupportedTags, setShowAllUnsupportedTags] = useState(false);
+  const [highlightConsentWarning, setHighlightConsentWarning] = useState(false);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [activePipelineStep, setActivePipelineStep] = useState(0);
@@ -127,14 +208,30 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const scriptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const highlightMirrorRef = useRef<HTMLDivElement | null>(null);
+  const advancedSettingsRef = useRef<HTMLDivElement | null>(null);
+  const nodeUrlInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadSectionRef = useRef<HTMLDivElement | null>(null);
+  const scriptEditorRef = useRef<HTMLDivElement | null>(null);
+  const consentCardRef = useRef<HTMLDivElement | null>(null);
 
+  const liveActivity = useLiveActivityState();
   const currentLangConfig = CLONING_LANGUAGES[selectedLang];
 
-  // Live emotion tag parsing, tokenizing, and chunk preview
+  const selectedSavedVoice = useMemo(
+    () => savedVoices.find((v) => v.voiceId === selectedSavedVoiceId) || null,
+    [savedVoices, selectedSavedVoiceId]
+  );
+
+  // Live emotion tag parsing, tokenizing, and chunk preview (matches 300-char server chunking)
   const liveTokens = useMemo(() => tokenizeScriptForLiveEditor(inputText), [inputText]);
   const parsedScript = useMemo(() => parseEmotionTaggedScript(inputText), [inputText]);
   const previewChunks = useMemo(
-    () => buildEmotionPreservingChunks(parsedScript, splitPreviewSentences, 320),
+    () =>
+      buildEmotionPreservingChunks(
+        parsedScript,
+        splitPreviewSentences,
+        DEFAULT_CLONING_CHUNK_MAX_CHARS
+      ),
     [parsedScript]
   );
   const scriptValidation = useMemo(
@@ -160,9 +257,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
   const detectedRefCode = referenceAnalysis?.detectedSpokenLanguage?.code;
   const isReferenceLanguageMismatch = Boolean(
-    detectedRefCode &&
+    !selectedSavedVoice &&
+      detectedRefCode &&
       ['bn', 'hi', 'en'].includes(detectedRefCode) &&
       detectedRefCode !== selectedLang
+  );
+  const isSavedVoiceLanguageMismatch = Boolean(
+    selectedSavedVoice && selectedSavedVoice.language !== selectedLang
   );
 
   const syncEditorScroll = () => {
@@ -270,6 +371,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         stageLabel: 'Applying reference vocal profile & alignment transcript...'
       });
       setReferenceAnalysis(data.analysis);
+      setSelectedSavedVoiceId(null);
+      setLastReferenceSourceType('studio_sample');
+      setSaveVoiceFeedback(null);
       setReferenceTranscript(
         parseEmotionTaggedScript(CLONING_LANGUAGES[lang].sampleTexts[0].text).spokenText
       );
@@ -333,6 +437,15 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       );
       if (op.isStale()) return;
       setReferenceAnalysis(data.analysis);
+      setSelectedSavedVoiceId(null);
+      setLastReferenceSourceType(
+        file.name.startsWith('mic_reference_') ? 'microphone' : 'reference_upload'
+      );
+      setSaveVoiceFeedback(null);
+      const excerpt = data.analysis.detectedSpokenLanguage?.transcriptExcerpt?.trim();
+      if (excerpt) {
+        setReferenceTranscript((prev) => (prev.trim() ? prev : excerpt));
+      }
       completeOperation(
         op.operationId,
         `Validated ${data.analysis.fileName} (${data.analysis.durationSeconds}s · ${data.analysis.fundamentalFreqHz} Hz)`
@@ -413,29 +526,297 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (previewBlobUrl) {
+        URL.revokeObjectURL(previewBlobUrl);
+      }
+    };
+  }, [previewBlobUrl]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('voicelab_audio_quality', audioQuality);
+    } catch {
+      // Ignore storage errors
+    }
+  }, [audioQuality]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('voicelab_local_node_url', localEndpointUrl);
+    } catch {
+      // Ignore storage errors
+    }
+  }, [localEndpointUrl]);
+
+  const lastCloneStorageKey = `voicelab_last_clone_result_v1_${user?.uid || 'guest'}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    try {
+      const raw = window.localStorage.getItem(lastCloneStorageKey);
+      if (!raw) {
+        setCloneResult(null);
+        return;
+      }
+      const parsed = JSON.parse(raw) as VoiceCloneResult;
+      if (parsed && parsed.jobId && parsed.wavUrl) {
+        fetch(parsed.wavUrl, { method: 'HEAD' })
+          .then((res) => {
+            if (!cancelled && res.ok) {
+              setCloneResult(parsed);
+            } else if (!cancelled) {
+              window.localStorage.removeItem(lastCloneStorageKey);
+            }
+          })
+          .catch(() => {});
+      }
+    } catch {
+      // Ignore storage parse errors
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [lastCloneStorageKey]);
+
+  useEffect(() => {
+    if (!cloneResult) return;
+    try {
+      window.localStorage.setItem(lastCloneStorageKey, JSON.stringify(cloneResult));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [cloneResult, lastCloneStorageKey]);
+
+  useEffect(() => {
+    if (!user?.uid) return;
+    const key = `voicelab_selected_voice_${user.uid}`;
+    if (selectedSavedVoiceId) {
+      try {
+        window.localStorage.setItem(key, selectedSavedVoiceId);
+      } catch {
+        // Ignore storage errors
+      }
+      return;
+    }
+    if (!savedVoicesLoading && savedVoices.length > 0 && !referenceAnalysis) {
+      try {
+        const storedId = window.localStorage.getItem(key);
+        if (storedId) {
+          const found = savedVoices.find((v) => v.voiceId === storedId && v.hasConditioningAudio);
+          if (found) {
+            setSelectedSavedVoiceId(found.voiceId);
+            setReferenceTranscript(found.referenceTranscript || '');
+            setSelectedLang(found.language);
+          }
+        }
+      } catch {
+        // Ignore storage errors
+      }
+    }
+  }, [user?.uid, selectedSavedVoiceId, savedVoices, savedVoicesLoading, referenceAnalysis]);
+
+  useEffect(() => {
+    if (!user && selectedSavedVoiceId) {
+      setSelectedSavedVoiceId(null);
+      setPreviewVoiceId(null);
+      setPreviewBlobUrl(null);
+    } else if (
+      selectedSavedVoiceId &&
+      !savedVoicesLoading &&
+      savedVoices.length > 0 &&
+      !savedVoices.some((v) => v.voiceId === selectedSavedVoiceId)
+    ) {
+      setSelectedSavedVoiceId(null);
+      if (user?.uid) {
+        try {
+          window.localStorage.removeItem(`voicelab_selected_voice_${user.uid}`);
+        } catch {
+          // Ignore storage errors
+        }
+      }
+    }
+  }, [user, savedVoices, savedVoicesLoading, selectedSavedVoiceId]);
+
+  const handleSelectSavedVoice = (voice: SavedVoiceProfile) => {
+    setSelectedSavedVoiceId(voice.voiceId);
+    setGenerationError(null);
+    setSaveVoiceFeedback(null);
+    setReferenceTranscript(voice.referenceTranscript || '');
+    if (voice.language !== selectedLang) {
+      setSelectedLang(voice.language);
+      const checkExisting = validateSameLanguageText(inputText, voice.language);
+      if (!checkExisting.isValid) {
+        setInputText(CLONING_LANGUAGES[voice.language].sampleTexts[0].text);
+      }
+    }
+  };
+
+  const handlePreviewSavedVoice = async (voice: SavedVoiceProfile) => {
+    if (previewVoiceId === voice.voiceId && previewBlobUrl) {
+      URL.revokeObjectURL(previewBlobUrl);
+      setPreviewBlobUrl(null);
+      setPreviewVoiceId(null);
+      return;
+    }
+    setPreviewError(null);
+    setPreviewLoadingId(voice.voiceId);
+    try {
+      const nextUrl = await fetchSavedVoicePreviewBlobUrl(voice.voiceId);
+      setPreviewBlobUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return nextUrl;
+      });
+      setPreviewVoiceId(voice.voiceId);
+    } catch (err: any) {
+      setPreviewError(err?.message || 'Unable to load private voice preview.');
+    } finally {
+      setPreviewLoadingId(null);
+    }
+  };
+
+  const handleSaveCurrentReferenceVoice = async () => {
+    if (!referenceAnalysis) return;
+    if (!user || !user.emailVerified) {
+      try {
+        await signInWithGoogle();
+      } catch {
+        // Error surfaced by auth context
+      }
+      return;
+    }
+    if (!consentConfirmed) {
+      setHighlightConsentWarning(true);
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: 'Please check the Voice Authorization box first before saving a voice profile.'
+      });
+      consentCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    setIsSavingVoice(true);
+    setSaveVoiceFeedback(null);
+    try {
+      const resp = await saveVoiceProfile({
+        referenceFileId: referenceAnalysis.fileId,
+        name: newVoiceNameInput.trim() || undefined,
+        language: selectedLang,
+        referenceTranscript: referenceTranscript.trim() || undefined,
+        sourceType: lastReferenceSourceType,
+        consentConfirmed: true,
+        deduplicateByPromptHash: false
+      });
+      setSelectedSavedVoiceId(resp.voice.voiceId);
+      setNewVoiceNameInput('');
+      setSaveVoiceFeedback({
+        type: 'success',
+        text: `Saved "${resp.voice.name}" (${resp.voice.voiceId}) to My Saved Voices.`
+      });
+    } catch (err: any) {
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: err?.message || 'Could not save voice profile.'
+      });
+    } finally {
+      setIsSavingVoice(false);
+    }
+  };
+
+  const handleConfirmRenameSavedVoice = async (voiceId: string) => {
+    const clean = renameDraft.trim();
+    if (!clean) return;
+    setRenameLoadingId(voiceId);
+    try {
+      await renameSavedVoiceProfile(voiceId, clean);
+      setRenamingVoiceId(null);
+      setRenameDraft('');
+    } catch (err: any) {
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: err?.message || 'Failed to rename saved voice.'
+      });
+    } finally {
+      setRenameLoadingId(null);
+    }
+  };
+
+  const handleConfirmDeleteSavedVoice = async (voiceId: string) => {
+    setDeleteLoadingId(voiceId);
+    try {
+      await deleteSavedVoiceProfile(voiceId);
+      if (selectedSavedVoiceId === voiceId) {
+        setSelectedSavedVoiceId(null);
+      }
+      if (previewVoiceId === voiceId) {
+        if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl);
+        setPreviewBlobUrl(null);
+        setPreviewVoiceId(null);
+      }
+      setDeletingVoiceId(null);
+    } catch (err: any) {
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: err?.message || 'Failed to delete saved voice.'
+      });
+    } finally {
+      setDeleteLoadingId(null);
+    }
+  };
+
   const handleGenerateClonedVoice = async (reuseCompletedChunks = true) => {
-    if (!referenceAnalysis) {
-      setGenerationError('Please upload or load an authorized reference voice first.');
+    const activeSavedVoice = selectedSavedVoice;
+    if (!activeSavedVoice && !referenceAnalysis) {
+      setGenerationError(
+        'Please select a saved voice profile or upload/record/load a reference voice first.'
+      );
+      uploadSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (activeSavedVoice && !activeSavedVoice.hasConditioningAudio) {
+      setGenerationError(
+        `Saved voice "${activeSavedVoice.name}" is missing speaker-conditioning audio on server storage. Please re-upload or record a reference once to restore it.`
+      );
       return;
     }
     if (!scriptValidation.isValid) {
       setGenerationError(scriptValidation.errorMessage || 'Text language mismatch.');
+      scriptEditorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (isSavedVoiceLanguageMismatch && activeSavedVoice) {
+      setGenerationError(
+        `Cross-Language Blocked: Saved voice "${activeSavedVoice.name}" is locked to ${activeSavedVoice.languageName}, which mismatches ${selectedLang.toUpperCase()}.`
+      );
       return;
     }
     if (isReferenceLanguageMismatch) {
       setGenerationError(
         `Cross-Language Blocked: Reference audio language (${detectedRefCode?.toUpperCase()}) does not match selected target language (${selectedLang.toUpperCase()}).`
       );
+      uploadSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
     if (!consentConfirmed) {
-      setGenerationError('Please confirm voice authorization before generating.');
+      setHighlightConsentWarning(true);
+      setGenerationError(
+        'Please check the Voice Authorization confirmation box directly above the Generate button to start cloning.'
+      );
+      consentCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;
     }
 
+    setHighlightConsentWarning(false);
     setIsGenerating(true);
     setGenerationError(null);
     setActivePipelineStep(0);
+
+    // Allow generous time for multi-chunk zero-shot CPU synthesis (up to 30 min)
+    const dynamicTimeoutMs = Math.max(
+      300_000,
+      Math.min(30 * 60 * 1000, Math.max(1, previewChunks.length) * 120_000)
+    );
 
     const op = startOperation({
       feature: 'voice-cloning',
@@ -443,12 +824,17 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       stages: [
         'Parsing emotion tags & verifying genuine cloning capability',
         `Synthesizing ${previewChunks.length} emotion-scoped chunk(s) conditioned on reference audio`,
-        'Finalizing lossless 24kHz WAV/MP3 loudness & anti-clipping mastering',
+        audioQuality === 'standard'
+          ? 'Finalizing 24kHz WAV/MP3 loudness & anti-clipping mastering'
+          : audioQuality === 'studio_plus'
+          ? 'Applying Studio Plus 48kHz broadcast voice mastering'
+          : 'Applying adaptive 48kHz Studio voice mastering',
         'Computing 3072-D & 16-D audio embeddings',
         'Running single-pass ASR back-transcription & zero-literal-tag check'
       ],
       initialProgressPct: null,
       progressSource: 'indeterminate-inference',
+      timeoutMs: dynamicTimeoutMs,
       canCancel: true
     });
     const stopStream = connectBackendOperationStream(op.operationId);
@@ -457,34 +843,149 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       setActivePipelineStep((prev) => (prev < PIPELINE_A_STEPS.length - 1 ? prev + 1 : prev));
     }, 1200);
 
+    let activeBackendJobId: string | null = null;
+    const onAbortSignal = () => {
+      if (activeBackendJobId) {
+        fetchApiJson(`/api/voice-clone/jobs/${encodeURIComponent(activeBackendJobId)}/cancel`, {
+          method: 'POST'
+        }).catch(() => {});
+      }
+    };
+    op.signal.addEventListener('abort', onAbortSignal, { once: true });
+
     try {
-      const data = await fetchApiJson<{ status: string; result: VoiceCloneResult }>(
-        '/api/voice-clone/generate',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          operationId: op.operationId,
-          signal: op.signal,
-          onRetry: (_, reason) => recordOperationRetry(op.operationId, reason),
-          body: JSON.stringify({
-            referenceFileId: referenceAnalysis.fileId,
-            language: selectedLang,
-            text: inputText,
-            referenceTranscript: referenceTranscript.trim() || undefined,
-            preservePitchContour,
-            preserveSpectralTimbre,
-            reuseCompletedChunks,
-            localEndpointUrl: localEndpointUrl.trim() || undefined,
-            localNodeToken: localNodeToken.trim() || undefined,
-            enableCloudVerification,
-            consentConfirmed
-          })
-        }
-      );
+      const startData = await fetchApiJson<{
+        status?: string;
+        jobId?: string;
+        result?: VoiceCloneResult;
+      }>('/api/voice-clone/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        operationId: op.operationId,
+        signal: op.signal,
+        onRetry: (_, reason) => recordOperationRetry(op.operationId, reason),
+        body: JSON.stringify({
+          referenceFileId: activeSavedVoice ? undefined : referenceAnalysis?.fileId,
+          savedVoiceId: activeSavedVoice ? activeSavedVoice.voiceId : undefined,
+          language: selectedLang,
+          text: inputText,
+          referenceTranscript: referenceTranscript.trim() || undefined,
+          audioQuality,
+          preservePitchContour,
+          preserveSpectralTimbre,
+          reuseCompletedChunks,
+          localEndpointUrl: localEndpointUrl.trim() || undefined,
+          localNodeToken: localNodeToken.trim() || undefined,
+          enableCloudVerification,
+          consentConfirmed,
+          asyncJob: true
+        })
+      });
 
       if (op.isStale()) return;
 
-      const resObj: VoiceCloneResult = data.result;
+      let resObj: VoiceCloneResult | undefined = startData.result;
+
+      if (!resObj && startData.jobId) {
+        activeBackendJobId = startData.jobId;
+        let transientPollErrors = 0;
+
+        while (!resObj) {
+          if (op.signal.aborted || op.isStale()) {
+            const abortErr = new Error('Voice cloning operation ended before completion.');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
+
+          await new Promise<void>((resolve) => {
+            const t = window.setTimeout(resolve, 700);
+            const onWake = () => {
+              window.clearTimeout(t);
+              resolve();
+            };
+            op.signal.addEventListener('abort', onWake, { once: true });
+          });
+
+          if (op.signal.aborted || op.isStale()) {
+            const abortErr = new Error('Voice cloning operation ended before completion.');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
+
+          try {
+            const pollResp = await fetchApiJson<{
+              jobId: string;
+              status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+              operation?: {
+                stageIndex?: number;
+                stageLabel?: string;
+                stageDetail?: string;
+                progressPct?: number | null;
+                progressSource?: 'backend-chunks' | 'indeterminate-inference' | 'completed';
+                completedUnits?: number;
+                totalUnits?: number;
+              } | null;
+              result?: VoiceCloneResult;
+              error?: string;
+            }>(`/api/voice-clone/jobs/${encodeURIComponent(startData.jobId)}`, {
+              method: 'GET',
+              signal: op.signal
+            });
+            transientPollErrors = 0;
+
+            if (pollResp.operation && pollResp.status === 'running') {
+              updateOperationStage(op.operationId, {
+                stageIndex: pollResp.operation.stageIndex,
+                stageLabel: pollResp.operation.stageLabel,
+                stageDetail: pollResp.operation.stageDetail,
+                progressPct: pollResp.operation.progressPct,
+                progressSource: pollResp.operation.progressSource,
+                completedUnits: pollResp.operation.completedUnits,
+                totalUnits: pollResp.operation.totalUnits
+              });
+              if (typeof pollResp.operation.stageIndex === 'number') {
+                setActivePipelineStep(pollResp.operation.stageIndex);
+              }
+            }
+
+            if (pollResp.status === 'succeeded' && pollResp.result) {
+              resObj = pollResp.result;
+              break;
+            }
+            if (pollResp.status === 'failed') {
+              throw new Error(pollResp.error || 'Voice cloning pipeline failed.');
+            }
+            if (pollResp.status === 'cancelled') {
+              const cancelErr = new Error('Voice cloning job was cancelled.');
+              cancelErr.name = 'AbortError';
+              throw cancelErr;
+            }
+          } catch (pollErr: any) {
+            if (pollErr?.name === 'AbortError' || op.signal.aborted || op.isStale()) {
+              throw pollErr;
+            }
+            transientPollErrors += 1;
+            const msg = String(pollErr?.message || '');
+            const isFatal =
+              transientPollErrors >= 5 ||
+              msg.includes('JOB_NOT_FOUND') ||
+              msg.includes('not found') ||
+              msg.includes('failed') ||
+              msg.includes('ZeroGPU') ||
+              msg.includes('Mode 2');
+            if (isFatal) {
+              throw pollErr;
+            }
+          }
+        }
+      }
+
+      if (!resObj) {
+        throw new Error('Voice cloning did not return synthesized audio.');
+      }
+
+      if (op.isStale()) return;
+
       setCloneResult(resObj);
       setActivePipelineStep(PIPELINE_A_STEPS.length - 1);
       const matchPct =
@@ -494,6 +995,33 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         `${currentLangConfig.englishName} speech ready (${resObj.outputDurationSec}s · ${resObj.chunkCount} chunk${resObj.chunkCount === 1 ? '' : 's'} · ${matchPct !== null ? `${matchPct}% ASR match` : '0-Quota Mode 2'})`
       );
 
+      if (activeSavedVoice) {
+        void recordSavedVoiceUsage(activeSavedVoice.voiceId).catch(() => {});
+      } else if (user && user.emailVerified && referenceAnalysis) {
+        try {
+          const savedResp = await saveVoiceProfile({
+            referenceFileId: referenceAnalysis.fileId,
+            name: newVoiceNameInput.trim() || undefined,
+            language: selectedLang,
+            referenceTranscript: referenceTranscript.trim() || undefined,
+            modelCheckpoint: resObj.routedModelUsed,
+            sourceType: lastReferenceSourceType,
+            consentConfirmed: true,
+            deduplicateByPromptHash: true
+          });
+          setSelectedSavedVoiceId(savedResp.voice.voiceId);
+          setNewVoiceNameInput('');
+          setSaveVoiceFeedback({
+            type: 'success',
+            text: savedResp.deduplicated
+              ? `Using saved speaker profile "${savedResp.voice.name}" (${savedResp.voice.voiceId}).`
+              : `Auto-saved speaker profile "${savedResp.voice.name}" (${savedResp.voice.voiceId}) to My Saved Voices for future sessions.`
+          });
+        } catch {
+          // Non-fatal if auto-save fails after successful synthesis
+        }
+      }
+
       if (onActivityComplete) {
         onActivityComplete({
           languageLabel: `${currentLangConfig.englishName} (${currentLangConfig.nativeName})`,
@@ -502,11 +1030,25 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         });
       }
     } catch (err: any) {
-      if (err?.name === 'AbortError' || op.isStale()) return;
+      if (err?.name === 'AbortError' || op.isStale()) {
+        // Check if abort came from timeout vs explicit user cancellation
+        const timedOutMsg =
+          liveActivity.primaryOperation?.operationId === op.operationId &&
+          liveActivity.primaryOperation.status === 'failed'
+            ? liveActivity.primaryOperation.error
+            : null;
+        if (timedOutMsg) {
+          setGenerationError(
+            `${timedOutMsg} Completed chunks are saved on the server—click "Retry Failed Chunks" to resume cleanly.`
+          );
+        }
+        return;
+      }
       const msg = err?.message || 'Voice cloning pipeline encountered an error.';
       setGenerationError(msg);
       failOperation(op.operationId, msg);
     } finally {
+      op.signal.removeEventListener('abort', onAbortSignal);
       stopStream();
       clearInterval(stepInterval);
       setIsGenerating(false);
@@ -526,6 +1068,48 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       canCancel: false
     });
     completeOperation(op.operationId, `Downloading ${filename}`);
+  };
+
+  const handleDownloadGeneratedSrt = () => {
+    if (!cloneResult) return;
+    const srtSegments = buildSrtSegmentsFromVoiceClone(cloneResult);
+    if (srtSegments.length === 0) return;
+    const srtText = `\uFEFF${formatSegmentsToSrtString(srtSegments)}`;
+    const filename = `voicelab_${cloneResult.language}_${cloneResult.jobId}.srt`;
+    const blob = new Blob([srtText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    const op = startOperation({
+      feature: 'export-download',
+      title: `Export ${filename}`,
+      stages: [`Generated ${srtSegments.length} aligned subtitle blocks`, 'Triggered UTF-8 BOM .SRT download'],
+      initialProgressPct: 100,
+      progressSource: 'task-steps',
+      canCancel: false
+    });
+    completeOperation(op.operationId, `Exported ${filename} (${srtSegments.length} subtitle blocks)`);
+  };
+
+  const handleOpenGeneratedInSrtStudio = () => {
+    if (!cloneResult || !onSendToSrtEditor) return;
+    const srtSegments = buildSrtSegmentsFromVoiceClone(cloneResult);
+    const langCfg = CLONING_LANGUAGES[cloneResult.language];
+    onSendToSrtEditor({
+      fileName: `voicelab_${cloneResult.language}_${cloneResult.jobId}.wav`,
+      audioUrl: cloneResult.wavUrl,
+      languageCode: cloneResult.language,
+      languageName: `${langCfg.englishName} (${langCfg.nativeName})`,
+      scriptName: langCfg.scriptName,
+      durationSeconds: cloneResult.outputDurationSec,
+      segments: srtSegments
+    });
   };
 
   const formatBytes = (bytes: number) => {
@@ -597,6 +1181,15 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     }
   };
 
+  const handleOpenMode2Setup = () => {
+    setShowAdvancedSettings(true);
+    setShowColabGuide(true);
+    window.setTimeout(() => {
+      advancedSettingsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      nodeUrlInputRef.current?.focus();
+    }, 80);
+  };
+
   const scriptFontClass =
     selectedLang === 'bn' ? 'font-bengali' : selectedLang === 'hi' ? 'font-hindi' : 'font-sans';
 
@@ -625,10 +1218,10 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
           <div className="bg-[#0B1512] border border-[#19352A] rounded-xl px-3 py-2 flex items-center gap-2">
             <Cpu className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
-            <span className="text-[#A2B5AA] font-mono whitespace-nowrap">
+            <span className="text-[#42D9A0] font-mono whitespace-nowrap">
               {localEndpointUrl.trim()
-                ? `Mode 2: Zero-Shot Neural (${currentLangConfig.openSourceEquivalent.split(' ')[0]})`
-                : 'No Mode 2 Node (Cloud Models Do Not Clone)'}
+                ? `Mode 2 Custom Node (${selectedLang === 'en' ? 'OpenVoice V2' : 'IndicF5'})`
+                : `Mode 2 Built-in Zero-Shot (${selectedLang === 'en' ? 'F5-TTS' : 'IndicF5'} · 0 Quota)`}
             </span>
           </div>
         </div>
@@ -674,10 +1267,274 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         })}
       </div>
 
+      {/* My Saved Voices — Persistent Account Speaker Profiles */}
+      <div className="bg-[#12231D] border border-[#19352A] rounded-2xl p-4 sm:p-5 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <UserCheck className="w-4 h-4 text-[#42D9A0]" />
+              <h2 className="text-sm font-semibold text-[#F4F8F5]">My Saved Voices</h2>
+              {user && user.emailVerified && (
+                <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-[#0B1512] border border-[#19352A] text-[#42D9A0]">
+                  {savedVoices.length} saved
+                </span>
+              )}
+            </div>
+            <p className="text-[11px] text-[#A2B5AA]">
+              Saved speaker conditioning profiles persist across sessions for your account. Select
+              any saved voice to generate new scripts without re-uploading audio.
+            </p>
+          </div>
+
+          {selectedSavedVoice && (
+            <button
+              type="button"
+              onClick={() => setSelectedSavedVoiceId(null)}
+              className="px-2.5 py-1 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#19352A] text-[11px] font-medium text-[#A2B5AA] hover:text-[#F4F8F5] transition-colors cursor-pointer"
+            >
+              Use New Reference Instead
+            </button>
+          )}
+        </div>
+
+        {!user || !user.emailVerified ? (
+          <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <p className="text-xs text-[#A2B5AA]">
+              Sign in with your verified Google account to save cloned voices and reuse them across
+              sessions and devices.
+            </p>
+            <button
+              type="button"
+              onClick={() => void signInWithGoogle()}
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#16A36A] hover:bg-[#16A36A]/90 text-xs font-semibold text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <LogIn className="w-3.5 h-3.5" />
+              <span>Sign in with Google</span>
+            </button>
+          </div>
+        ) : savedVoicesLoading ? (
+          <div className="text-xs text-[#A2B5AA] flex items-center gap-2 py-2">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#42D9A0]" />
+            <span>Loading your persistent saved voice profiles...</span>
+          </div>
+        ) : savedVoices.length === 0 ? (
+          <div className="bg-[#0B1512] border border-dashed border-[#19352A] rounded-xl p-3 text-xs text-[#A2B5AA]">
+            No saved voice profiles yet. Upload, record, or generate a voice clone in Step 01 — it
+            will be saved here automatically for instant reuse.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 max-h-80 overflow-y-auto pr-1">
+            {savedVoices.map((voice) => {
+              const isSelected = selectedSavedVoiceId === voice.voiceId;
+              const isRenaming = renamingVoiceId === voice.voiceId;
+              const isConfirmDeleting = deletingVoiceId === voice.voiceId;
+              const isPreviewing = previewVoiceId === voice.voiceId && Boolean(previewBlobUrl);
+              const createdLabel = (() => {
+                const d = new Date(voice.createdAt);
+                return Number.isNaN(d.getTime()) ? 'Recent' : d.toLocaleDateString();
+              })();
+
+              return (
+                <div
+                  key={voice.voiceId}
+                  className={`rounded-xl border p-3 space-y-2.5 transition-colors ${
+                    isSelected
+                      ? 'bg-[#19352A]/60 border-[#16A36A]'
+                      : 'bg-[#0B1512] border-[#19352A] hover:border-[#16A36A]/50'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1 space-y-0.5">
+                      {isRenaming ? (
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={renameDraft}
+                            onChange={(e) => setRenameDraft(e.target.value)}
+                            maxLength={80}
+                            className="flex-1 min-w-0 rounded-lg bg-[#12231D] border border-[#16A36A] px-2 py-1 text-xs text-[#F4F8F5] focus:outline-none"
+                            placeholder="Voice profile name"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void handleConfirmRenameSavedVoice(voice.voiceId)}
+                            disabled={renameLoadingId === voice.voiceId || !renameDraft.trim()}
+                            className="px-2 py-1 rounded-lg bg-[#16A36A] text-[11px] font-semibold text-[#F4F8F5] cursor-pointer"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRenamingVoiceId(null);
+                              setRenameDraft('');
+                            }}
+                            className="px-2 py-1 rounded-lg bg-[#12231D] border border-[#19352A] text-[11px] text-[#A2B5AA] cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="text-xs font-semibold text-[#F4F8F5] truncate">
+                            {voice.name}
+                          </span>
+                          {isSelected && (
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#16A36A]/25 border border-[#16A36A]/60 text-[#42D9A0] shrink-0">
+                              Active
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      <div className="text-[10px] font-mono text-[#A2B5AA] truncate">
+                        ID: {voice.voiceId}
+                      </div>
+                    </div>
+
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[#12231D] border border-[#19352A] text-[#42D9A0] shrink-0">
+                      {voice.language.toUpperCase()}
+                    </span>
+                  </div>
+
+                  <div className="text-[11px] text-[#A2B5AA] space-y-0.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate">{voice.languageName}</span>
+                      <span className="font-mono text-[#F4F8F5] shrink-0">
+                        {voice.promptDurationSec}s prompt · {voice.fundamentalFreqHz} Hz
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 text-[10px] font-mono">
+                      <span className="truncate">
+                        Cond: {voice.promptConditioningSha256.slice(0, 10) || 'canonical-wav'}
+                      </span>
+                      <span className="shrink-0">
+                        {createdLabel} · {voice.usageCount} uses
+                      </span>
+                    </div>
+                  </div>
+
+                  {voice.hasConditioningAudio ? (
+                    <div className="text-[10px] text-[#42D9A0] bg-[#19352A]/40 border border-[#16A36A]/35 rounded-lg px-2 py-1 flex items-center gap-1.5">
+                      <ShieldCheck className="w-3 h-3 shrink-0" />
+                      <span>Permanent Cloud + Vault Speaker Conditioning Active</span>
+                    </div>
+                  ) : (
+                    <div className="text-[10px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-2 py-1">
+                      Speaker conditioning audio missing. Re-upload reference once to restore
+                      cloud vault.
+                    </div>
+                  )}
+
+                  {isPreviewing && previewBlobUrl && (
+                    <audio controls autoPlay src={previewBlobUrl} className="w-full h-8 rounded-lg" />
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-1.5 pt-1 border-t border-[#19352A]">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectSavedVoice(voice)}
+                      disabled={!voice.hasConditioningAudio}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'bg-[#16A36A] text-[#F4F8F5]'
+                          : voice.hasConditioningAudio
+                          ? 'bg-[#19352A] hover:bg-[#16A36A] text-[#F4F8F5]'
+                          : 'bg-[#12231D] text-[#A2B5AA]/50 cursor-not-allowed'
+                      }`}
+                    >
+                      {isSelected ? 'Selected' : 'Use Voice'}
+                    </button>
+
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => void handlePreviewSavedVoice(voice)}
+                        disabled={!voice.hasConditioningAudio || previewLoadingId === voice.voiceId}
+                        title="Preview saved reference voice"
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-[#12231D] hover:bg-[#19352A] border border-[#19352A] text-[11px] text-[#A2B5AA] hover:text-[#F4F8F5] cursor-pointer disabled:opacity-40"
+                      >
+                        {previewLoadingId === voice.voiceId ? (
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <Play className="w-3 h-3 text-[#42D9A0]" />
+                        )}
+                        <span>{isPreviewing ? 'Stop' : 'Preview'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRenamingVoiceId(voice.voiceId);
+                          setRenameDraft(voice.name);
+                          setDeletingVoiceId(null);
+                        }}
+                        title="Rename saved voice"
+                        className="p-1.5 rounded-lg bg-[#12231D] hover:bg-[#19352A] border border-[#19352A] text-[#A2B5AA] hover:text-[#F4F8F5] cursor-pointer"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
+
+                      {isConfirmDeleting ? (
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => void handleConfirmDeleteSavedVoice(voice.voiceId)}
+                            disabled={deleteLoadingId === voice.voiceId}
+                            className="px-2 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-[10px] font-semibold text-white cursor-pointer"
+                          >
+                            {deleteLoadingId === voice.voiceId ? '...' : 'Confirm'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeletingVoiceId(null)}
+                            className="px-1.5 py-1 rounded-lg bg-[#12231D] border border-[#19352A] text-[10px] text-[#A2B5AA] cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeletingVoiceId(voice.voiceId);
+                            setRenamingVoiceId(null);
+                          }}
+                          title="Delete saved voice & conditioning audio"
+                          className="p-1.5 rounded-lg bg-[#12231D] hover:bg-red-950/70 border border-[#19352A] hover:border-red-500/40 text-[#A2B5AA] hover:text-red-300 cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {previewError && (
+          <div className="text-xs text-red-200 bg-red-950/50 border border-red-500/40 rounded-lg px-3 py-2">
+            {previewError}
+          </div>
+        )}
+        {saveVoiceFeedback && (
+          <div
+            className={`text-xs rounded-lg px-3 py-2 border ${
+              saveVoiceFeedback.type === 'success'
+                ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                : 'bg-red-950/50 border-red-500/40 text-red-200'
+            }`}
+          >
+            {saveVoiceFeedback.text}
+          </div>
+        )}
+      </div>
+
       {/* Main Two-Column Studio Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
         {/* Left Column (5 cols): Reference Audio Upload, Recording & Reference Vocal Identity */}
-        <div className="lg:col-span-5 space-y-4">
+        <div ref={uploadSectionRef} className="lg:col-span-5 space-y-4">
           <div className="bg-[#12231D] border border-[#19352A] rounded-2xl p-4 sm:p-5 space-y-4">
             <div className="flex items-center justify-between gap-2">
               <h2 className="text-sm font-semibold text-[#F4F8F5]">
@@ -781,13 +1638,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <div className="flex items-center justify-between text-[#42D9A0] font-semibold">
                     <span>Reference Speaker Conditioning</span>
                     <span className="font-mono">
-                      {localEndpointUrl.trim() ? 'Mode 2 Zero-Shot' : 'Mode 2 Required'}
+                      {localEndpointUrl.trim() ? 'Mode 2 Custom Node' : 'Mode 2 Zero-Shot Active'}
                     </span>
                   </div>
                   <p className="text-[#A2B5AA] leading-relaxed">
                     {localEndpointUrl.trim() ? (
                       <>
-                        Mode 2 Local Zero-Shot Neural Node configured (
+                        Custom Mode 2 Zero-Shot Neural Node configured (
                         <span className="text-[#F4F8F5] font-mono">
                           {currentLangConfig.openSourceEquivalent}
                         </span>
@@ -796,11 +1653,19 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                       </>
                     ) : (
                       <>
-                        Cloud Gemini speech models only provide 5 fixed prebuilt voices and cannot
-                        clone uploaded reference audio. VoiceLab AI will not substitute a generic
-                        Gemini voice—connect Mode 2 Local Neural Node (
-                        <span className="text-[#F4F8F5] font-mono">http://127.0.0.1:8001</span>)
-                        under settings to synthesize true reference-conditioned speech.
+                        Using built-in zero-shot{' '}
+                        <span className="text-[#F4F8F5] font-mono">
+                          {selectedLang === 'en' ? 'SWivid/F5-TTS' : 'ai4bharat/IndicF5'}
+                        </span>{' '}
+                        speaker conditioning (<strong className="text-[#42D9A0]">0 Gemini Quota</strong>
+                        ). Your exact uploaded reference voice is conditioned across every chunk.{' '}
+                        <button
+                          type="button"
+                          onClick={handleOpenMode2Setup}
+                          className="underline text-[#42D9A0] font-semibold cursor-pointer"
+                        >
+                          Optional: Private Colab T4 Node
+                        </button>
                       </>
                     )}
                   </p>
@@ -873,6 +1738,44 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     </div>
                   </div>
                 )}
+
+                {/* Save Reference Speaker Profile to Account */}
+                <div className="pt-2 border-t border-[#19352A] space-y-2">
+                  {user && user.emailVerified ? (
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="text"
+                        value={newVoiceNameInput}
+                        onChange={(e) => setNewVoiceNameInput(e.target.value)}
+                        maxLength={80}
+                        placeholder="Custom voice name (optional)..."
+                        className="flex-1 rounded-lg bg-[#12231D] border border-[#19352A] focus:border-[#16A36A] px-2.5 py-1.5 text-xs text-[#F4F8F5] placeholder-[#A2B5AA]/50 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleSaveCurrentReferenceVoice()}
+                        disabled={isSavingVoice}
+                        className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#16A36A] hover:bg-[#16A36A]/90 text-xs font-semibold text-[#F4F8F5] transition-colors cursor-pointer whitespace-nowrap disabled:opacity-60"
+                      >
+                        {isSavingVoice ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <BookmarkPlus className="w-3.5 h-3.5" />
+                        )}
+                        <span>{isSavingVoice ? 'Saving...' : 'Save Voice Profile'}</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void signInWithGoogle()}
+                      className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#12231D] hover:bg-[#19352A] border border-[#19352A] text-xs font-medium text-[#42D9A0] cursor-pointer"
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      <span>Sign in with Google to Save Voice Profile</span>
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 
@@ -896,7 +1799,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
         </div>
 
         {/* Right Column (7 cols): Emotion-Tagged Script Editor, Long-Script Telemetry, Settings & Output */}
-        <div className="lg:col-span-7 space-y-4">
+        <div ref={scriptEditorRef} className="lg:col-span-7 space-y-4">
           <div
             className={`${
               isFullscreenEditor
@@ -935,6 +1838,56 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               </div>
             </div>
 
+            {/* Saved Voice Selector for Script-to-Audio */}
+            <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="flex items-center gap-2 text-xs min-w-0">
+                <UserCheck className="w-4 h-4 text-[#42D9A0] shrink-0" />
+                <span className="font-medium text-[#F4F8F5] whitespace-nowrap">
+                  Speaker Identity:
+                </span>
+                {selectedSavedVoice ? (
+                  <span className="text-[#42D9A0] font-semibold truncate">
+                    {selectedSavedVoice.name} ({selectedSavedVoice.languageName})
+                  </span>
+                ) : referenceAnalysis ? (
+                  <span className="text-[#A2B5AA] truncate">
+                    Step 01 Reference ({referenceAnalysis.fileName})
+                  </span>
+                ) : (
+                  <span className="text-amber-300 truncate">
+                    Select a saved voice or upload reference in Step 01
+                  </span>
+                )}
+              </div>
+
+              {user && user.emailVerified && savedVoices.length > 0 && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <select
+                    aria-label="Saved Voice Selector"
+                    value={selectedSavedVoiceId || ''}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      if (!nextId) {
+                        setSelectedSavedVoiceId(null);
+                        return;
+                      }
+                      const found = savedVoices.find((v) => v.voiceId === nextId);
+                      if (found) handleSelectSavedVoice(found);
+                    }}
+                    className="rounded-lg bg-[#12231D] border border-[#19352A] focus:border-[#16A36A] px-2.5 py-1.5 text-xs text-[#F4F8F5] focus:outline-none max-w-[230px]"
+                  >
+                    <option value="">-- Use Step 01 Audio --</option>
+                    {savedVoices.map((v) => (
+                      <option key={v.voiceId} value={v.voiceId} disabled={!v.hasConditioningAudio}>
+                        {v.name} ({v.language.toUpperCase()} · {v.promptDurationSec}s
+                        {!v.hasConditioningAudio ? ' · Unavailable' : ''})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
             {/* Sample Presets */}
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-[11px] text-[#A2B5AA] mr-1">Presets:</span>
@@ -952,11 +1905,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
             {/* Interactive Emotion, Delivery & Timing Tag Palette (Click to Insert at Cursor) */}
             <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2 text-[11px]">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
                 <span className="text-[#A2B5AA] flex items-center gap-1.5 font-medium">
-                  <Sparkles className="w-3.5 h-3.5 text-[#42D9A0]" />
+                  <Sparkles className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
                   <span>
-                    Insert Emotion / Delivery Tag at Cursor (Never spoken aloud — controls prosody):
+                    Insert Emotion / Delivery Tag (বাংলা যেকোনো স্টেজ-ট্যাগ যেমন{' '}
+                    <code className="text-[#42D9A0]">[নিচু স্বরে]</code>,{' '}
+                    <code className="text-[#42D9A0]">[দীর্ঘ বিরতি]</code>-ও অটোমেটিক কাজ করে):
                   </span>
                 </span>
                 {activeScriptTagTokens.length > 0 && (
@@ -976,10 +1931,15 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     key={tagSpec.name}
                     type="button"
                     onClick={() => handleInsertEmotionTagAtCursor(tagSpec.token)}
-                    title={`Insert ${tagSpec.token} (${tagSpec.label})`}
-                    className={`px-2 py-0.5 rounded-md border text-[11px] font-mono transition-transform active:scale-95 cursor-pointer ${tagSpec.badgeColorClass}`}
+                    title={`Insert ${tagSpec.token} (${tagSpec.label} / ${tagSpec.bengaliLabel})`}
+                    className={`px-2 py-0.5 rounded-md border text-[11px] font-mono transition-transform active:scale-95 cursor-pointer inline-flex items-center gap-1 ${tagSpec.badgeColorClass}`}
                   >
-                    {tagSpec.token}
+                    <span>{tagSpec.token}</span>
+                    {selectedLang === 'bn' && (
+                      <span className="font-bengali opacity-80 text-[10px]">
+                        {tagSpec.bengaliLabel}
+                      </span>
+                    )}
                   </button>
                 ))}
               </div>
@@ -1046,13 +2006,16 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                 />
               </div>
 
-              {/* Active Tag Chips Strip (Interactive Removable Chips) */}
+              {/* Active Tag Chips Strip (Interactive Removable Chips — collapsed on long scripts for mobile clarity) */}
               {activeScriptTagTokens.length > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                   <span className="text-[11px] text-[#A2B5AA] mr-1">
                     Active tags in script ({activeScriptTagTokens.length}):
                   </span>
-                  {activeScriptTagTokens.map((tok, idx) => {
+                  {(showAllActiveTags
+                    ? activeScriptTagTokens
+                    : activeScriptTagTokens.slice(0, 6)
+                  ).map((tok, idx) => {
                     const spec =
                       tok.type === 'recognized-tag' && tok.recognizedName
                         ? RECOGNIZED_EMOTION_TAGS[tok.recognizedName]
@@ -1060,24 +2023,55 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     return (
                       <span
                         key={`${tok.startIndex}_${idx}`}
+                        title={
+                          tok.isNaturalDirection
+                            ? `Auto-mapped to: ${[
+                                ...(tok.mappedTags || []),
+                                tok.mappedPauseMs ? `pause ${tok.mappedPauseMs}ms` : ''
+                              ]
+                                .filter(Boolean)
+                                .join(' + ')}`
+                            : undefined
+                        }
                         className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[11px] font-mono ${
                           spec
                             ? spec.badgeColorClass
                             : 'bg-red-500/20 border-red-400/50 text-red-200'
                         }`}
                       >
-                        <span>{tok.raw}</span>
+                        <span className="max-w-[180px] truncate">{tok.raw}</span>
+                        {tok.isNaturalDirection && (
+                          <span className="text-[10px] opacity-80">
+                            →{[
+                              ...(tok.mappedTags || []),
+                              tok.mappedPauseMs ? `${tok.mappedPauseMs}ms` : ''
+                            ]
+                              .filter(Boolean)
+                              .join('+')}
+                          </span>
+                        )}
                         <button
                           type="button"
                           onClick={() => handleRemoveTagTokenAtRange(tok.startIndex, tok.endIndex)}
                           title={`Remove ${tok.raw} from script`}
-                          className="hover:opacity-100 opacity-75 cursor-pointer"
+                          className="hover:opacity-100 opacity-75 cursor-pointer shrink-0"
                         >
                           <X className="w-3 h-3" />
                         </button>
                       </span>
                     );
                   })}
+                  {activeScriptTagTokens.length > 6 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllActiveTags((prev) => !prev)}
+                      className="px-2 py-0.5 rounded-md border border-[#19352A] bg-[#0B1512] hover:bg-[#19352A] text-[11px] font-mono text-[#42D9A0] cursor-pointer"
+                    >
+                      {showAllActiveTags
+                        ? 'Show fewer'
+                        : `+${activeScriptTagTokens.length - 6} more`}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1085,15 +2079,37 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               {parsedScript.unsupportedTags.length > 0 && (
                 <div className="bg-amber-950/60 border border-amber-500/50 rounded-xl p-2.5 text-xs text-amber-200 flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div>
-                    Unrecognized bracket tag(s) detected:{' '}
-                    <span className="font-mono font-semibold">
-                      {parsedScript.unsupportedTags.join(', ')}
-                    </span>
-                    . Unrecognized tags are automatically stripped before synthesis so they are{' '}
-                    <span className="font-semibold underline">never spoken aloud</span>. Supported
-                    tags: [happy], [sad], [angry], [excited], [calm], [serious], [whispering],
-                    [softly], [confidently], [shouting], [pause].
+                  <div className="space-y-1 min-w-0">
+                    <div>
+                      <span className="font-semibold">
+                        {parsedScript.unsupportedTags.length} bracket stage-direction tag
+                        {parsedScript.unsupportedTags.length === 1 ? '' : 's'}
+                      </span>{' '}
+                      detected:{' '}
+                      <span className="font-mono font-semibold">
+                        {(showAllUnsupportedTags
+                          ? parsedScript.unsupportedTags
+                          : parsedScript.unsupportedTags.slice(0, 3)
+                        ).join(', ')}
+                      </span>
+                      {parsedScript.unsupportedTags.length > 3 && !showAllUnsupportedTags && (
+                        <span>
+                          {' '}
+                          and {parsedScript.unsupportedTags.length - 3} more
+                        </span>
+                      )}
+                      . Automatically stripped before synthesis so they are{' '}
+                      <span className="font-semibold underline">never spoken aloud</span>.
+                      {parsedScript.unsupportedTags.length > 3 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllUnsupportedTags((prev) => !prev)}
+                          className="ml-1.5 underline text-amber-300 font-semibold cursor-pointer"
+                        >
+                          {showAllUnsupportedTags ? 'Hide list' : 'Show all'}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}
@@ -1150,7 +2166,70 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             </div>
 
             {/* Collapsible Advanced Node & DSP Settings */}
-            <div className="rounded-xl bg-[#0B1512] border border-[#19352A]">
+            {/* Studio Output Audio Quality Selector */}
+            <div className="rounded-xl bg-[#0B1512] border border-[#19352A] p-3 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 text-xs font-medium text-[#F4F8F5]">
+                  <Sparkles className="w-3.5 h-3.5 text-[#42D9A0]" />
+                  <span>Audio Quality</span>
+                </span>
+                <span className="text-[11px] font-mono text-[#42D9A0]">
+                  {audioQuality === 'standard'
+                    ? '24 kHz · Raw Neural Balance'
+                    : audioQuality === 'studio_plus'
+                    ? '48 kHz · Creator Broadcast Polish'
+                    : '48 kHz · Adaptive Studio Mastering'}
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    {
+                      id: 'standard',
+                      title: 'Standard',
+                      subtitle: '24 kHz · -17 LUFS'
+                    },
+                    {
+                      id: 'studio',
+                      title: 'Studio',
+                      subtitle: '48 kHz · Recommended'
+                    },
+                    {
+                      id: 'studio_plus',
+                      title: 'Studio Plus',
+                      subtitle: '48 kHz · Rich Presence'
+                    }
+                  ] as const
+                ).map((mode) => {
+                  const selected = audioQuality === mode.id;
+                  return (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => setAudioQuality(mode.id)}
+                      className={`px-2.5 py-2 rounded-lg border text-left transition-colors cursor-pointer ${
+                        selected
+                          ? 'bg-[#19352A] border-[#16A36A] text-[#F4F8F5]'
+                          : 'bg-[#12231D] border-[#19352A] text-[#A2B5AA] hover:text-[#F4F8F5] hover:border-[#42D9A0]/40'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-xs font-semibold">{mode.title}</span>
+                        {selected && <Check className="w-3 h-3 text-[#42D9A0] shrink-0" />}
+                      </div>
+                      <div className="text-[10px] font-mono text-[#A2B5AA] mt-0.5 truncate">
+                        {mode.subtitle}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div
+              ref={advancedSettingsRef}
+              className="rounded-xl bg-[#0B1512] border border-[#19352A]"
+            >
               <button
                 type="button"
                 onClick={() => setShowAdvancedSettings((prev) => !prev)}
@@ -1161,8 +2240,10 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <span>Reference Conditioning &amp; DSP Settings</span>
                 </span>
                 <span className="flex items-center gap-1.5 text-[11px] font-mono text-[#A2B5AA]">
-                  <span>
-                    {localEndpointUrl.trim() ? 'Mode 2 Local Connected' : 'Configure Mode 2 Node'}
+                  <span className="text-[#42D9A0]">
+                    {localEndpointUrl.trim()
+                      ? 'Custom Mode 2 Connected'
+                      : 'Built-in GPU Active (Optional Override)'}
                   </span>
                   {showAdvancedSettings ? (
                     <ChevronUp className="w-4 h-4" />
@@ -1180,6 +2261,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     </label>
                     <div className="flex gap-2">
                       <input
+                        ref={nodeUrlInputRef}
                         type="url"
                         value={localEndpointUrl}
                         onChange={(e) => {
@@ -1290,27 +2372,56 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   </div>
 
                   <div className="text-[11px] text-[#A2B5AA] bg-[#12231D] border border-[#19352A] rounded-lg p-2.5 leading-relaxed">
-                    Speaker identity is preserved directly by Mode 2 neural weights (without DSP pitch
-                    shifting over synthesized output). Output audio uses lossless 24kHz loudness
-                    normalization and anti-clipping limiting only.
+                    Speaker identity, pitch contour, accent, and vocal personality are preserved directly
+                    by Mode 2 neural weights (0 semitone shift). Studio and Studio Plus apply adaptive
+                    48 kHz noise cleanup, boxy-room EQ refinement, gentle de-essing, comfort-tone chunk
+                    crossfades, and 2-pass linear EBU R128 loudness mastering.
                   </div>
                 </div>
               )}
             </div>
 
-            {/* Compact Consent Checkbox */}
-            <label className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-[#0B1512] border border-[#19352A] cursor-pointer text-xs text-[#A2B5AA]">
-              <input
-                type="checkbox"
-                checked={consentConfirmed}
-                onChange={(e) => setConsentConfirmed(e.target.checked)}
-                className="accent-[#16A36A] shrink-0"
-              />
-              <ShieldCheck className="w-3.5 h-3.5 text-[#42D9A0] shrink-0" />
-              <span className="truncate">
-                I confirm ownership or explicit authorization to clone this reference voice.
-              </span>
-            </label>
+            {/* Tap-Safe Voice Authorization Checkbox */}
+            <div
+              ref={consentCardRef}
+              className={`rounded-xl border px-3 py-2.5 transition-colors ${
+                !consentConfirmed
+                  ? highlightConsentWarning
+                    ? 'bg-amber-950/60 border-amber-400 ring-2 ring-amber-400/40'
+                    : 'bg-amber-950/35 border-amber-500/50'
+                  : 'bg-[#0B1512] border-[#19352A]'
+              }`}
+            >
+              <label className="flex items-start gap-2.5 cursor-pointer text-xs">
+                <input
+                  type="checkbox"
+                  checked={consentConfirmed}
+                  onChange={(e) => {
+                    setConsentConfirmed(e.target.checked);
+                    if (e.target.checked) {
+                      setHighlightConsentWarning(false);
+                      setGenerationError(null);
+                    }
+                  }}
+                  className="accent-[#16A36A] mt-0.5 h-4 w-4 shrink-0 cursor-pointer"
+                />
+                <ShieldCheck
+                  className={`w-4 h-4 mt-0.5 shrink-0 ${
+                    consentConfirmed ? 'text-[#42D9A0]' : 'text-amber-400'
+                  }`}
+                />
+                <span className="text-[#A2B5AA] leading-snug">
+                  <span className="text-[#F4F8F5] font-medium">
+                    I confirm ownership or explicit authorization to clone this reference voice.
+                  </span>
+                  {!consentConfirmed && (
+                    <span className="block text-[11px] text-amber-300 font-semibold mt-0.5">
+                      Required: Tap checkbox above to enable voice generation.
+                    </span>
+                  )}
+                </span>
+              </label>
+            </div>
 
             {generationError && (
               <div className="bg-red-950/60 border border-red-500/50 rounded-xl p-3 text-xs text-red-200 space-y-2">
@@ -1318,61 +2429,121 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
                   <span>{generationError}</span>
                 </div>
-                {previewChunks.length > 1 && (
+                <div className="flex flex-wrap gap-2">
+                  {previewChunks.length > 1 && (referenceAnalysis || selectedSavedVoice) && consentConfirmed && (
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateClonedVoice(true)}
+                      disabled={isGenerating}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-900/60 hover:bg-red-800 border border-red-400/40 text-xs font-semibold text-red-100 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Retry Failed Chunks (Reuse Cached)</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleOpenMode2Setup}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#16A36A] hover:bg-[#16A36A]/90 text-xs font-semibold text-[#F4F8F5] cursor-pointer"
+                  >
+                    <Terminal className="w-3.5 h-3.5" />
+                    <span>Connect Private Colab T4 GPU (Backup)</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Pre-flight readiness indicator & Primary Generate Action */}
+            {(() => {
+              const blockerReason =
+                !selectedSavedVoice && !referenceAnalysis
+                  ? 'Select a saved voice or upload/record/load a reference voice (Step 01) first'
+                  : selectedSavedVoice && !selectedSavedVoice.hasConditioningAudio
+                  ? 'Selected saved voice conditioning audio is missing on server storage'
+                  : isSavedVoiceLanguageMismatch && selectedSavedVoice
+                  ? `Saved voice "${selectedSavedVoice.name}" is locked to ${selectedSavedVoice.languageName}`
+                  : !scriptValidation.isValid
+                  ? 'Enter valid spoken text matching the selected language'
+                  : isReferenceLanguageMismatch
+                  ? 'Reference audio language mismatches selected target language'
+                  : !consentConfirmed
+                  ? 'Confirm voice authorization checkbox above'
+                  : null;
+              const isReadyToGenerate = blockerReason === null;
+              const activeCloneOp =
+                liveActivity.primaryOperation?.feature === 'voice-cloning' &&
+                liveActivity.primaryOperation?.status === 'running'
+                  ? liveActivity.primaryOperation
+                  : null;
+
+              return (
+                <div className="space-y-2">
+                  {blockerReason && !isGenerating && (
+                    <div className="text-[11px] text-amber-300 flex items-center gap-1.5 px-1">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                      <span>{blockerReason}</span>
+                    </div>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => handleGenerateClonedVoice(true)}
                     disabled={isGenerating}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-900/60 hover:bg-red-800 border border-red-400/40 text-xs font-semibold text-red-100 cursor-pointer"
+                    aria-disabled={!isReadyToGenerate || isGenerating}
+                    className={`w-full py-3 px-5 rounded-xl font-semibold text-sm transition-colors flex items-center justify-center gap-2 shadow-sm whitespace-nowrap ${
+                      isGenerating
+                        ? 'bg-[#19352A] text-[#F4F8F5]/80 cursor-wait'
+                        : isReadyToGenerate
+                        ? 'bg-[#16A36A] hover:bg-[#16A36A]/90 text-[#F4F8F5] cursor-pointer'
+                        : 'bg-[#19352A] hover:bg-[#19352A]/80 text-[#F4F8F5]/80 border border-amber-500/40 cursor-pointer'
+                    }`}
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    <span>Retry Failed Chunks (Reuse Completed Cached Chunks)</span>
+                    {isGenerating ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                        <span>
+                          Synthesizing {currentLangConfig.nativeName} Speech ({previewChunks.length}{' '}
+                          chunk{previewChunks.length === 1 ? '' : 's'})...
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="w-4 h-4 shrink-0" />
+                        <span>
+                          Generate {currentLangConfig.nativeName} Speech ({previewChunks.length} chunk
+                          {previewChunks.length === 1 ? '' : 's'})
+                        </span>
+                      </>
+                    )}
                   </button>
-                )}
-              </div>
-            )}
 
-            {/* Primary Generate Action */}
-            <button
-              type="button"
-              onClick={() => handleGenerateClonedVoice(true)}
-              disabled={
-                isGenerating ||
-                !referenceAnalysis ||
-                !scriptValidation.isValid ||
-                isReferenceLanguageMismatch ||
-                !consentConfirmed
-              }
-              className="w-full py-3 px-5 rounded-xl bg-[#16A36A] hover:bg-[#16A36A]/90 disabled:bg-[#19352A] disabled:text-[#A2B5AA]/50 text-[#F4F8F5] font-semibold text-sm transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed shadow-sm whitespace-nowrap"
-            >
-              {isGenerating ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
-                  <span>
-                    Synthesizing {currentLangConfig.nativeName} Speech ({previewChunks.length}{' '}
-                    chunk{previewChunks.length === 1 ? '' : 's'})...
-                  </span>
-                </>
-              ) : (
-                <>
-                  <Volume2 className="w-4 h-4 shrink-0" />
-                  <span>
-                    Generate {currentLangConfig.nativeName} Speech ({previewChunks.length} chunk
-                    {previewChunks.length === 1 ? '' : 's'})
-                  </span>
-                </>
-              )}
-            </button>
-
-            {/* Compact Pipeline Progress */}
-            {isGenerating && (
-              <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 text-xs font-mono text-[#42D9A0] flex items-center justify-between">
-                <span className="truncate">{PIPELINE_A_STEPS[activePipelineStep]}</span>
-                <span className="tabular-nums shrink-0 ml-2">
-                  {activePipelineStep + 1}/{PIPELINE_A_STEPS.length}
-                </span>
-              </div>
-            )}
+                  {isGenerating && (
+                    <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 text-xs font-mono text-[#42D9A0] space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate">
+                          {activeCloneOp?.currentStage || PIPELINE_A_STEPS[activePipelineStep]}
+                        </span>
+                        <span className="tabular-nums shrink-0 ml-2">
+                          {activeCloneOp?.progressPct !== null &&
+                          activeCloneOp?.progressPct !== undefined
+                            ? `${activeCloneOp.progressPct}%`
+                            : `${activePipelineStep + 1}/${PIPELINE_A_STEPS.length}`}
+                        </span>
+                      </div>
+                      {activeCloneOp?.progressPct !== null &&
+                        activeCloneOp?.progressPct !== undefined && (
+                          <div className="w-full h-1.5 bg-[#12231D] rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-[#16A36A] transition-all duration-300"
+                              style={{ width: `${activeCloneOp.progressPct}%` }}
+                            />
+                          </div>
+                        )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
 
           {/* Output Audio Player, Emotion & Chunk Verification, & Quality Metrics */}
@@ -1388,7 +2559,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   </h3>
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
                   <a
                     href={`${cloneResult.wavUrl}?download=1`}
                     download={`voicelab_${cloneResult.language}_${cloneResult.jobId}.wav`}
@@ -1417,12 +2588,49 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                     <Download className="w-3.5 h-3.5" />
                     <span>MP3</span>
                   </a>
+                  {cloneResult.chunks && cloneResult.chunks.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handleDownloadGeneratedSrt}
+                        title="Download aligned SubRip (.SRT) subtitles for this voiceover"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0B1512] hover:bg-[#19352A] border border-[#16A36A]/50 text-xs font-semibold text-[#42D9A0] transition-colors whitespace-nowrap cursor-pointer"
+                      >
+                        <Captions className="w-3.5 h-3.5" />
+                        <span>.SRT</span>
+                      </button>
+                      {onSendToSrtEditor && (
+                        <button
+                          type="button"
+                          onClick={handleOpenGeneratedInSrtStudio}
+                          title="Open audio & subtitles in Audio-to-SRT Studio for fine-tuning"
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#19352A] hover:bg-[#16A36A]/30 border border-[#16A36A]/40 text-xs font-medium text-[#F4F8F5] transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <span>Edit SRT</span>
+                          <ArrowRight className="w-3.5 h-3.5 text-[#42D9A0]" />
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
 
               {/* Audio Player */}
-              <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3">
+              <div className="bg-[#0B1512] border border-[#19352A] rounded-xl p-3 space-y-2">
                 <audio controls src={cloneResult.wavUrl} className="w-full h-9" />
+                {cloneResult.audioEnhancementReport && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-[#A2B5AA] pt-1 border-t border-[#19352A]/70">
+                    <span className="text-[#42D9A0]">
+                      {cloneResult.audioEnhancementReport.qualityLabel}
+                    </span>
+                    <span>
+                      {Math.round(cloneResult.audioEnhancementReport.outputSampleRateHz / 1000)} kHz ·{' '}
+                      {cloneResult.audioEnhancementReport.outputIntegratedLufs} LUFS · Peak{' '}
+                      {cloneResult.audioEnhancementReport.outputTruePeakDb} dBTP · Pitch{' '}
+                      {cloneResult.audioEnhancementReport.outputPitchHz} Hz
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Emotion & Speaker Identity Verification Banner */}
@@ -1627,9 +2835,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
 
                       <div className="bg-[#0B1512] border border-[#19352A] rounded-lg p-2.5 space-y-0.5">
                         <div className="text-[11px] font-mono text-[#42D9A0]">
-                          4. Signal &amp; DSP Telemetry
+                          4. Signal &amp; Studio Mastering Telemetry
                         </div>
                         <div className="text-[#F4F8F5] font-mono">
+                          {cloneResult.qualityControlReport.separatedMetrics.audioSignalQuality.sampleRateHz} Hz ·{' '}
+                          {cloneResult.audioEnhancementReport
+                            ? `${cloneResult.audioEnhancementReport.outputIntegratedLufs} LUFS · `
+                            : ''}
                           RMS{' '}
                           {
                             cloneResult.qualityControlReport.separatedMetrics.audioSignalQuality

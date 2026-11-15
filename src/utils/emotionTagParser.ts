@@ -14,6 +14,7 @@ export type RecognizedEmotionTagName =
 export type EmotionTagCategory = 'emotion' | 'delivery' | 'timing';
 
 export const MAX_SUPPORTED_CLONING_SCRIPT_CHARS = 12000;
+export const DEFAULT_CLONING_CHUNK_MAX_CHARS = 300;
 
 export interface EmotionTagDefinition {
   name: RecognizedEmotionTagName;
@@ -241,6 +242,9 @@ export interface ScriptEditorToken {
   startIndex: number;
   endIndex: number;
   recognizedName?: RecognizedEmotionTagName;
+  mappedTags?: RecognizedEmotionTagName[];
+  mappedPauseMs?: number;
+  isNaturalDirection?: boolean;
   tagName?: string;
   tagDef?: EmotionTagDefinition;
 }
@@ -305,7 +309,90 @@ export interface SynthesizableScriptChunk {
 
 export type EmotionScriptChunk = SynthesizableScriptChunk;
 
-const BRACKET_TAG_REGEX = /\[([^\][\r\n]{1,40})\]/g;
+const BRACKET_TAG_REGEX = /\[([^\][\r\n]{1,160})\]/g;
+
+export interface ResolvedStageDirection {
+  primaryName: RecognizedEmotionTagName;
+  mappedTags: RecognizedEmotionTagName[];
+  pauseMs: number;
+  isNaturalDirection: boolean;
+}
+
+/**
+ * Resolves both canonical English tags ([happy], [sad], [pause]) and rich Bengali/multilingual
+ * natural acting/stage-direction tags (e.g. [গম্ভীর, ধীর ও ভারী], [নিচু স্বরে], [দীর্ঘ বিরতি, বিষণ্ণ প্রশ্নের সুরে])
+ * into canonical emotion, delivery, and pause instructions.
+ */
+export function resolveNaturalStageDirectionTag(rawInner: string): ResolvedStageDirection | null {
+  const normalized = String(rawInner || '').trim().toLowerCase();
+  if (!normalized) return null;
+
+  if (Object.prototype.hasOwnProperty.call(RECOGNIZED_EMOTION_TAGS, normalized)) {
+    const exact = normalized as RecognizedEmotionTagName;
+    return {
+      primaryName: exact,
+      mappedTags: exact === 'pause' ? [] : [exact],
+      pauseMs: exact === 'pause' ? 450 : 0,
+      isNaturalDirection: false
+    };
+  }
+
+  let pauseMs = 0;
+  if (/দীর্ঘ\s*বিরতি|লম্বা\s*বিরতি|long\s*pause|deep\s*pause/i.test(normalized)) {
+    pauseMs = 850;
+  } else if (/সামান্য\s*বিরতি|অল্প\s*বিরতি|ক্ষুদ্র\s*বিরতি|short\s*pause|brief\s*pause/i.test(normalized)) {
+    pauseMs = 350;
+  } else if (/বিরতি|থেমে|দম\s*নিয়ে|pause|break|silence|রুক|विराम|रुककर/i.test(normalized)) {
+    pauseMs = 450;
+  }
+
+  let matchedEmotion: RecognizedEmotionTagName | null = null;
+  let matchedDelivery: RecognizedEmotionTagName | null = null;
+
+  // Emotion cues (priority ordered for nuance)
+  if (/বিষণ্ণ|দুঃখ|হতাশ|কান্না|করুণ|অসহায়|বেদনা|কষ্ট|ম্লান|উদাস|ব্যথিত|দুঃখিত|melanchol|sorrow|grief|sad|unhappy|heartbreak|उदास|दुख|करुण/i.test(normalized)) {
+    matchedEmotion = 'sad';
+  } else if (/ব্যঙ্গ|অনিচ্ছুক|বিরক্তি|রাগ|ক্ষোভ|অবিশ্বাস|ঠাট্টা|অবজ্ঞা|কঠোর|নাক\s*সিটকানো|irritat|annoy|sarcas|angry|furious|indignant|scorn|गुस्सा|क्रोध|व्यंग्य/i.test(normalized)) {
+    matchedEmotion = 'angry';
+  } else if (/উৎসাহ|উত্তেজনা|বিস্ময়|বিস্মিত|তাড়াহুড়ো|আগ্রহ|কৌতূহল|চমক|excit|eager|surpris|amazed|enthusiast|उत्साह|आश्चर्य/i.test(normalized)) {
+    matchedEmotion = 'excited';
+  } else if (/হাসি|মুচকি|মজার|আনন্দ|খুশি|দুষ্টুমি|কৌতুক|আশাবাদী|উৎফুল্ল|প্রশংসা|মিষ্টি|smile|cheerful|laugh|playful|happy|joy|warm|खुश|मुस्कान|हंसी/i.test(normalized)) {
+    matchedEmotion = 'happy';
+  } else if (/গম্ভীর|গুরুত্ব|বিচারক|সমালোচন|কর্তৃত্ব|সতর্ক|চিন্তিত|ভারী|গভীর|সংবাদ|শক্ত|serious|grave|solemn|authority|thoughtful|heavy|गंभीर/i.test(normalized)) {
+    matchedEmotion = 'serious';
+  } else if (/স্বাভাবিক|শান্ত|স্থির|চুপচাপ|নিরব|নীরব|গল্প|বর্ণনা|অভিনয়|পর্যবেক্ষণ|ভদ্র|বিনীত|calm|peaceful|storytell|narration|neutral|normal|gentle|शांत|सामान्य/i.test(normalized)) {
+    matchedEmotion = 'calm';
+  }
+
+  // Delivery cues
+  if (/ফিসফিস|গোপন|নিচু\s*স্বরে|নিচু\s*গলায়|চাপা\s*স্বরে|whisper|hushed|secret|low\s*voice|धीमे|फुसफुस/i.test(normalized)) {
+    matchedDelivery = 'whispering';
+  } else if (/চিৎকার|উচ্চস্বরে|উচ্চ\s*স্বরে|চেঁচিয়ে|হাঁক|দমক|shout|yell|loud|चिल्ला/i.test(normalized)) {
+    matchedDelivery = 'shouting';
+  } else if (/আত্মবিশ্বাস|জোর\s*দিয়ে|স্পষ্ট|দৃঢ়|সাবলীল|তাল\s*মিলিয়ে|confident|firm|assertive|decisive|आत्मविश्वास/i.test(normalized)) {
+    matchedDelivery = 'confidently';
+  } else if (/নরম|কোমল|নম্র|আবেগ|ধীরে|ধীর|অনুরোধ|মৃদু|আস্তে|সাবধানে|চাপা\s*রেখে|soft|tender|slowly|polite|pleading|delicate|कोमल|नम्र/i.test(normalized)) {
+    matchedDelivery = 'softly';
+  }
+
+  const mappedTags: RecognizedEmotionTagName[] = [];
+  if (matchedEmotion) mappedTags.push(matchedEmotion);
+  if (matchedDelivery) mappedTags.push(matchedDelivery);
+
+  if (mappedTags.length === 0 && pauseMs === 0) {
+    return null;
+  }
+
+  const primaryName: RecognizedEmotionTagName =
+    matchedEmotion || matchedDelivery || 'pause';
+
+  return {
+    primaryName,
+    mappedTags,
+    pauseMs,
+    isNaturalDirection: true
+  };
+}
 
 /**
  * Tokenizes a raw script into lossless editor tokens (preserving every character, newline, and space)
@@ -337,12 +424,12 @@ export function tokenizeScriptForLiveEditor(rawScript: string): ScriptEditorToke
       });
     }
 
-    const innerNormalized = match[1].trim().toLowerCase();
-    const recognized = Object.prototype.hasOwnProperty.call(RECOGNIZED_EMOTION_TAGS, innerNormalized)
-      ? RECOGNIZED_EMOTION_TAGS[innerNormalized as RecognizedEmotionTagName]
-      : undefined;
+    const innerRaw = match[1].trim();
+    const innerNormalized = innerRaw.toLowerCase();
+    const resolved = resolveNaturalStageDirectionTag(innerRaw);
 
-    if (recognized) {
+    if (resolved) {
+      const def = RECOGNIZED_EMOTION_TAGS[resolved.primaryName];
       tokens.push({
         id: `tag_${matchStart}`,
         type: 'recognized-tag',
@@ -350,9 +437,12 @@ export function tokenizeScriptForLiveEditor(rawScript: string): ScriptEditorToke
         rawText: match[0],
         startIndex: matchStart,
         endIndex: matchEnd,
-        recognizedName: recognized.name,
-        tagName: recognized.name,
-        tagDef: recognized
+        recognizedName: resolved.primaryName,
+        mappedTags: resolved.mappedTags,
+        mappedPauseMs: resolved.pauseMs,
+        isNaturalDirection: resolved.isNaturalDirection,
+        tagName: resolved.primaryName,
+        tagDef: def
       });
     } else {
       tokens.push({
@@ -408,7 +498,7 @@ function normalizeSpokenSegmentWhitespace(raw: string): string {
 }
 
 /**
- * Parses a script containing bracketed emotion/delivery/pause tags into:
+ * Parses a script containing bracketed emotion/delivery/pause tags (canonical or Bengali natural acting cues) into:
  * - spokenText (100% free of any bracket tags so TTS never speaks "[sad]" or "[happy]")
  * - spans (preserving emotion and delivery tag scope across sentences until changed)
  * - emotionInstructions
@@ -486,31 +576,37 @@ export function parseEmotionTaggedScript(rawScript: string): ParsedScriptAnalysi
       continue;
     }
 
-    if (token.tagDef && token.tagDef.category === 'timing') {
-      recognizedSet.add('pause');
-      const pauseMs = token.tagDef.pauseDurationMs || 450;
-      flushCurrentTextBuffer();
+    const mappedPauseMs = token.mappedPauseMs ?? (token.tagDef?.category === 'timing' ? token.tagDef.pauseDurationMs || 450 : 0);
+    const mappedTags = token.mappedTags && token.mappedTags.length > 0
+      ? token.mappedTags
+      : token.tagDef && token.tagDef.category !== 'timing'
+      ? [token.tagDef.name]
+      : [];
 
+    if (mappedPauseMs > 0 || mappedTags.length > 0) {
+      flushCurrentTextBuffer();
+    }
+
+    if (mappedPauseMs > 0) {
+      recognizedSet.add('pause');
       const lastSpan = spans[spans.length - 1];
       pauseInstructions.push({
         index: pauseInstructions.length,
-        durationMs: pauseMs,
+        durationMs: mappedPauseMs,
         afterTextExcerpt: lastSpan ? lastSpan.spokenText.slice(-50) : '(start of script)'
       });
 
       if (lastSpan) {
-        lastSpan.trailingPauseMs += pauseMs;
+        lastSpan.trailingPauseMs += mappedPauseMs;
       } else {
-        pendingLeadingPauseMs += pauseMs;
+        pendingLeadingPauseMs += mappedPauseMs;
       }
-      continue;
     }
 
-    if (token.tagDef) {
-      const def = token.tagDef;
+    for (const mappedName of mappedTags) {
+      const def = RECOGNIZED_EMOTION_TAGS[mappedName];
+      if (!def) continue;
       recognizedSet.add(def.name);
-      flushCurrentTextBuffer();
-
       if (def.category === 'emotion') {
         currentEmotion = def.name;
       } else if (def.category === 'delivery') {
@@ -593,7 +689,7 @@ function splitLongSentenceOnSafeWordBoundaries(sentence: string, maxChunkChars: 
 export function buildEmotionPreservingChunks(
   parsed: ParsedScriptAnalysis,
   sentenceSplitter: (text: string) => string[],
-  maxChunkChars = 320
+  maxChunkChars = DEFAULT_CLONING_CHUNK_MAX_CHARS
 ): SynthesizableScriptChunk[] {
   const rawChunks: Omit<SynthesizableScriptChunk, 'chunkIndex' | 'chunkId' | 'totalChunks'>[] = [];
 
