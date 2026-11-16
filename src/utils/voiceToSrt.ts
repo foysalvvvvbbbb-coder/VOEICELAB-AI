@@ -85,55 +85,111 @@ export function buildSrtSegmentsFromVoiceClone(result: VoiceCloneResult): SrtSeg
   const maxCharsPerLine = result.language === 'en' ? 42 : 38;
   const maxCharsPerBlock = maxCharsPerLine * 2;
 
-  const rawWindows = chunks.map((chk) => {
-    const leadMs = Math.max(0, chk.leadingPauseMs || 0);
-    const trailMs = Math.max(0, chk.trailingPauseMs || 0);
-    const speechMs = Math.max(500, Math.round((chk.durationSec || 2.0) * 1000));
-    return { chk, leadMs, speechMs, trailMs };
-  });
-
-  const rawTotalMs = rawWindows.reduce((acc, w) => acc + w.leadMs + w.speechMs + w.trailMs, 0) || totalAudioMs;
-  const scale = totalAudioMs / rawTotalMs;
+  const hasExactOffsets = chunks.every(
+    (c) =>
+      typeof c.actualStartMs === 'number' &&
+      typeof c.actualEndMs === 'number' &&
+      c.actualEndMs > c.actualStartMs
+  );
 
   const segments: SrtSegment[] = [];
-  let cursorMs = 0;
 
-  for (const win of rawWindows) {
-    cursorMs += Math.round(win.leadMs * scale);
-    const scaledSpeechMs = Math.max(450, Math.round(win.speechMs * scale));
-    const cues = splitTextIntoReadableSubtitleCues(win.chk.spokenText, maxCharsPerBlock);
-    const totalChars = cues.reduce((s, c) => s + Math.max(1, Array.from(c).length), 0) || 1;
+  if (hasExactOffsets) {
+    const rawLastEndMs = Math.max(
+      1000,
+      chunks[chunks.length - 1].actualEndMs! + (chunks[chunks.length - 1].trailingPauseMs || 0)
+    );
+    const scale = totalAudioMs / rawLastEndMs;
 
-    let innerCursor = cursorMs;
-    const chunkEnd = Math.min(totalAudioMs, cursorMs + scaledSpeechMs);
+    for (const chk of chunks) {
+      const chunkStartMs = Math.round((chk.actualStartMs || 0) * scale);
+      const chunkEndMs = Math.min(totalAudioMs, Math.round((chk.actualEndMs || 0) * scale));
+      const cues = splitTextIntoReadableSubtitleCues(chk.spokenText, maxCharsPerBlock);
+      const totalChars = cues.reduce((s, c) => s + Math.max(1, Array.from(c).length), 0) || 1;
+      const chunkSpanMs = Math.max(400, chunkEndMs - chunkStartMs);
 
-    for (let i = 0; i < cues.length; i++) {
-      const cueText = cues[i];
-      const weight = Math.max(1, Array.from(cueText).length) / totalChars;
-      const isLastCue = i === cues.length - 1;
-      const proposedEnd = isLastCue
-        ? chunkEnd
-        : Math.min(chunkEnd, innerCursor + Math.max(400, Math.round(scaledSpeechMs * weight)));
-      const safeStart = Math.max(
-        segments.length > 0 ? segments[segments.length - 1].endTimeMs + 20 : 0,
-        innerCursor
-      );
-      const safeEnd = Math.max(safeStart + 350, proposedEnd);
+      let innerCursor = chunkStartMs;
+      for (let i = 0; i < cues.length; i++) {
+        const cueText = cues[i];
+        const weight = Math.max(1, Array.from(cueText).length) / totalChars;
+        const isLastCue = i === cues.length - 1;
+        const proposedEnd = isLastCue
+          ? chunkEndMs
+          : Math.min(chunkEndMs, innerCursor + Math.max(380, Math.round(chunkSpanMs * weight)));
+        const safeStart = Math.max(
+          segments.length > 0 ? segments[segments.length - 1].endTimeMs + 20 : 0,
+          innerCursor
+        );
+        const safeEnd = Math.max(safeStart + 350, proposedEnd);
 
-      segments.push({
-        id: segments.length + 1,
-        startTimeMs: safeStart,
-        endTimeMs: safeEnd,
-        startTimestamp: msToSrtTimestampUtil(safeStart),
-        endTimestamp: msToSrtTimestampUtil(safeEnd),
-        text: wrapIntoTwoBalancedLines(cueText, maxCharsPerLine),
-        timingSource: 'acoustic-pause-aligned'
-      });
+        segments.push({
+          id: segments.length + 1,
+          startTimeMs: safeStart,
+          endTimeMs: safeEnd,
+          startTimestamp: msToSrtTimestampUtil(safeStart),
+          endTimestamp: msToSrtTimestampUtil(safeEnd),
+          text: wrapIntoTwoBalancedLines(cueText, maxCharsPerLine),
+          timingSource: 'acoustic-pause-aligned'
+        });
 
-      innerCursor = safeEnd + 20;
+        innerCursor = safeEnd + 20;
+      }
     }
+  } else {
+    const rawWindows = chunks.map((chk, idx) => {
+      const leadMs = Math.max(0, chk.leadingPauseMs || 0);
+      const trailMs = Math.max(0, chk.trailingPauseMs || 0);
+      const interChunkDefaultPauseMs =
+        idx < chunks.length - 1 && trailMs === 0 && (chunks[idx + 1]?.leadingPauseMs || 0) === 0
+          ? 180
+          : 0;
+      const speechMs = Math.max(500, Math.round((chk.durationSec || 2.0) * 1000));
+      return { chk, leadMs, speechMs, trailMs: trailMs + interChunkDefaultPauseMs };
+    });
 
-    cursorMs = chunkEnd + Math.round(win.trailMs * scale);
+    const rawTotalMs =
+      rawWindows.reduce((acc, w) => acc + w.leadMs + w.speechMs + w.trailMs, 0) || totalAudioMs;
+    const scale = totalAudioMs / rawTotalMs;
+
+    let cursorMs = 0;
+
+    for (const win of rawWindows) {
+      cursorMs += Math.round(win.leadMs * scale);
+      const scaledSpeechMs = Math.max(450, Math.round(win.speechMs * scale));
+      const cues = splitTextIntoReadableSubtitleCues(win.chk.spokenText, maxCharsPerBlock);
+      const totalChars = cues.reduce((s, c) => s + Math.max(1, Array.from(c).length), 0) || 1;
+
+      let innerCursor = cursorMs;
+      const chunkEnd = Math.min(totalAudioMs, cursorMs + scaledSpeechMs);
+
+      for (let i = 0; i < cues.length; i++) {
+        const cueText = cues[i];
+        const weight = Math.max(1, Array.from(cueText).length) / totalChars;
+        const isLastCue = i === cues.length - 1;
+        const proposedEnd = isLastCue
+          ? chunkEnd
+          : Math.min(chunkEnd, innerCursor + Math.max(400, Math.round(scaledSpeechMs * weight)));
+        const safeStart = Math.max(
+          segments.length > 0 ? segments[segments.length - 1].endTimeMs + 20 : 0,
+          innerCursor
+        );
+        const safeEnd = Math.max(safeStart + 350, proposedEnd);
+
+        segments.push({
+          id: segments.length + 1,
+          startTimeMs: safeStart,
+          endTimeMs: safeEnd,
+          startTimestamp: msToSrtTimestampUtil(safeStart),
+          endTimestamp: msToSrtTimestampUtil(safeEnd),
+          text: wrapIntoTwoBalancedLines(cueText, maxCharsPerLine),
+          timingSource: 'acoustic-pause-aligned'
+        });
+
+        innerCursor = safeEnd + 20;
+      }
+
+      cursorMs = chunkEnd + Math.round(win.trailMs * scale);
+    }
   }
 
   // Clamp final segment smoothly to total output audio length if needed

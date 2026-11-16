@@ -555,12 +555,21 @@ function trimActivePcmChunk(buf: Buffer, sampleRate = 24000): { buf: Buffer; act
  * - Generous 65ms natural breath/consonant tail preservation
  * - Ultra-quiet comfort room-tone gaps honoring exact [pause] millisecond timings
  */
+export interface ConcatenatedChunkTimingOffset {
+  chunkIndex: number;
+  startMs: number;
+  endMs: number;
+}
+
 export async function concatenateWavChunksWithCrossfade(
   chunkWavPaths: string[],
   outputWavPath: string,
   interSentencePauseMs = 190,
   perChunkPauses?: ChunkPauseTiming[]
-): Promise<void> {
+): Promise<{
+  totalDurationSec: number;
+  chunkOffsets: ConcatenatedChunkTimingOffset[];
+}> {
   if (chunkWavPaths.length === 0) {
     throw new Error('No audio chunks provided for concatenation.');
   }
@@ -570,16 +579,23 @@ export async function concatenateWavChunksWithCrossfade(
   const defaultPauseSamples = Math.round((sampleRate * interSentencePauseMs) / 1000);
 
   interface DecodedChunk {
+    chunkIndex: number;
     buf: Buffer;
     activeRmsDb: number;
   }
 
-  const decodeSingleChunk = async (chunkPath: string): Promise<DecodedChunk | null> => {
+  const decodeSingleChunk = async (
+    chunkPath: string,
+    chunkIndex: number
+  ): Promise<DecodedChunk | null> => {
     try {
       const wavBuf = await fs.promises.readFile(chunkPath);
       const directPcm = tryExtractCanonical24kMonoPcmSync(wavBuf);
       if (directPcm) {
-        return trimActivePcmChunk(directPcm, sampleRate);
+        const trimmed = trimActivePcmChunk(directPcm, sampleRate);
+        if (trimmed) {
+          return { chunkIndex, ...trimmed };
+        }
       }
     } catch {
       // Fall back cleanly to FFmpeg decode below
@@ -601,7 +617,8 @@ export async function concatenateWavChunksWithCrossfade(
         rawPath
       ]);
       const buf = await fs.promises.readFile(rawPath);
-      return trimActivePcmChunk(buf, sampleRate);
+      const trimmed = trimActivePcmChunk(buf, sampleRate);
+      return trimmed ? { chunkIndex, ...trimmed } : null;
     } finally {
       await fs.promises.unlink(rawPath).catch(() => {});
     }
@@ -615,7 +632,7 @@ export async function concatenateWavChunksWithCrossfade(
     Array.from({ length: workerCount }, async () => {
       while (nextIdx < chunkWavPaths.length) {
         const myIdx = nextIdx++;
-        decodedMaybe[myIdx] = await decodeSingleChunk(chunkWavPaths[myIdx]);
+        decodedMaybe[myIdx] = await decodeSingleChunk(chunkWavPaths[myIdx], myIdx);
       }
     })
   );
@@ -636,8 +653,12 @@ export async function concatenateWavChunksWithCrossfade(
   }
 
   const pcmBuffers: Buffer[] = [];
+  const chunkOffsets: ConcatenatedChunkTimingOffset[] = [];
+  let sampleCursor = 0;
+
   for (let idx = 0; idx < decodedChunks.length; idx++) {
     const chunkBuf = decodedChunks[idx].buf;
+    const origIdx = decodedChunks[idx].chunkIndex;
     const totalSamples = Math.floor(chunkBuf.length / 2);
 
     if (decodedChunks.length > 1) {
@@ -670,17 +691,29 @@ export async function concatenateWavChunksWithCrossfade(
     }
 
     if (idx === 0) {
-      const leadMs = perChunkPauses?.[0]?.leadingPauseMs || 0;
+      const leadMs = perChunkPauses?.[origIdx]?.leadingPauseMs || 0;
       if (leadMs > 0) {
-        pcmBuffers.push(buildComfortSilenceBuffer(Math.round((sampleRate * leadMs) / 1000)));
+        const leadSamples = Math.round((sampleRate * leadMs) / 1000);
+        pcmBuffers.push(buildComfortSilenceBuffer(leadSamples));
+        sampleCursor += leadSamples;
       }
     }
 
+    const speechStartSample = sampleCursor;
     pcmBuffers.push(chunkBuf);
+    sampleCursor += totalSamples;
+    const speechEndSample = sampleCursor;
+
+    chunkOffsets.push({
+      chunkIndex: origIdx,
+      startMs: Math.round((speechStartSample / sampleRate) * 1000),
+      endMs: Math.round((speechEndSample / sampleRate) * 1000)
+    });
 
     if (idx < decodedChunks.length - 1) {
-      const currTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
-      const nextLeadMs = perChunkPauses?.[idx + 1]?.leadingPauseMs || 0;
+      const nextOrigIdx = decodedChunks[idx + 1].chunkIndex;
+      const currTrailMs = perChunkPauses?.[origIdx]?.trailingPauseMs || 0;
+      const nextLeadMs = perChunkPauses?.[nextOrigIdx]?.leadingPauseMs || 0;
       const explicitBoundaryMs = currTrailMs + nextLeadMs;
       const effectivePauseSamples =
         explicitBoundaryMs > 0
@@ -688,11 +721,14 @@ export async function concatenateWavChunksWithCrossfade(
           : defaultPauseSamples;
       if (effectivePauseSamples > 0) {
         pcmBuffers.push(buildComfortSilenceBuffer(effectivePauseSamples));
+        sampleCursor += effectivePauseSamples;
       }
     } else {
-      const finalTrailMs = perChunkPauses?.[idx]?.trailingPauseMs || 0;
+      const finalTrailMs = perChunkPauses?.[origIdx]?.trailingPauseMs || 0;
       if (finalTrailMs > 0) {
-        pcmBuffers.push(buildComfortSilenceBuffer(Math.round((sampleRate * finalTrailMs) / 1000)));
+        const tailSamples = Math.round((sampleRate * finalTrailMs) / 1000);
+        pcmBuffers.push(buildComfortSilenceBuffer(tailSamples));
+        sampleCursor += tailSamples;
       }
     }
   }
@@ -717,6 +753,11 @@ export async function concatenateWavChunksWithCrossfade(
   } finally {
     await fs.promises.unlink(combinedRawPath).catch(() => {});
   }
+
+  return {
+    totalDurationSec: Number((sampleCursor / sampleRate).toFixed(3)),
+    chunkOffsets
+  };
 }
 
 interface EbuR128Measurement {
@@ -1141,20 +1182,28 @@ export interface DetectedAcousticPause {
   depthDb: number;
 }
 
+export interface ActiveSpeechIsland {
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+}
+
 export interface ChunkAcousticTimingProfile {
   durationMs: number;
   frameHopMs: number;
   frameEnergies: number[];
+  frameIsVoiced: boolean[];
   cumulativeEnergy: number[];
   pauses: DetectedAcousticPause[];
+  activeSpeechIslands: ActiveSpeechIsland[];
   activeSpeechStartMs: number;
   activeSpeechEndMs: number;
 }
 
 /**
- * Extracts a 20ms-resolution acoustic energy & natural pause profile from a 16kHz mono WAV chunk.
- * Used by the SRT segmenter to anchor sentence and clause split points to real acoustic pauses
- * and actual speech energy distribution when word-level timestamps are absent or coarse.
+ * Extracts a 20ms-resolution acoustic energy, voiced-activity & natural pause profile from a 16kHz mono WAV chunk.
+ * Used by the SRT segmenter both to verify ASR timestamps and to anchor sentence/clause boundaries directly
+ * to measured vocal activity and real acoustic pauses.
  */
 export async function extractChunkAcousticTimingProfile(
   chunkWavPath: string
@@ -1183,7 +1232,7 @@ export async function extractChunkAcousticTimingProfile(
     const durationMs = Math.round((totalSamples / sampleRate) * 1000);
 
     const frameDb: number[] = new Array(numFrames).fill(-96.0);
-    const frameEnergies: number[] = new Array(numFrames).fill(0);
+    const frameRms: number[] = new Array(numFrames).fill(0);
 
     for (let f = 0; f < numFrames; f++) {
       let sumSq = 0;
@@ -1194,23 +1243,39 @@ export async function extractChunkAcousticTimingProfile(
       }
       const rms = Math.sqrt(sumSq / frameSamples);
       const db = rms > 1e-6 ? 20 * Math.log10(rms) : -96.0;
+      frameRms[f] = rms;
       frameDb[f] = db;
-      // Weight active voiced energy above -44 dBFS
-      frameEnergies[f] = db > -44.0 ? Math.max(0.05, rms) : 0.002;
     }
 
     const sortedDb = [...frameDb].sort((a, b) => a - b);
+    const noiseFloorDb = sortedDb[Math.floor(sortedDb.length * 0.15)] ?? -60.0;
     const p80Db = sortedDb[Math.floor(sortedDb.length * 0.8)] ?? -20.0;
-    const pauseThresholdDb = Math.max(-43.0, Math.min(-26.0, p80Db - 13.5));
+    const dynamicRangeDb = Math.max(8.0, p80Db - noiseFloorDb);
+    const pauseThresholdDb = Math.max(
+      -44.0,
+      Math.min(-24.0, Math.max(p80Db - 15.0, noiseFloorDb + dynamicRangeDb * 0.34))
+    );
 
-    // Identify natural acoustic pauses >= 120ms (6 frames of 20ms)
+    // Raw voiced mask + 1-frame (20ms) hangover so brief stop-consonant closures stay voiced
+    const rawVoiced = frameDb.map((db) => db > pauseThresholdDb);
+    const frameIsVoiced: boolean[] = rawVoiced.map((v, idx) => {
+      if (v) return true;
+      return Boolean(rawVoiced[idx - 1] && rawVoiced[idx + 1]);
+    });
+
+    // Companded voiced activity energy: tracks spoken syllable time rather than peak bursts
+    const frameEnergies: number[] = frameRms.map((rms, idx) =>
+      frameIsVoiced[idx] ? Math.max(0.25, Math.pow(rms, 0.35)) : 0.001
+    );
+
+    // Identify natural acoustic pauses >= 140ms (7 frames of 20ms)
     const pauses: DetectedAcousticPause[] = [];
     let inPause = false;
     let pauseStartFrame = 0;
     let minPauseDb = 0;
 
     for (let f = 0; f < numFrames; f++) {
-      if (frameDb[f] <= pauseThresholdDb) {
+      if (!frameIsVoiced[f]) {
         if (!inPause) {
           inPause = true;
           pauseStartFrame = f;
@@ -1220,7 +1285,7 @@ export async function extractChunkAcousticTimingProfile(
         }
       } else if (inPause) {
         const spanFrames = f - pauseStartFrame;
-        if (spanFrames >= 6) {
+        if (spanFrames >= 7) {
           const startMs = pauseStartFrame * frameHopMs;
           const endMs = f * frameHopMs;
           pauses.push({
@@ -1235,6 +1300,53 @@ export async function extractChunkAcousticTimingProfile(
       }
     }
 
+    // Build contiguous active speech islands (merging intra-phrase micro-pauses < 340ms)
+    const activeSpeechIslands: ActiveSpeechIsland[] = [];
+    let inSpeech = false;
+    let speechStartFrame = 0;
+    for (let f = 0; f < numFrames; f++) {
+      if (frameIsVoiced[f]) {
+        if (!inSpeech) {
+          inSpeech = true;
+          speechStartFrame = f;
+        }
+      } else if (inSpeech) {
+        const prevIslandEndMs = f * frameHopMs;
+        // Look ahead up to 340ms (17 frames) to see if speech immediately resumes
+        let nextVoicedFrame = -1;
+        for (let k = f + 1; k < Math.min(numFrames, f + 17); k++) {
+          if (frameIsVoiced[k]) {
+            nextVoicedFrame = k;
+            break;
+          }
+        }
+        if (nextVoicedFrame !== -1) {
+          continue;
+        }
+        const startMs = Math.max(0, (speechStartFrame - 2) * frameHopMs);
+        const endMs = Math.min(durationMs, prevIslandEndMs + 40);
+        if (endMs - startMs >= 160) {
+          activeSpeechIslands.push({
+            startMs,
+            endMs,
+            durationMs: endMs - startMs
+          });
+        }
+        inSpeech = false;
+      }
+    }
+    if (inSpeech) {
+      const startMs = Math.max(0, (speechStartFrame - 2) * frameHopMs);
+      const endMs = durationMs;
+      if (endMs - startMs >= 160) {
+        activeSpeechIslands.push({
+          startMs,
+          endMs,
+          durationMs: endMs - startMs
+        });
+      }
+    }
+
     // Build cumulative energy array for energy-proportional timestamp interpolation
     const cumulativeEnergy: number[] = new Array(numFrames + 1).fill(0);
     for (let f = 0; f < numFrames; f++) {
@@ -1242,11 +1354,11 @@ export async function extractChunkAcousticTimingProfile(
     }
 
     let firstActiveFrame = 0;
-    while (firstActiveFrame < numFrames - 1 && frameDb[firstActiveFrame] <= pauseThresholdDb - 4) {
+    while (firstActiveFrame < numFrames - 1 && !frameIsVoiced[firstActiveFrame]) {
       firstActiveFrame++;
     }
     let lastActiveFrame = numFrames - 1;
-    while (lastActiveFrame > firstActiveFrame && frameDb[lastActiveFrame] <= pauseThresholdDb - 4) {
+    while (lastActiveFrame > firstActiveFrame && !frameIsVoiced[lastActiveFrame]) {
       lastActiveFrame--;
     }
 
@@ -1254,8 +1366,10 @@ export async function extractChunkAcousticTimingProfile(
       durationMs,
       frameHopMs,
       frameEnergies,
+      frameIsVoiced,
       cumulativeEnergy,
       pauses,
+      activeSpeechIslands,
       activeSpeechStartMs: Math.max(0, (firstActiveFrame - 2) * frameHopMs),
       activeSpeechEndMs: Math.min(durationMs, (lastActiveFrame + 3) * frameHopMs)
     };
@@ -2306,6 +2420,27 @@ export interface RawAsrSegmentInput {
  * Note: Intentional word repetition inside any sentence (e.g. "ধীরে ধীরে", "बार बार", "very very")
  * is 100% preserved because only cross-segment boundary overlaps are deduplicated.
  */
+export function parseFlexibleSeconds(raw: unknown): number | null {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : null;
+  }
+  const s = String(raw ?? '').trim().replace(',', '.');
+  if (!s) return null;
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  const parts = s.split(':').map((p) => Number(p.trim()));
+  if (parts.some((p) => !Number.isFinite(p) || p < 0)) return null;
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  }
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  return null;
+}
+
 export function sanitizeRawAsrSegmentsOverlap(
   rawSegments: RawAsrSegmentInput[]
 ): RawAsrSegmentInput[] {
@@ -2313,9 +2448,11 @@ export function sanitizeRawAsrSegmentsOverlap(
   for (const seg of rawSegments) {
     const tokens = tokenizeTranscriptForVerification(seg.text || '');
     if (tokens.length === 0) continue;
+    const parsedStart = parseFlexibleSeconds(seg.startSec);
+    const parsedEnd = parseFlexibleSeconds(seg.endSec);
     nonEmpty.push({
-      startSec: Number(seg.startSec) || 0,
-      endSec: Number(seg.endSec) || 0,
+      startSec: parsedStart ?? 0,
+      endSec: parsedEnd ?? (parsedStart !== null ? parsedStart + 0.5 : 0),
       text: tokens.join(' '),
       words: Array.isArray(seg.words) ? seg.words : undefined
     });
@@ -2505,8 +2642,10 @@ export async function detectSpeechIntervalsAndChunks(
 
   const splitPoints: number[] = [0];
   let lastSplit = 0;
+  const minLeadingIntervalSec = Math.min(8, Math.max(4, Math.round(maxChunkSec * 0.35)));
+  const searchRadiusSec = Math.min(8, Math.max(4, Math.round(maxChunkSec * 0.35)));
 
-  while (totalDurationSec - lastSplit > maxChunkSec + 6) {
+  while (totalDurationSec - lastSplit > maxChunkSec + 4) {
     const targetSplit = lastSplit + maxChunkSec;
     let bestSplit = targetSplit;
     let bestDist = Infinity;
@@ -2515,9 +2654,9 @@ export async function detectSpeechIntervalsAndChunks(
       const sStart = silenceStarts[i];
       const sEnd = silenceEnds[i] ?? sStart + 0.3;
       const midpoint = (sStart + sEnd) / 2;
-      if (midpoint > lastSplit + 12 && midpoint < totalDurationSec - 4) {
+      if (midpoint > lastSplit + minLeadingIntervalSec && midpoint < totalDurationSec - 3) {
         const dist = Math.abs(midpoint - targetSplit);
-        if (dist < 12 && dist < bestDist) {
+        if (dist < searchRadiusSec && dist < bestDist) {
           bestDist = dist;
           bestSplit = Number(midpoint.toFixed(3));
         }
@@ -2538,14 +2677,15 @@ export async function detectSpeechIntervalsAndChunks(
     const duration = Math.max(0.5, endSec - startSec);
     const chunkFilePath = path.join(dir, `${base}_chunk_${idx}.wav`);
 
+    // Place -ss AFTER -i so FFmpeg decodes sample-accurately on VBR MP3/M4A/AAC files (prevents chunk start drift)
     await execFileAsync('ffmpeg', [
       '-y',
+      '-i',
+      filePath,
       '-ss',
       String(startSec),
       '-t',
       String(duration),
-      '-i',
-      filePath,
       '-vn',
       '-ac',
       '1',
@@ -2567,15 +2707,408 @@ export async function detectSpeechIntervalsAndChunks(
   return { speechIntervals, chunks };
 }
 
+function countVoicedFramesInWindow(
+  profile: ChunkAcousticTimingProfile,
+  startMs: number,
+  endMs: number
+): { voicedFrames: number; totalFrames: number; voicedRatio: number } {
+  const hopMs = profile.frameHopMs || 20;
+  const voicedArr = profile.frameIsVoiced || [];
+  if (voicedArr.length === 0 || endMs <= startMs) {
+    return { voicedFrames: 0, totalFrames: 0, voicedRatio: 0 };
+  }
+  const fStart = Math.max(0, Math.min(voicedArr.length - 1, Math.floor(startMs / hopMs)));
+  const fEnd = Math.max(fStart + 1, Math.min(voicedArr.length, Math.ceil(endMs / hopMs)));
+  let voicedFrames = 0;
+  for (let f = fStart; f < fEnd; f++) {
+    if (voicedArr[f]) voicedFrames++;
+  }
+  const totalFrames = Math.max(1, fEnd - fStart);
+  return {
+    voicedFrames,
+    totalFrames,
+    voicedRatio: voicedFrames / totalFrames
+  };
+}
+
+function trimIntervalToVoicedSpeech(
+  profile: ChunkAcousticTimingProfile,
+  startMs: number,
+  endMs: number
+): { startMs: number; endMs: number } {
+  const hopMs = profile.frameHopMs || 20;
+  const voicedArr = profile.frameIsVoiced || [];
+  if (voicedArr.length === 0 || endMs - startMs < 400) {
+    return { startMs, endMs };
+  }
+  const fStart = Math.max(0, Math.min(voicedArr.length - 1, Math.floor(startMs / hopMs)));
+  const fEnd = Math.max(fStart, Math.min(voicedArr.length - 1, Math.floor(endMs / hopMs)));
+
+  let firstVoiced = -1;
+  let lastVoiced = -1;
+  for (let f = fStart; f <= fEnd; f++) {
+    if (voicedArr[f]) {
+      if (firstVoiced === -1) firstVoiced = f;
+      lastVoiced = f;
+    }
+  }
+  if (firstVoiced === -1 || lastVoiced <= firstVoiced) {
+    return { startMs, endMs };
+  }
+  const trimmedStart = Math.max(startMs, (firstVoiced - 2) * hopMs);
+  const trimmedEnd = Math.min(endMs, (lastVoiced + 3) * hopMs);
+  if (trimmedEnd - trimmedStart >= 250) {
+    return { startMs: trimmedStart, endMs: trimmedEnd };
+  }
+  return { startMs, endMs };
+}
+
+function mapEnergyFractionAcrossIslands(
+  profile: ChunkAcousticTimingProfile,
+  islands: ActiveSpeechIsland[],
+  targetFraction: number
+): number {
+  const hopMs = profile.frameHopMs || 20;
+  const cum = profile.cumulativeEnergy || [];
+  const islandWeights = islands.map((isl) => {
+    if (cum.length <= 1) return Math.max(1, isl.durationMs);
+    const f0 = Math.max(0, Math.min(cum.length - 2, Math.floor(isl.startMs / hopMs)));
+    const f1 = Math.max(f0 + 1, Math.min(cum.length - 1, Math.ceil(isl.endMs / hopMs)));
+    return Math.max(0.01, (cum[f1] ?? 0) - (cum[f0] ?? 0));
+  });
+  const totalIslandEnergy = islandWeights.reduce((a, b) => a + b, 0) || 1;
+  const targetEnergy = Math.max(0, Math.min(1, targetFraction)) * totalIslandEnergy;
+
+  let accum = 0;
+  for (let i = 0; i < islands.length; i++) {
+    const w = islandWeights[i];
+    if (accum + w >= targetEnergy || i === islands.length - 1) {
+      const localFrac = Math.max(0, Math.min(1, (targetEnergy - accum) / w));
+      const isl = islands[i];
+      if (cum.length <= 1) {
+        return Math.round(isl.startMs + isl.durationMs * localFrac);
+      }
+      const f0 = Math.max(0, Math.min(cum.length - 2, Math.floor(isl.startMs / hopMs)));
+      const f1 = Math.max(f0 + 1, Math.min(cum.length - 1, Math.ceil(isl.endMs / hopMs)));
+      const baseCum = cum[f0] ?? 0;
+      const localTarget = baseCum + w * localFrac;
+      let matchedFrame = f0;
+      for (let f = f0; f <= f1; f++) {
+        if ((cum[f] ?? 0) >= localTarget) {
+          matchedFrame = f;
+          break;
+        }
+      }
+      return Math.max(isl.startMs, Math.min(isl.endMs, matchedFrame * hopMs));
+    }
+    accum += w;
+  }
+  return islands[islands.length - 1].endMs;
+}
+
+function alignSubUnitsAcrossActiveSpeechIslands(options: {
+  subUnits: string[];
+  maxCharsPerLine: number;
+  chunkOffsetMs: number;
+  chunkDurationMs: number;
+  acousticProfile: ChunkAcousticTimingProfile;
+  usedPauseMidpoints: Set<number>;
+}): SrtSegment[] {
+  const {
+    subUnits,
+    maxCharsPerLine,
+    chunkOffsetMs,
+    chunkDurationMs,
+    acousticProfile,
+    usedPauseMidpoints
+  } = options;
+  if (subUnits.length === 0) return [];
+
+  const rawIslands =
+    acousticProfile.activeSpeechIslands && acousticProfile.activeSpeechIslands.length > 0
+      ? acousticProfile.activeSpeechIslands
+      : [
+          {
+            startMs: Math.max(0, acousticProfile.activeSpeechStartMs),
+            endMs: Math.max(
+              acousticProfile.activeSpeechStartMs + 250,
+              Math.min(chunkDurationMs, acousticProfile.activeSpeechEndMs || chunkDurationMs)
+            ),
+            durationMs: Math.max(
+              250,
+              (acousticProfile.activeSpeechEndMs || chunkDurationMs) -
+                acousticProfile.activeSpeechStartMs
+            )
+          }
+        ];
+
+  // Keep only substantial islands unless total islands is empty
+  const validIslands = rawIslands.filter((isl) => isl.durationMs >= 180);
+  let islands = (validIslands.length > 0 ? validIslands : rawIslands).map((isl) => ({ ...isl }));
+
+  const weights = subUnits.map((u) => {
+    const tokens = tokenizeTranscriptForVerification(u);
+    const charCount = Math.max(1, Array.from(u.replace(/\s+/g, '')).length);
+    const wordWeight = tokens.length * 2.5;
+    const punctPauseWeight = /[.!?।॥؟۔。！？]$/.test(u)
+      ? 4.5
+      : /[,;—–:،؛]$/.test(u)
+      ? 2.0
+      : 0;
+    return charCount + wordWeight + punctPauseWeight;
+  });
+  const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+
+  // If there are more islands than subUnits, iteratively merge the pair of adjacent islands
+  // separated by the SHORTEST silence gap so real multi-second silences stay strictly unbridged.
+  while (islands.length > subUnits.length && islands.length > 1) {
+    let minGapIdx = 0;
+    let minGapMs = Infinity;
+    for (let i = 0; i < islands.length - 1; i++) {
+      const gap = islands[i + 1].startMs - islands[i].endMs;
+      if (gap < minGapMs) {
+        minGapMs = gap;
+        minGapIdx = i;
+      }
+    }
+    const merged: ActiveSpeechIsland = {
+      startMs: islands[minGapIdx].startMs,
+      endMs: islands[minGapIdx + 1].endMs,
+      durationMs: islands[minGapIdx + 1].endMs - islands[minGapIdx].startMs
+    };
+    islands.splice(minGapIdx, 2, merged);
+  }
+
+  // Compute each island's acoustic voiced energy weight
+  const hopMs = acousticProfile.frameHopMs || 20;
+  const cum = acousticProfile.cumulativeEnergy || [];
+  const islandWeights = islands.map((isl) => {
+    if (cum.length <= 1) return Math.max(1, isl.durationMs);
+    const f0 = Math.max(0, Math.min(cum.length - 2, Math.floor(isl.startMs / hopMs)));
+    const f1 = Math.max(f0 + 1, Math.min(cum.length - 1, Math.ceil(isl.endMs / hopMs)));
+    return Math.max(0.01, (cum[f1] ?? 0) - (cum[f0] ?? 0));
+  });
+  const totalIslandEnergy = islandWeights.reduce((a, b) => a + b, 0) || 1;
+  const islandFracs = islandWeights.map((w) => w / totalIslandEnergy);
+
+  // Prefix sums of subUnit weights for O(1) slice fraction lookup
+  const weightPrefix: number[] = [0];
+  for (let i = 0; i < weights.length; i++) {
+    weightPrefix.push(weightPrefix[i] + weights[i]);
+  }
+
+  // Partition subUnits[0..N-1] contiguously across islands[0..M-1] (M <= N) minimizing energy-proportion mismatch
+  const M = islands.length;
+  const N = subUnits.length;
+  const groupSlices: Array<{ startIdx: number; endIdx: number }> = [];
+
+  if (M === 1) {
+    groupSlices.push({ startIdx: 0, endIdx: N });
+  } else {
+    const dp: number[][] = Array.from({ length: M + 1 }, () => new Array(N + 1).fill(Infinity));
+    const prevSplit: number[][] = Array.from({ length: M + 1 }, () => new Array(N + 1).fill(0));
+    dp[0][0] = 0;
+
+    for (let m = 1; m <= M; m++) {
+      const targetFrac = islandFracs[m - 1];
+      const maxEnd = N - (M - m);
+      for (let j = m; j <= maxEnd; j++) {
+        for (let i = m - 1; i < j; i++) {
+          if (!Number.isFinite(dp[m - 1][i])) continue;
+          const sliceFrac = (weightPrefix[j] - weightPrefix[i]) / totalWeight;
+          const cost = Math.abs(sliceFrac - targetFrac) ** 2;
+          if (dp[m - 1][i] + cost < dp[m][j]) {
+            dp[m][j] = dp[m - 1][i] + cost;
+            prevSplit[m][j] = i;
+          }
+        }
+      }
+    }
+
+    let cursor = N;
+    for (let m = M; m >= 1; m--) {
+      const startIdx = prevSplit[m][cursor];
+      groupSlices.unshift({ startIdx, endIdx: cursor });
+      cursor = startIdx;
+    }
+  }
+
+  const blocks: SrtSegment[] = [];
+  let prevEndMs = 0;
+
+  for (let m = 0; m < M; m++) {
+    const isl = islands[m];
+    const { startIdx, endIdx } = groupSlices[m];
+    const sliceCount = endIdx - startIdx;
+    if (sliceCount <= 0) continue;
+
+    const sliceTotalWeight = Math.max(1e-6, weightPrefix[endIdx] - weightPrefix[startIdx]);
+    let localAccum = 0;
+    let sliceStartMs = Math.max(m === 0 ? isl.startMs : prevEndMs + 20, isl.startMs);
+
+    for (let idx = startIdx; idx < endIdx; idx++) {
+      localAccum += weights[idx];
+      const localFrac = localAccum / sliceTotalWeight;
+      const isLastInIsland = idx === endIdx - 1;
+
+      let rawStartMs = sliceStartMs;
+      let rawEndMs = isLastInIsland
+        ? isl.endMs
+        : mapEnergyFractionAcrossIslands(acousticProfile, [isl], localFrac);
+
+      let timingSource: SrtSegment['timingSource'] = 'acoustic-energy-aligned';
+
+      if (!isLastInIsland) {
+        let bestPause: DetectedAcousticPause | null = null;
+        let bestScore = -Infinity;
+        for (const p of acousticProfile.pauses) {
+          if (usedPauseMidpoints.has(p.midMs)) continue;
+          if (p.midMs <= rawStartMs + 260 || p.midMs >= isl.endMs - 220) continue;
+          const distMs = Math.abs(p.midMs - rawEndMs);
+          if (distMs <= 450) {
+            const score = p.durationMs * 0.55 + p.depthDb * 3 - distMs * 0.3;
+            if (score > bestScore) {
+              bestScore = score;
+              bestPause = p;
+            }
+          }
+        }
+        if (bestPause) {
+          usedPauseMidpoints.add(bestPause.midMs);
+          rawEndMs = bestPause.midMs;
+          timingSource = 'acoustic-pause-aligned';
+        }
+        const minTail = (endIdx - 1 - idx) * 240;
+        rawEndMs = Math.min(isl.endMs - minTail, Math.max(rawStartMs + 220, rawEndMs));
+      } else if (isl.endMs - isl.startMs > 220) {
+        rawEndMs = isl.endMs;
+      }
+
+      const trimmed = trimIntervalToVoicedSpeech(
+        acousticProfile,
+        rawStartMs,
+        Math.max(rawStartMs + 220, rawEndMs)
+      );
+      rawStartMs = Math.max(idx === startIdx ? isl.startMs : prevEndMs + 20, trimmed.startMs);
+      rawEndMs = Math.max(rawStartMs + 220, Math.min(chunkDurationMs, Math.min(isl.endMs, trimmed.endMs)));
+
+      prevEndMs = rawEndMs;
+      sliceStartMs = Math.min(isl.endMs - 220, rawEndMs + 25);
+
+      const absStartMs = chunkOffsetMs + rawStartMs;
+      const absEndMs = chunkOffsetMs + rawEndMs;
+      blocks.push({
+        id: blocks.length + 1,
+        startTimeMs: absStartMs,
+        endTimeMs: absEndMs,
+        startTimestamp: msToSrtTimestamp(absStartMs),
+        endTimestamp: msToSrtTimestamp(absEndMs),
+        text: wrapSubtitleTextIntoMaxTwoLines(subUnits[idx], maxCharsPerLine),
+        timingSource
+      });
+    }
+  }
+
+  return blocks;
+}
+
+function shouldFallbackToAcousticIslandAlignment(
+  rawSegments: RawAsrSegmentInput[],
+  chunkDurationMs: number,
+  acousticProfile: ChunkAcousticTimingProfile
+): boolean {
+  if (rawSegments.length === 0) return false;
+  const voicedArr = acousticProfile.frameIsVoiced || [];
+  if (voicedArr.length < 10) return false;
+
+  const totalVoicedFrames = voicedArr.filter(Boolean).length;
+  if (totalVoicedFrames < 12) return false; // Less than 240ms of speech total
+
+  const parsedBounds: { startMs: number; endMs: number; tokens: number }[] = [];
+  let nonMonotonicOrInvalid = 0;
+
+  for (let i = 0; i < rawSegments.length; i++) {
+    const seg = rawSegments[i];
+    const s = parseFlexibleSeconds(seg.startSec);
+    const e = parseFlexibleSeconds(seg.endSec);
+    const tokens = tokenizeTranscriptForVerification(seg.text || '').length;
+    if (s === null || e === null || e <= s || s * 1000 > chunkDurationMs + 800) {
+      nonMonotonicOrInvalid++;
+      continue;
+    }
+    const startMs = Math.max(0, Math.min(chunkDurationMs - 50, Math.round(s * 1000)));
+    const endMs = Math.max(startMs + 50, Math.min(chunkDurationMs, Math.round(e * 1000)));
+    if (
+      parsedBounds.length > 0 &&
+      startMs < parsedBounds[parsedBounds.length - 1].startMs - 400
+    ) {
+      nonMonotonicOrInvalid++;
+    }
+    parsedBounds.push({ startMs, endMs, tokens });
+  }
+
+  if (parsedBounds.length === 0 || nonMonotonicOrInvalid >= Math.max(1, Math.ceil(rawSegments.length * 0.4))) {
+    return true;
+  }
+
+  // Check 1: Single raw segment spanning whole chunk or missing acoustic boundaries -> use island aligner
+  if (rawSegments.length === 1) {
+    const b = parsedBounds[0];
+    const segVoiced = countVoicedFramesInWindow(acousticProfile, b.startMs, b.endMs);
+    if (segVoiced.voicedFrames < totalVoicedFrames * 0.7 || acousticProfile.activeSpeechIslands.length >= 2) {
+      return true;
+    }
+  }
+
+  // Check 2: Did the model leave a giant gap (> 1200ms) right across active speech?
+  for (let i = 1; i < parsedBounds.length; i++) {
+    const gapStart = parsedBounds[i - 1].endMs;
+    const gapEnd = parsedBounds[i].startMs;
+    if (gapEnd - gapStart > 1200) {
+      const gapVoice = countVoicedFramesInWindow(acousticProfile, gapStart, gapEnd);
+      if (gapVoice.voicedRatio >= 0.4 && gapVoice.voicedFrames >= 35) {
+        return true;
+      }
+    }
+  }
+
+  // Check 3: Compare total voiced speech covered by model segments vs total voiced speech in chunk
+  let coveredVoicedFrames = 0;
+  let placedTotalFrames = 0;
+  for (const b of parsedBounds) {
+    const w = countVoicedFramesInWindow(acousticProfile, b.startMs, b.endMs);
+    coveredVoicedFrames += w.voicedFrames;
+    placedTotalFrames += w.totalFrames;
+  }
+
+  if (totalVoicedFrames >= 25 && coveredVoicedFrames < totalVoicedFrames * 0.56) {
+    return true;
+  }
+
+  // Check 4: Are placed segments landing mostly on dead silence while real speech is elsewhere?
+  if (
+    placedTotalFrames >= 20 &&
+    totalVoicedFrames / voicedArr.length >= 0.25 &&
+    coveredVoicedFrames / placedTotalFrames < 0.26
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * Priority 2 Intelligent Timestamp-Aware SRT Segmenter:
  * Converts sanitized ASR segments into sentence-aware, pause-aligned, 2-line max SubRip segments
  * while guaranteeing 100% exact ordered token sequence preservation:
- *   1. Word-level timestamps from ASR when present and valid.
+ *   0. Verifies ASR segment timestamps against actual 20ms PCM voiced activity & speech islands;
+ *      if Gemini timestamps drifted, compressed, or left dead holes across active speech, cleanly
+ *      re-anchors all verbatim sentences/clauses to the measured acoustic speech islands & pauses.
+ *   1. Word-level timestamps from ASR when present, monotonic, and acoustically coherent.
  *   2. Sentence boundary detection (., !, ?, ।, ॥, ؟, ۔, 。, ！, ？) with abbreviation protection.
  *   3. Measured 20ms-resolution acoustic pauses (extractChunkAcousticTimingProfile).
  *   4. Balanced linguistic clause grouping (>= 3 words per clause, zero orphan tails) & 2-line wrapping.
- *   5. Cumulative vocal energy timestamp fallback when word timestamps and pauses are absent.
+ *   5. Companded voiced energy alignment fallback when word timestamps and pauses are absent.
  */
 export function segmentChunkAsrIntoReadableSrtBlocks(options: {
   rawSegments: RawAsrSegmentInput[];
@@ -2588,6 +3121,40 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
   const chunkOffsetMs = Math.round(chunkStartSec * 1000);
   const chunkDurationMs = Math.max(250, Math.round((chunkEndSec - chunkStartSec) * 1000));
   const usedPauseMidpoints = new Set<number>();
+
+  // If Gemini's segment timestamps failed acoustic verification (drifted, left spoken gaps, or placed on silence),
+  // preserve 100% of verbatim words and re-anchor strictly to actual measured PCM speech islands & pauses!
+  if (shouldFallbackToAcousticIslandAlignment(rawSegments, chunkDurationMs, acousticProfile)) {
+    const combinedVerbatimText = rawSegments
+      .map((s) => tokenizeTranscriptForVerification(s.text || '').join(' '))
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (combinedVerbatimText) {
+      const maxCharsPerLine = getScriptMaxCharsPerLine(languageCode, combinedVerbatimText);
+      const rawSentences = splitTextIntoLinguisticSentences(combinedVerbatimText);
+      const subUnits: string[] = [];
+      for (const sent of rawSentences) {
+        const clauses = splitLongSentenceIntoReadableClauses(sent, maxCharsPerLine);
+        for (const cl of clauses) {
+          if (cl.trim()) subUnits.push(cl.trim());
+        }
+      }
+      if (subUnits.length > 0) {
+        return alignSubUnitsAcrossActiveSpeechIslands({
+          subUnits,
+          maxCharsPerLine,
+          chunkOffsetMs,
+          chunkDurationMs,
+          acousticProfile,
+          usedPauseMidpoints
+        });
+      }
+    }
+  }
+
   const outputBlocks: SrtSegment[] = [];
 
   for (let segIdx = 0; segIdx < rawSegments.length; segIdx++) {
@@ -2598,16 +3165,16 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
 
     const maxCharsPerLine = getScriptMaxCharsPerLine(languageCode, cleanText);
 
+    const parsedStartSec = parseFlexibleSeconds(rawSeg.startSec) ?? 0;
+    const parsedEndSec = parseFlexibleSeconds(rawSeg.endSec) ?? (chunkEndSec - chunkStartSec);
+
     let relStartMs = Math.max(
       0,
-      Math.min(chunkDurationMs - 100, Math.round((Number(rawSeg.startSec) || 0) * 1000))
+      Math.min(chunkDurationMs - 100, Math.round(parsedStartSec * 1000))
     );
     let relEndMs = Math.max(
       relStartMs + 100,
-      Math.min(
-        chunkDurationMs,
-        Math.round((Number(rawSeg.endSec) || chunkEndSec - chunkStartSec) * 1000)
-      )
+      Math.min(chunkDurationMs, Math.round(parsedEndSec * 1000))
     );
 
     if (rawSegments.length === 1 && relStartMs === 0 && relEndMs >= chunkDurationMs - 100) {
@@ -2615,11 +3182,16 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
       relEndMs = Math.max(relStartMs + 100, Math.min(chunkDurationMs, acousticProfile.activeSpeechEndMs));
     }
 
-    // Guard against compressed ASR segment endSec (e.g., 13 words reported inside 0.24s..1.48s when next segment starts at 7.46s)
+    // Trim pure leading/trailing silence inside the segment window
+    const voicedTrim = trimIntervalToVoicedSpeech(acousticProfile, relStartMs, relEndMs);
+    relStartMs = voicedTrim.startMs;
+    relEndMs = voicedTrim.endMs;
+
+    // Guard against compressed ASR segment endSec
     const minNaturalSpanMs = cleanTokens.length * 260;
     const nextRawSeg = rawSegments[segIdx + 1];
     const nextSegStartMs = nextRawSeg
-      ? Math.max(relEndMs, Math.round((Number(nextRawSeg.startSec) || 0) * 1000) - 80)
+      ? Math.max(relEndMs, Math.round((parseFlexibleSeconds(nextRawSeg.startSec) ?? 0) * 1000) - 80)
       : Math.max(relEndMs, Math.min(chunkDurationMs, acousticProfile.activeSpeechEndMs));
 
     if (relEndMs - relStartMs < minNaturalSpanMs && nextSegStartMs > relEndMs + 350) {
@@ -2645,12 +3217,20 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
     // Check if usable monotonic word-level timestamps were returned by ASR for this segment
     let validWords: SrtWordTimestamp[] = [];
     if (Array.isArray(rawSeg.words) && rawSeg.words.length >= 2) {
-      let prevEnd = 0;
+      let prevEnd = relStartMs;
+      let hadOutlierJump = false;
       for (const w of rawSeg.words) {
         const wText = String(w.word || '').trim();
-        const wStart = Math.max(0, Math.round((Number(w.startSec) || 0) * 1000));
-        const wEnd = Math.min(chunkDurationMs, Math.round((Number(w.endSec) || 0) * 1000));
-        if (wText && wEnd > wStart && wStart >= prevEnd - 80) {
+        const wStartSec = parseFlexibleSeconds(w.startSec);
+        const wEndSec = parseFlexibleSeconds(w.endSec);
+        if (wStartSec === null || wEndSec === null) continue;
+        const wStart = Math.max(0, Math.round(wStartSec * 1000));
+        const wEnd = Math.min(chunkDurationMs, Math.round(wEndSec * 1000));
+        if (wStart - prevEnd > 3500 && rawSeg.words.length > 4) {
+          hadOutlierJump = true;
+          break;
+        }
+        if (wText && wEnd > wStart && wStart >= prevEnd - 120) {
           validWords.push({
             word: wText,
             startTimeMs: Math.max(prevEnd, wStart),
@@ -2659,8 +3239,9 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
           prevEnd = Math.max(prevEnd, wEnd);
         }
       }
-      // Discard compressed word timestamps if their total span is implausibly short (< 180ms/word)
-      if (validWords.length >= 2) {
+      if (hadOutlierJump || validWords.length < Math.floor(cleanTokens.length * 0.7)) {
+        validWords = [];
+      } else if (validWords.length >= 2) {
         const wordSpanMs = validWords[validWords.length - 1].endTimeMs - validWords[0].startTimeMs;
         if (wordSpanMs < cleanTokens.length * 180 && relEndMs - relStartMs > wordSpanMs * 1.4) {
           validWords = [];
@@ -2736,7 +3317,6 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
     // and cumulative voiced speech energy within [relStartMs, relEndMs]
     const weights = subUnits.map((u) => {
       const tokens = tokenizeTranscriptForVerification(u);
-      // Weight by phonological syllable/vowel-nucleus proxy + word count + terminal pause weight
       const charCount = Math.max(1, Array.from(u.replace(/\s+/g, '')).length);
       const wordWeight = tokens.length * 2.5;
       const punctPauseWeight = /[.!?।॥؟۔。！？]$/.test(u) ? 5 : /[,;—–:،؛]$/.test(u) ? 2.5 : 0;
@@ -2775,8 +3355,16 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
         timingSource = resolved.source;
       }
 
-      const absStartMs = chunkOffsetMs + currentRelStartMs;
-      const absEndMs = Math.max(absStartMs + 100, chunkOffsetMs + nextRelEndMs);
+      const sliceTrimmed = trimIntervalToVoicedSpeech(
+        acousticProfile,
+        currentRelStartMs,
+        Math.max(currentRelStartMs + 150, nextRelEndMs)
+      );
+      const effStartRelMs = Math.max(currentRelStartMs, sliceTrimmed.startMs);
+      const effEndRelMs = Math.max(effStartRelMs + 100, Math.min(nextRelEndMs, sliceTrimmed.endMs));
+
+      const absStartMs = chunkOffsetMs + effStartRelMs;
+      const absEndMs = Math.max(absStartMs + 100, chunkOffsetMs + effEndRelMs);
       outputBlocks.push({
         id: outputBlocks.length + 1,
         startTimeMs: absStartMs,
@@ -2787,8 +3375,8 @@ export function segmentChunkAsrIntoReadableSrtBlocks(options: {
         timingSource
       });
 
-      const gapMs = Math.min(40, Math.max(10, Math.floor((relEndMs - nextRelEndMs) * 0.1)));
-      currentRelStartMs = Math.min(relEndMs - minSliceMs, nextRelEndMs + gapMs);
+      const gapMs = Math.min(40, Math.max(10, Math.floor((relEndMs - effEndRelMs) * 0.1)));
+      currentRelStartMs = Math.min(relEndMs - minSliceMs, effEndRelMs + gapMs);
     }
   }
 
@@ -2860,15 +3448,15 @@ export function enforceAndValidateSrtTimelineIntegrity(
       }
     }
 
-    // Pass 4: Expand overly brief segments (< 750ms) ONLY up to available slack before next segment and maxAudioMs
+    // Pass 4: Expand overly brief segments (< 750ms) up to available slack before next segment and maxAudioMs
+    // without arbitrarily amputating longer continuous speech blocks.
     for (let i = 0; i < n; i++) {
       const ceilingMs = i < n - 1 ? Math.max(ends[i], starts[i + 1] - minGapMs) : maxAudioMs;
       if (ends[i] - starts[i] < 750 && ceilingMs > ends[i]) {
         ends[i] = Math.min(ceilingMs, starts[i] + 800);
       }
-      // Cap single subtitle block duration at 6500ms
-      if (ends[i] - starts[i] > 6500) {
-        ends[i] = starts[i] + 6500;
+      if (ends[i] - starts[i] > 10_000) {
+        ends[i] = starts[i] + 10_000;
       }
     }
 

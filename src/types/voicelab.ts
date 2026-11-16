@@ -69,6 +69,8 @@ export interface VoiceCloneChunkStatus {
   trailingPauseMs: number;
   status: 'completed' | 'cached' | 'failed';
   durationSec?: number;
+  actualStartMs?: number;
+  actualEndMs?: number;
   error?: string;
 }
 

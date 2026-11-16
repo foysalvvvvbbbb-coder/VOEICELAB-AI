@@ -1169,7 +1169,22 @@ async function synthesizeMode2ReferenceConditionedChunks(options: {
   }
 
   await Promise.all(backgroundWritePromises);
-  await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180, chunkTimings);
+  const concatInfo = await concatenateWavChunksWithCrossfade(
+    chunkPaths,
+    outputRawWavPath,
+    180,
+    chunkTimings
+  );
+  for (const offset of concatInfo.chunkOffsets) {
+    const statusEntry = chunkStatuses[offset.chunkIndex];
+    if (statusEntry) {
+      statusEntry.actualStartMs = offset.startMs;
+      statusEntry.actualEndMs = offset.endMs;
+      statusEntry.durationSec = Number(
+        Math.max(0.05, (offset.endMs - offset.startMs) / 1000).toFixed(3)
+      );
+    }
+  }
 
   const meanEcapaCosineSimilarity =
     ecapaScores.length > 0
@@ -2323,7 +2338,22 @@ async function synthesizeViaZeroShotGradioCloudSpace(options: {
         throw fatalWorkerError;
       }
 
-      await concatenateWavChunksWithCrossfade(chunkPaths, outputRawWavPath, 180, chunkTimings);
+      const concatInfo = await concatenateWavChunksWithCrossfade(
+        chunkPaths,
+        outputRawWavPath,
+        180,
+        chunkTimings
+      );
+      for (const offset of concatInfo.chunkOffsets) {
+        const statusEntry = chunkStatuses[offset.chunkIndex];
+        if (statusEntry) {
+          statusEntry.actualStartMs = offset.startMs;
+          statusEntry.actualEndMs = offset.endMs;
+          statusEntry.durationSec = Number(
+            Math.max(0.05, (offset.endMs - offset.startMs) / 1000).toFixed(3)
+          );
+        }
+      }
 
       return {
         modelCheckpoint: spec.modelCheckpoint,
@@ -3237,11 +3267,11 @@ export async function executeMultilingualSrtPipeline(options: {
     progressSource: 'indeterminate-inference'
   });
 
-  // 1. Detect speech intervals and split into silence-aligned chunks via FFmpeg
+  // 1. Detect speech intervals and split into silence-aligned chunks via FFmpeg (~22s cap minimizes ASR timestamp drift)
   const { chunks } = await detectSpeechIntervalsAndChunks(
     filePath,
     durationSeconds,
-    45
+    22
   );
 
   const allChunkSegments: SrtSegment[] = [];
@@ -3355,7 +3385,7 @@ export async function executeMultilingualSrtPipeline(options: {
 
       // Gentle pacing between consecutive non-cached ASR requests to reduce burst 503 spikes
       if (isMultiChunk && cIdx > 0) {
-        await sleepWithAbort(250, signal);
+        await sleepWithAbort(120, signal);
       }
 
       const base64Chunk = chunkBytes.toString('base64');
@@ -3427,7 +3457,7 @@ Requirements:
 1. NEVER combine multiple full sentences into a single subtitle segment. Every complete sentence ending in '.', '!', '?', '।', '॥', or '؟' MUST be its own segment, EXCEPT do not isolate a single greeting word (e.g. "নমস্কার।", "नमस्ते।", "Hello.") into a 1-word segment when immediately followed by another sentence.
 2. NEVER repeat or echo trailing words or phrases from the end of one segment at the start of or inside the next segment. Each spoken word in the audio must appear in exactly ONE segment.
 3. Keep each segment concise (1 to 5 seconds, max 2 lines) and split only at natural grammatical clause boundaries.
-4. Provide accurate startSec and endSec relative to the start of this audio chunk, and include word-level timestamps in 'words' when possible.
+4. Provide accurate numeric decimal seconds (e.g., 1.42, 4.85 — NEVER MM:SS strings) for startSec and endSec strictly within [0, ${chunkDuration}] relative to the start of THIS audio clip, matching exact audible speech boundaries with zero artificial gaps across continuous speech, and include word-level timestamps in 'words' when possible.
 5. Preserve every spoken word and native Unicode punctuation verbatim without omission or translation.`
                       }
                     ]
