@@ -53,6 +53,9 @@ export interface AudioSignalAnalysis {
     };
   };
   previewUrl: string;
+  autoTrimmedFromSec?: number;
+  autoTrimWindowStartSec?: number;
+  autoTrimWindowEndSec?: number;
 }
 
 export interface VoiceCloneChunkStatus {

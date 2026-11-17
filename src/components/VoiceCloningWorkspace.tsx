@@ -409,8 +409,8 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       title: `Upload & Analyze ${file.name}`,
       stages: [
         'Uploading reference audio bytes',
-        'Verifying audio container signature & running FFprobe/FFmpeg DSP',
-        'Analyzing spoken language & reference vocal identity'
+        'Verifying audio & auto-cutting cleanest 10s speech clip',
+        'Analyzing spoken language & 10s reference vocal identity'
       ],
       initialProgressPct: 0,
       progressSource: 'upload-bytes',
@@ -1545,7 +1545,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               <h2 className="text-sm font-semibold text-[#F4F8F5]">
                 01. Reference Voice ({currentLangConfig.nativeName})
               </h2>
-              <span className="text-[11px] font-mono text-[#A2B5AA]">5–30s audio</span>
+              <span className="text-[11px] font-mono text-[#42D9A0]">Any length · Auto 10s</span>
             </div>
 
             {/* Compact Drag and Drop Zone */}
@@ -1637,6 +1637,28 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                   src={referenceAnalysis.previewUrl}
                   className="w-full h-9 rounded-lg"
                 />
+
+                {typeof referenceAnalysis.autoTrimmedFromSec === 'number' &&
+                  referenceAnalysis.autoTrimmedFromSec > 10.05 && (
+                    <div className="bg-emerald-950/40 border border-emerald-500/35 rounded-lg px-2.5 py-2 text-[11px] text-emerald-200 flex items-center justify-between gap-2">
+                      <span>
+                        অটো-কাট: মূল{' '}
+                        <strong className="font-mono text-white">
+                          {referenceAnalysis.autoTrimmedFromSec}s
+                        </strong>{' '}
+                        অডিও থেকে সবচেয়ে পরিষ্কার{' '}
+                        <strong className="font-mono text-[#42D9A0]">
+                          {referenceAnalysis.durationSeconds}s
+                        </strong>{' '}
+                        অংশ (
+                        <span className="font-mono">
+                          {referenceAnalysis.autoTrimWindowStartSec ?? 0}s–
+                          {referenceAnalysis.autoTrimWindowEndSec ?? referenceAnalysis.durationSeconds}s
+                        </span>
+                        ) ক্লোনিংয়ের জন্য নেওয়া হয়েছে।
+                      </span>
+                    </div>
+                  )}
 
                 {/* Reference Speaker Conditioning Status Badge */}
                 <div className="bg-[#12231D] border border-[#19352A] rounded-lg p-2.5 text-[11px] space-y-1">

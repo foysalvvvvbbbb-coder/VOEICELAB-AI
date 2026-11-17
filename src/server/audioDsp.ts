@@ -3645,3 +3645,191 @@ export function formatSegmentsToSrt(segments: SrtSegment[]): string {
     })
     .join('\n');
 }
+
+export interface Auto10SecExtractResult {
+  trimmed: boolean;
+  outputPath: string;
+  originalDurationSec: number;
+  extractedDurationSec: number;
+  windowStartSec: number;
+  windowEndSec: number;
+}
+
+/**
+ * Automatically cuts the cleanest, most speech-rich 10-second window from any
+ * reference voice exceeding 10 seconds, converting it to a canonical 24kHz mono WAV.
+ * Files <= 10.05s pass through untouched.
+ */
+export async function extractAuto10SecVoiceCloneReference(
+  inputPath: string,
+  outputWavPath: string,
+  targetMaxSec = 10
+): Promise<Auto10SecExtractResult> {
+  let originalDurationSec = 0;
+  try {
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', inputPath],
+      { timeout: 12_000 }
+    );
+    const parsed = JSON.parse(stdout);
+    const stream = (parsed.streams || []).find((s: any) => s.codec_type === 'audio');
+    originalDurationSec = Number(
+      parseFloat(stream?.duration || parsed.format?.duration || '0').toFixed(2)
+    );
+  } catch {
+    originalDurationSec = 0;
+  }
+
+  if (originalDurationSec <= targetMaxSec + 0.05) {
+    return {
+      trimmed: false,
+      outputPath: inputPath,
+      originalDurationSec,
+      extractedDurationSec: originalDurationSec,
+      windowStartSec: 0,
+      windowEndSec: originalDurationSec
+    };
+  }
+
+  let bestStartSec = 0;
+  const scanLimitSec = Math.min(originalDurationSec, 180);
+  const scanPcmPath = `${outputWavPath}.scan8k.pcm`;
+
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        inputPath,
+        '-t',
+        String(scanLimitSec),
+        '-vn',
+        '-ar',
+        '8000',
+        '-ac',
+        '1',
+        '-f',
+        's16le',
+        scanPcmPath
+      ],
+      { timeout: 15_000 }
+    );
+    const pcmBuf = await fs.promises.readFile(scanPcmPath);
+    const frameSamples = 1600; // 200ms frames at 8kHz
+    const frameSec = 0.2;
+    const totalSamples = Math.floor(pcmBuf.length / 2);
+    const frameCount = Math.floor(totalSamples / frameSamples);
+    const windowFrames = Math.max(10, Math.round(targetMaxSec / frameSec)); // 50 frames = 10s
+
+    if (frameCount > windowFrames) {
+      const frameDbs: number[] = [];
+      const framePeaks: number[] = [];
+      for (let f = 0; f < frameCount; f++) {
+        let sumSq = 0;
+        let peak = 0;
+        const base = f * frameSamples;
+        for (let s = 0; s < frameSamples; s++) {
+          const val = pcmBuf.readInt16LE((base + s) * 2) / 32768.0;
+          const absVal = Math.abs(val);
+          if (absVal > peak) peak = absVal;
+          sumSq += val * val;
+        }
+        const rms = Math.sqrt(sumSq / frameSamples);
+        frameDbs.push(rms > 1e-6 ? 20 * Math.log10(rms) : -96.0);
+        framePeaks.push(peak > 1e-6 ? 20 * Math.log10(peak) : -96.0);
+      }
+
+      const sortedDb = [...frameDbs].sort((a, b) => a - b);
+      const noiseFloorDb = sortedDb[Math.floor(sortedDb.length * 0.15)] ?? -60;
+      const p80Db = sortedDb[Math.floor(sortedDb.length * 0.8)] ?? -20;
+      const speechThreshDb = Math.max(-46, Math.min(-24, noiseFloorDb + Math.max(8, (p80Db - noiseFloorDb) * 0.35)));
+
+      let bestScore = -Infinity;
+      let bestFrameIdx = 0;
+
+      for (let start = 0; start <= frameCount - windowFrames; start++) {
+        let activeCount = 0;
+        let dbSum = 0;
+        let clippedCount = 0;
+        for (let k = 0; k < windowFrames; k++) {
+          const db = frameDbs[start + k];
+          if (db >= speechThreshDb) {
+            activeCount++;
+            dbSum += Math.min(-10, db);
+          }
+          if (framePeaks[start + k] > -0.8) {
+            clippedCount++;
+          }
+        }
+        const activeRatio = activeCount / windowFrames;
+        const avgActiveDbNorm = activeCount > 0 ? Math.max(0, (dbSum / activeCount + 45) / 35) : 0;
+        const earlyBias = 0.04 * (1 - start / Math.max(1, frameCount - windowFrames));
+        const score = activeRatio * 2.0 + avgActiveDbNorm * 0.35 - (clippedCount / windowFrames) * 0.4 + earlyBias;
+        if (score > bestScore) {
+          bestScore = score;
+          bestFrameIdx = start;
+        }
+      }
+
+      // Trim any leading silence inside the chosen 10s window while keeping full 10s when available
+      let firstActiveOffset = 0;
+      for (let k = 0; k < Math.min(windowFrames - 10, 15); k++) {
+        if (frameDbs[bestFrameIdx + k] >= speechThreshDb) {
+          firstActiveOffset = k;
+          break;
+        }
+      }
+      const adjustedStartFrame = Math.min(frameCount - windowFrames, bestFrameIdx + firstActiveOffset);
+      bestStartSec = Number(Math.max(0, adjustedStartFrame * frameSec).toFixed(2));
+      if (bestStartSec + targetMaxSec > originalDurationSec) {
+        bestStartSec = Number(Math.max(0, originalDurationSec - targetMaxSec).toFixed(2));
+      }
+    }
+  } catch {
+    bestStartSec = 0;
+  } finally {
+    await fs.promises.unlink(scanPcmPath).catch(() => {});
+  }
+
+  const fadeOutStart = Math.max(0.1, targetMaxSec - 0.02).toFixed(3);
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-i',
+      inputPath,
+      '-ss',
+      String(bestStartSec),
+      '-t',
+      String(targetMaxSec),
+      '-vn',
+      '-af',
+      `afade=t=in:ss=0:d=0.015,afade=t=out:st=${fadeOutStart}:d=0.015`,
+      '-ar',
+      '24000',
+      '-ac',
+      '1',
+      '-c:a',
+      'pcm_s16le',
+      outputWavPath
+    ],
+    { timeout: 25_000 }
+  );
+
+  const stat = await fs.promises.stat(outputWavPath).catch(() => null);
+  const extractedDurationSec = stat
+    ? Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2))
+    : targetMaxSec;
+
+  return {
+    trimmed: true,
+    outputPath: outputWavPath,
+    originalDurationSec,
+    extractedDurationSec,
+    windowStartSec: bestStartSec,
+    windowEndSec: Number(Math.min(originalDurationSec, bestStartSec + extractedDurationSec).toFixed(2))
+  };
+}
+

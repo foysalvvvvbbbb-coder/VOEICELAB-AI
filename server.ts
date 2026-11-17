@@ -16,7 +16,10 @@ import type {
   VoiceAudioQualityMode,
   VoiceCloneResult
 } from './src/types/voicelab.ts';
-import { inspectAndValidateAudioFile } from './src/server/audioDsp.ts';
+import {
+  extractAuto10SecVoiceCloneReference,
+  inspectAndValidateAudioFile
+} from './src/server/audioDsp.ts';
 import {
   analyzeReferenceVoiceLanguageAndIdentity,
   assertSafeNeuralNodeUrl,
@@ -532,7 +535,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50 MB max upload size
+    fileSize: 150 * 1024 * 1024, // 150 MB max upload size (long reference voices auto-trim to 10s)
     files: 1
   },
   fileFilter: (_req, file, cb) => {
@@ -653,7 +656,7 @@ function handleAudioUploadMiddleware(
     if (err) {
       const message =
         err?.code === 'LIMIT_FILE_SIZE'
-          ? 'Audio file exceeds the 50 MB maximum upload limit.'
+          ? 'Audio file exceeds the 150 MB maximum upload limit.'
           : err?.message || 'Audio file upload failed validation.';
       res.status(400).type('application/json').json({
         error: message
@@ -2068,16 +2071,59 @@ async function startServer() {
         const fileId = path.basename(req.file.filename, path.extname(req.file.filename));
         const previewUrl = `/api/audio/uploaded/${fileId}`;
 
+        let activeAudioPath = req.file.path;
+        let effectiveMimeType = req.file.mimetype || 'audio/wav';
+        let autoTrimMeta: {
+          originalDurationSec: number;
+          windowStartSec: number;
+          windowEndSec: number;
+        } | null = null;
+
+        if (workspace === 'voice-cloning') {
+          const trimmed10sPath = path.join(UPLOAD_DIR, `${fileId}_10s.wav`);
+          const autoExtract = await extractAuto10SecVoiceCloneReference(
+            req.file.path,
+            trimmed10sPath,
+            10
+          );
+          if (autoExtract.trimmed && fs.existsSync(autoExtract.outputPath)) {
+            activeAudioPath = autoExtract.outputPath;
+            effectiveMimeType = 'audio/wav';
+            autoTrimMeta = {
+              originalDurationSec: autoExtract.originalDurationSec,
+              windowStartSec: autoExtract.windowStartSec,
+              windowEndSec: autoExtract.windowEndSec
+            };
+            await fs.promises.unlink(req.file.path).catch(() => {});
+            emitServerOperationProgress(operationId, {
+              stageIndex: 1,
+              stageLabel: `Auto-cut cleanest 10.0s speech clip from ${autoExtract.originalDurationSec}s reference audio...`,
+              progressPct: null,
+              progressSource: 'indeterminate-inference',
+              status: 'running'
+            });
+          }
+        }
+
         const analysis = await inspectAndValidateAudioFile(
-          req.file.path,
+          activeAudioPath,
           fileId,
           req.file.originalname,
-          req.file.mimetype || 'audio/wav',
+          effectiveMimeType,
           previewUrl
         );
 
+        if (autoTrimMeta) {
+          analysis.autoTrimmedFromSec = autoTrimMeta.originalDurationSec;
+          analysis.autoTrimWindowStartSec = autoTrimMeta.windowStartSec;
+          analysis.autoTrimWindowEndSec = autoTrimMeta.windowEndSec;
+        }
+
         if (!analysis.isValid) {
-          await fs.promises.unlink(req.file.path).catch(() => {});
+          await fs.promises.unlink(activeAudioPath).catch(() => {});
+          if (activeAudioPath !== req.file.path) {
+            await fs.promises.unlink(req.file.path).catch(() => {});
+          }
           const valErr =
             analysis.qualityWarnings.join(' ') ||
             'Uploaded audio is empty, corrupted, or contains only silence.';
@@ -2098,22 +2144,24 @@ async function startServer() {
         if (workspace === 'voice-cloning') {
           emitServerOperationProgress(operationId, {
             stageIndex: 2,
-            stageLabel: 'Analyzing spoken language & reference vocal identity...',
+            stageLabel: 'Analyzing spoken language & 10s reference vocal identity...',
             progressPct: null,
             progressSource: 'indeterminate-inference',
             status: 'running'
           });
           analysis.detectedSpokenLanguage = await analyzeReferenceVoiceLanguageAndIdentity(
-            req.file.path,
+            activeAudioPath,
             analysis
           );
         }
 
-        await saveUploadedFileEntry(fileId, req.file.path, analysis);
+        await saveUploadedFileEntry(fileId, activeAudioPath, analysis);
 
         emitServerOperationProgress(operationId, {
           stageIndex: workspace === 'voice-cloning' ? 2 : 1,
-          stageLabel: 'Audio validated and ready',
+          stageLabel: autoTrimMeta
+            ? `Auto-cut 10.0s from ${autoTrimMeta.originalDurationSec}s audio — ready for cloning`
+            : 'Audio validated and ready',
           progressPct: 100,
           progressSource: 'completed',
           status: 'succeeded'
@@ -2122,7 +2170,9 @@ async function startServer() {
         res.status(200).type('application/json').json({ analysis });
       } catch (err: any) {
         if (req.file?.path) {
+          const fallbackFileId = path.basename(req.file.filename, path.extname(req.file.filename));
           await fs.promises.unlink(req.file.path).catch(() => {});
+          await fs.promises.unlink(path.join(UPLOAD_DIR, `${fallbackFileId}_10s.wav`)).catch(() => {});
         }
         emitServerOperationProgress(operationId, {
           stageIndex: 1,

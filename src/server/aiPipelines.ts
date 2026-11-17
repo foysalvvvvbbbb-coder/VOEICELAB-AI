@@ -37,6 +37,7 @@ import {
   type DetectedAcousticPause,
   detectSpeechIntervalsAndChunks,
   enforceAndValidateSrtTimelineIntegrity,
+  extractAuto10SecVoiceCloneReference,
   extractChunkAcousticTimingProfile,
   formatSegmentsToSrt,
   inspectAndValidateAudioFile,
@@ -1512,9 +1513,9 @@ function parseGradioSseResult(sseText: string): {
 }
 
 /**
- * Prepares a clean <= 5.5s 24kHz mono WAV clip for zero-shot cloud Spaces
- * (strips dead leading/trailing mic silence cleanly so CosyVoice3 / IndicF5
- * avoid stretched silences while preserving 100% of speaker vocal timbre).
+ * Prepares a clean <= 10.0s 24kHz mono WAV clip for zero-shot cloud Spaces
+ * (selects the cleanest speech-rich 10-second window for long files and strips
+ * dead leading mic silence while preserving 100% of speaker vocal timbre).
  */
 export async function prepareCanonicalSpeakerPromptWav(
   referenceBytes: Buffer,
@@ -1607,46 +1608,36 @@ async function trimReferenceAudioForZeroShot(
   }
 
   const inTmp = path.join(outputDir, `ref_in_${referenceSha256.slice(0, 12)}.wav`);
-  const desilencedTmp = path.join(outputDir, `ref_clean_${referenceSha256.slice(0, 12)}.wav`);
-  const outTmp = path.join(outputDir, `ref_5s_${referenceSha256.slice(0, 12)}.wav`);
+  const extracted10sTmp = path.join(outputDir, `ref_best10s_${referenceSha256.slice(0, 12)}.wav`);
+  const outTmp = path.join(outputDir, `ref_10s_${referenceSha256.slice(0, 12)}.wav`);
   try {
     await fs.promises.writeFile(inTmp, referenceBytes);
-    let sourceForTrim = inTmp;
-    try {
-      await execFileAsync(
-        'ffmpeg',
-        [
-          '-y',
-          '-i',
-          inTmp,
-          '-af',
-          'silenceremove=start_periods=1:start_silence=0.15:start_threshold=-42dB:stop_periods=-1:stop_silence=0.35:stop_threshold=-42dB',
-          '-ar',
-          '24000',
-          '-ac',
-          '1',
-          '-c:a',
-          'pcm_s16le',
-          desilencedTmp
-        ],
-        { timeout: 10_000 }
-      );
-      const cleanStat = await fs.promises.stat(desilencedTmp).catch(() => null);
-      // Require >= 1.2s of active speech after silence trim; otherwise keep raw clip
-      if (cleanStat && cleanStat.size >= 44 + 24000 * 2 * 1.2) {
-        sourceForTrim = desilencedTmp;
-      }
-    } catch {
-      sourceForTrim = inTmp;
-    }
+    const extracted = await extractAuto10SecVoiceCloneReference(inTmp, extracted10sTmp, 10);
+    const activeInputPath = extracted.trimmed ? extracted.outputPath : inTmp;
 
+    // Strip only leading dead silence while preserving up to full 10.0s natural vocal cadence
     await execFileAsync(
       'ffmpeg',
-      ['-y', '-i', sourceForTrim, '-t', '5.5', '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', outTmp],
-      { timeout: 10_000 }
+      [
+        '-y',
+        '-i',
+        activeInputPath,
+        '-af',
+        'silenceremove=start_periods=1:start_silence=0.12:start_threshold=-42dB',
+        '-t',
+        '10',
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        outTmp
+      ],
+      { timeout: 12_000 }
     );
     const trimmed = await fs.promises.readFile(outTmp);
-    const finalBuf = trimmed.length > 1000 ? trimmed : referenceBytes;
+    const finalBuf = trimmed.length >= 44 + 24000 * 2 * 1.0 ? trimmed : await fs.promises.readFile(activeInputPath);
     if (trimmedPromptBufferCache.size >= PROMPT_CACHE_MAX_ENTRIES) {
       const oldestKey = trimmedPromptBufferCache.keys().next().value;
       if (oldestKey) trimmedPromptBufferCache.delete(oldestKey);
@@ -1660,7 +1651,7 @@ async function trimReferenceAudioForZeroShot(
     return referenceBytes;
   } finally {
     await fs.promises.unlink(inTmp).catch(() => {});
-    await fs.promises.unlink(desilencedTmp).catch(() => {});
+    await fs.promises.unlink(extracted10sTmp).catch(() => {});
     await fs.promises.unlink(outTmp).catch(() => {});
   }
 }
@@ -2581,7 +2572,12 @@ export async function executeSameLanguageVoiceCloning(options: {
     }
   }
 
-  const referenceSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+  let referenceSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+  // Guarantee <= 10.0s reference conditioning even for legacy Saved Voices or direct paths
+  if (refBytes.length > 44 + 24000 * 2 * 10.1) {
+    refBytes = await trimReferenceAudioForZeroShot(refBytes, outputDir, referenceSha256);
+    referenceSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+  }
   let preConditionedPromptBytes: Buffer | undefined;
   if (preConditionedPromptPath && fs.existsSync(preConditionedPromptPath)) {
     try {
