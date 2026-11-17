@@ -102,6 +102,7 @@ const UPLOAD_DIR = path.join(PERSISTENT_DATA_ROOT, 'uploads');
 const GENERATED_DIR = path.join(PERSISTENT_DATA_ROOT, 'generated');
 const SAMPLES_DIR = path.join(PERSISTENT_DATA_ROOT, 'samples');
 const VOICE_VAULT_DIR = path.join(PERSISTENT_DATA_ROOT, 'voice_vault');
+const VOICE_CLONE_JOBS_DIR = path.join(PERSISTENT_DATA_ROOT, 'voice_clone_jobs');
 const SAVED_VOICES_INDEX_FILE = path.join(PERSISTENT_DATA_ROOT, 'saved_voices_index.json');
 
 for (const dir of [
@@ -109,7 +110,8 @@ for (const dir of [
   UPLOAD_DIR,
   GENERATED_DIR,
   SAMPLES_DIR,
-  VOICE_VAULT_DIR
+  VOICE_VAULT_DIR,
+  VOICE_CLONE_JOBS_DIR
 ]) {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -2296,6 +2298,22 @@ async function startServer() {
     }
   );
 
+  interface VoiceCloneJobLaunchParams {
+    referenceFilePath: string;
+    preConditionedPromptPath?: string;
+    savedVoiceId?: string;
+    referenceAnalysis: AudioSignalAnalysis;
+    language: CloningLanguageCode;
+    text: string;
+    referenceTranscript?: string;
+    audioQuality: VoiceAudioQualityMode;
+    preservePitchContour: boolean;
+    preserveSpectralTimbre: boolean;
+    localEndpointUrl?: string;
+    localNodeToken?: string;
+    enableCloudVerification: boolean;
+  }
+
   interface VoiceCloneJobRecord {
     jobId: string;
     operationId: string | null;
@@ -2314,9 +2332,70 @@ async function startServer() {
     createdAtMs: number;
     updatedAtMs: number;
     latestProgress?: ServerOperationProgress;
+    launchParams?: VoiceCloneJobLaunchParams;
+    lastDiskWriteMs?: number;
   }
 
   const voiceCloneJobsRegistry = new Map<string, VoiceCloneJobRecord>();
+
+  async function persistVoiceCloneJobToDisk(job: VoiceCloneJobRecord): Promise<void> {
+    if (!SAFE_IDENTIFIER_REGEX.test(job.jobId)) return;
+    const jobFile = path.join(VOICE_CLONE_JOBS_DIR, `${job.jobId}.json`);
+    const tmpFile = `${jobFile}.tmp`;
+    const serializable = {
+      jobId: job.jobId,
+      operationId: job.operationId,
+      sessionId: job.sessionId,
+      uid: job.uid,
+      status: job.status,
+      result: job.result,
+      error: job.error,
+      code: job.code,
+      httpStatus: job.httpStatus,
+      retryAfterText: job.retryAfterText,
+      deductedTokens: job.deductedTokens,
+      deductedUser: job.deductedUser,
+      refunded: job.refunded,
+      createdAtMs: job.createdAtMs,
+      updatedAtMs: job.updatedAtMs,
+      latestProgress: job.latestProgress,
+      launchParams: job.launchParams
+    };
+    await fs.promises.writeFile(tmpFile, JSON.stringify(serializable), 'utf8').catch(() => {});
+    await fs.promises.rename(tmpFile, jobFile).catch(() => {});
+  }
+
+  async function loadVoiceCloneJobFromDisk(jobId: string): Promise<VoiceCloneJobRecord | null> {
+    if (!SAFE_IDENTIFIER_REGEX.test(jobId)) return null;
+    const jobFile = path.join(VOICE_CLONE_JOBS_DIR, `${jobId}.json`);
+    try {
+      if (!fs.existsSync(jobFile)) return null;
+      const parsed = JSON.parse(await fs.promises.readFile(jobFile, 'utf8'));
+      if (!parsed || parsed.jobId !== jobId) return null;
+      return {
+        jobId: parsed.jobId,
+        operationId: parsed.operationId || null,
+        sessionId: String(parsed.sessionId || ''),
+        uid: parsed.uid || null,
+        status: parsed.status || 'failed',
+        result: parsed.result,
+        error: parsed.error,
+        code: parsed.code,
+        httpStatus: parsed.httpStatus,
+        retryAfterText: parsed.retryAfterText,
+        deductedTokens: Number(parsed.deductedTokens) || 0,
+        deductedUser: parsed.deductedUser || null,
+        refunded: Boolean(parsed.refunded),
+        abortController: new AbortController(),
+        createdAtMs: Number(parsed.createdAtMs) || Date.now(),
+        updatedAtMs: Number(parsed.updatedAtMs) || Date.now(),
+        latestProgress: parsed.latestProgress,
+        launchParams: parsed.launchParams
+      };
+    } catch {
+      return null;
+    }
+  }
 
   function pruneOldVoiceCloneJobs(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -2333,6 +2412,20 @@ async function startServer() {
         voiceCloneJobsRegistry.delete(r.jobId);
       }
     }
+    // Prune stale disk job snapshots older than 24h in background
+    void fs.promises
+      .readdir(VOICE_CLONE_JOBS_DIR)
+      .then(async (files) => {
+        for (const f of files) {
+          if (!f.endsWith('.json')) continue;
+          const p = path.join(VOICE_CLONE_JOBS_DIR, f);
+          const st = await fs.promises.stat(p).catch(() => null);
+          if (st && st.mtimeMs < cutoff) {
+            await fs.promises.unlink(p).catch(() => {});
+          }
+        }
+      })
+      .catch(() => {});
   }
 
   async function refundVoiceCloneJobTokensOnce(job: VoiceCloneJobRecord, reason: string): Promise<void> {
@@ -2347,6 +2440,125 @@ async function startServer() {
       actorUid: 'system'
     });
     await persistGovernanceState();
+    await persistVoiceCloneJobToDisk(job);
+  }
+
+  function launchVoiceCloneJobBackground(
+    jobRecord: VoiceCloneJobRecord,
+    params: VoiceCloneJobLaunchParams,
+    reuseCompletedChunks: boolean,
+    bearerToken: string | null
+  ): void {
+    void (async () => {
+      try {
+        const result = await executeSameLanguageVoiceCloning({
+          jobId: jobRecord.jobId,
+          referenceFilePath: params.referenceFilePath,
+          preConditionedPromptPath: params.preConditionedPromptPath,
+          savedVoiceId: params.savedVoiceId,
+          referenceAnalysis: params.referenceAnalysis,
+          language: params.language,
+          text: params.text,
+          referenceTranscript: params.referenceTranscript,
+          audioQuality: params.audioQuality,
+          preservePitchContour: params.preservePitchContour,
+          preserveSpectralTimbre: params.preserveSpectralTimbre,
+          reuseCompletedChunks,
+          outputDir: GENERATED_DIR,
+          localEndpointUrl: params.localEndpointUrl,
+          localNodeToken: params.localNodeToken,
+          enableCloudVerification: params.enableCloudVerification,
+          abortSignal: jobRecord.abortController.signal,
+          onProgress: (ev) => {
+            const nowMs = Date.now();
+            const snap: ServerOperationProgress = {
+              operationId: jobRecord.operationId || jobRecord.jobId,
+              ...ev,
+              status: 'running',
+              updatedAtMs: nowMs
+            };
+            jobRecord.latestProgress = snap;
+            jobRecord.updatedAtMs = nowMs;
+            if (!jobRecord.lastDiskWriteMs || nowMs - jobRecord.lastDiskWriteMs >= 3500) {
+              jobRecord.lastDiskWriteMs = nowMs;
+              void persistVoiceCloneJobToDisk(jobRecord);
+            }
+            emitServerOperationProgress(jobRecord.operationId, {
+              ...ev,
+              status: 'running'
+            });
+          }
+        });
+
+        if (jobRecord.status === 'cancelled' || jobRecord.abortController.signal.aborted) {
+          await refundVoiceCloneJobTokensOnce(
+            jobRecord,
+            'Automatic refund: Voice Cloning job was cancelled'
+          );
+          return;
+        }
+
+        if (params.savedVoiceId) {
+          const sv = savedVoicesRegistry.get(params.savedVoiceId);
+          if (sv) {
+            const usedIso = new Date().toISOString();
+            sv.usageCount = (sv.usageCount || 0) + 1;
+            sv.lastUsedAt = usedIso;
+            sv.updatedAt = usedIso;
+            await persistSavedVoiceProfileRecord(sv);
+            if (bearerToken) {
+              void incrementSavedVoiceUsageInFirestore(bearerToken, params.savedVoiceId);
+            }
+          }
+        }
+
+        jobRecord.status = 'succeeded';
+        jobRecord.result = result;
+        jobRecord.updatedAtMs = Date.now();
+        await persistVoiceCloneJobToDisk(jobRecord);
+        emitServerOperationProgress(jobRecord.operationId, {
+          stageIndex: 4,
+          stageLabel: 'Voice cloning completed',
+          progressPct: 100,
+          progressSource: 'completed',
+          status: 'succeeded'
+        });
+      } catch (err: any) {
+        const wasCancelled =
+          jobRecord.status === 'cancelled' ||
+          jobRecord.abortController.signal.aborted ||
+          err?.code === 'JOB_CANCELLED';
+        await refundVoiceCloneJobTokensOnce(
+          jobRecord,
+          wasCancelled
+            ? 'Automatic refund: Voice Cloning job cancelled'
+            : 'Automatic refund: Voice Cloning pipeline failed before completion'
+        );
+        const quotaInfo = extractQuotaExhaustedInfo(err);
+        const rawStatus =
+          typeof err?.httpStatus === 'number'
+            ? err.httpStatus
+            : quotaInfo.isQuotaExhausted
+            ? 429
+            : 400;
+        const safeStatus = rawStatus === 403 ? 401 : rawStatus;
+        jobRecord.status = wasCancelled ? 'cancelled' : 'failed';
+        jobRecord.error = err?.message || 'Voice cloning pipeline failed.';
+        jobRecord.code =
+          err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED');
+        jobRecord.httpStatus = safeStatus;
+        jobRecord.retryAfterText = err?.retryAfterText || quotaInfo.retryAfterText;
+        jobRecord.updatedAtMs = Date.now();
+        await persistVoiceCloneJobToDisk(jobRecord);
+        emitServerOperationProgress(jobRecord.operationId, {
+          stageIndex: 1,
+          stageLabel: jobRecord.error || 'Voice cloning failed',
+          progressPct: null,
+          progressSource: 'indeterminate-inference',
+          status: 'failed'
+        });
+      }
+    })();
   }
 
   // 7. WORKSPACE A — Same-Language AI Voice Cloning Generation
@@ -2580,6 +2792,21 @@ async function startServer() {
 
         if (asyncJob === true) {
           pruneOldVoiceCloneJobs();
+          const launchParams: VoiceCloneJobLaunchParams = {
+            referenceFilePath: refEntry.filePath,
+            preConditionedPromptPath,
+            savedVoiceId: effectiveSavedVoiceId,
+            referenceAnalysis: refEntry.analysis,
+            language: language as CloningLanguageCode,
+            text: String(text || ''),
+            referenceTranscript: effectiveReferenceTranscript,
+            audioQuality: validatedAudioQuality,
+            preservePitchContour: Boolean(preservePitchContour),
+            preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
+            localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
+            localNodeToken: typeof localNodeToken === 'string' ? localNodeToken : undefined,
+            enableCloudVerification: effectiveCloudVerification
+          };
           const jobRecord: VoiceCloneJobRecord = {
             jobId,
             operationId,
@@ -2591,9 +2818,11 @@ async function startServer() {
             refunded: false,
             abortController,
             createdAtMs: Date.now(),
-            updatedAtMs: Date.now()
+            updatedAtMs: Date.now(),
+            launchParams
           };
           voiceCloneJobsRegistry.set(jobId, jobRecord);
+          await persistVoiceCloneJobToDisk(jobRecord);
 
           // Prevent duplicate refund in outer catch once background runner owns the lifecycle
           deductedTokens = 0;
@@ -2605,109 +2834,12 @@ async function startServer() {
             operationId
           });
 
-          void (async () => {
-            try {
-              const result = await executeSameLanguageVoiceCloning({
-                jobId,
-                referenceFilePath: refEntry.filePath,
-                preConditionedPromptPath,
-                savedVoiceId: effectiveSavedVoiceId,
-                referenceAnalysis: refEntry.analysis,
-                language: language as CloningLanguageCode,
-                text: String(text || ''),
-                referenceTranscript: effectiveReferenceTranscript,
-                audioQuality: validatedAudioQuality,
-                preservePitchContour: Boolean(preservePitchContour),
-                preserveSpectralTimbre: Boolean(preserveSpectralTimbre),
-                reuseCompletedChunks: Boolean(reuseCompletedChunks),
-                outputDir: GENERATED_DIR,
-                localEndpointUrl: typeof localEndpointUrl === 'string' ? localEndpointUrl : undefined,
-                localNodeToken: typeof localNodeToken === 'string' ? localNodeToken : undefined,
-                enableCloudVerification: effectiveCloudVerification,
-                abortSignal: abortController.signal,
-                onProgress: (ev) => {
-                  const snap: ServerOperationProgress = {
-                    operationId: operationId || jobId,
-                    ...ev,
-                    status: 'running',
-                    updatedAtMs: Date.now()
-                  };
-                  jobRecord.latestProgress = snap;
-                  jobRecord.updatedAtMs = snap.updatedAtMs;
-                  emitServerOperationProgress(operationId, {
-                    ...ev,
-                    status: 'running'
-                  });
-                }
-              });
-
-              if (jobRecord.status === 'cancelled' || abortController.signal.aborted) {
-                await refundVoiceCloneJobTokensOnce(
-                  jobRecord,
-                  'Automatic refund: Voice Cloning job was cancelled'
-                );
-                return;
-              }
-
-              if (effectiveSavedVoiceId) {
-                const sv = savedVoicesRegistry.get(effectiveSavedVoiceId);
-                if (sv) {
-                  const usedIso = new Date().toISOString();
-                  sv.usageCount = (sv.usageCount || 0) + 1;
-                  sv.lastUsedAt = usedIso;
-                  sv.updatedAt = usedIso;
-                  await persistSavedVoiceProfileRecord(sv);
-                  if (bearerToken) {
-                    void incrementSavedVoiceUsageInFirestore(bearerToken, effectiveSavedVoiceId);
-                  }
-                }
-              }
-
-              jobRecord.status = 'succeeded';
-              jobRecord.result = result;
-              jobRecord.updatedAtMs = Date.now();
-              emitServerOperationProgress(operationId, {
-                stageIndex: 4,
-                stageLabel: 'Voice cloning completed',
-                progressPct: 100,
-                progressSource: 'completed',
-                status: 'succeeded'
-              });
-            } catch (err: any) {
-              const wasCancelled =
-                jobRecord.status === 'cancelled' ||
-                abortController.signal.aborted ||
-                err?.code === 'JOB_CANCELLED';
-              await refundVoiceCloneJobTokensOnce(
-                jobRecord,
-                wasCancelled
-                  ? 'Automatic refund: Voice Cloning job cancelled'
-                  : 'Automatic refund: Voice Cloning pipeline failed before completion'
-              );
-              const quotaInfo = extractQuotaExhaustedInfo(err);
-              const rawStatus =
-                typeof err?.httpStatus === 'number'
-                  ? err.httpStatus
-                  : quotaInfo.isQuotaExhausted
-                  ? 429
-                  : 400;
-              const safeStatus = rawStatus === 403 ? 401 : rawStatus;
-              jobRecord.status = wasCancelled ? 'cancelled' : 'failed';
-              jobRecord.error = err?.message || 'Voice cloning pipeline failed.';
-              jobRecord.code =
-                err?.code || (safeStatus === 429 ? 'RESOURCE_EXHAUSTED' : 'VOICE_CLONE_FAILED');
-              jobRecord.httpStatus = safeStatus;
-              jobRecord.retryAfterText = err?.retryAfterText || quotaInfo.retryAfterText;
-              jobRecord.updatedAtMs = Date.now();
-              emitServerOperationProgress(operationId, {
-                stageIndex: 1,
-                stageLabel: jobRecord.error || 'Voice cloning failed',
-                progressPct: null,
-                progressSource: 'indeterminate-inference',
-                status: 'failed'
-              });
-            }
-          })();
+          launchVoiceCloneJobBackground(
+            jobRecord,
+            launchParams,
+            Boolean(reuseCompletedChunks),
+            bearerToken
+          );
           return;
         }
 
@@ -2808,14 +2940,24 @@ async function startServer() {
     }
   );
 
-  // 7b. Poll status / result of an async Voice Cloning job (session/user scoped)
-  app.get('/api/voice-clone/jobs/:jobId', requireAuthenticatedSession, (req, res) => {
+  // 7b. Poll status / result of an async Voice Cloning job (persists & auto-resumes across restarts)
+  app.get('/api/voice-clone/jobs/:jobId', requireAuthenticatedSession, async (req, res) => {
     const jobId = String(req.params.jobId || '').trim();
     if (!SAFE_IDENTIFIER_REGEX.test(jobId)) {
       res.status(400).type('application/json').json({ error: 'Invalid job identifier.' });
       return;
     }
-    const job = voiceCloneJobsRegistry.get(jobId);
+
+    let job = voiceCloneJobsRegistry.get(jobId);
+    let recoveredFromDisk = false;
+    if (!job) {
+      const diskJob = await loadVoiceCloneJobFromDisk(jobId);
+      if (diskJob) {
+        job = diskJob;
+        recoveredFromDisk = true;
+      }
+    }
+
     if (!job) {
       res.status(404).type('application/json').json({
         error: 'Voice cloning job not found or expired.',
@@ -2833,6 +2975,31 @@ async function startServer() {
         code: 'JOB_FORBIDDEN'
       });
       return;
+    }
+
+    if (recoveredFromDisk) {
+      voiceCloneJobsRegistry.set(jobId, job);
+      if (job.status === 'running' && job.launchParams) {
+        const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+        // If server restarted while job was running, seamlessly resume from cached chunks
+        if (job.launchParams.savedVoiceId && fbIdentity) {
+          await ensureSavedVoiceHydratedOnServer(
+            job.launchParams.savedVoiceId,
+            fbIdentity,
+            bearerToken
+          ).catch(() => {});
+        }
+        job.latestProgress = {
+          operationId: job.operationId || job.jobId,
+          stageIndex: 1,
+          stageLabel: 'Server restarted — resuming synthesis seamlessly from cached chunks...',
+          progressPct: job.latestProgress?.progressPct ?? null,
+          progressSource: job.latestProgress?.progressSource ?? 'indeterminate-inference',
+          status: 'running',
+          updatedAtMs: Date.now()
+        };
+        launchVoiceCloneJobBackground(job, job.launchParams, true, bearerToken);
+      }
     }
 
     res.status(200).type('application/json').json({
@@ -2854,7 +3021,8 @@ async function startServer() {
       res.status(400).type('application/json').json({ error: 'Invalid job identifier.' });
       return;
     }
-    const job = voiceCloneJobsRegistry.get(jobId);
+    const job =
+      voiceCloneJobsRegistry.get(jobId) || (await loadVoiceCloneJobFromDisk(jobId));
     if (!job) {
       res.status(404).type('application/json').json({ error: 'Voice cloning job not found.' });
       return;
@@ -2874,6 +3042,8 @@ async function startServer() {
       job.code = 'JOB_CANCELLED';
       job.updatedAtMs = Date.now();
       job.abortController.abort();
+      voiceCloneJobsRegistry.set(jobId, job);
+      await persistVoiceCloneJobToDisk(job);
       await refundVoiceCloneJobTokensOnce(
         job,
         'Automatic refund: Voice Cloning job cancelled by user'

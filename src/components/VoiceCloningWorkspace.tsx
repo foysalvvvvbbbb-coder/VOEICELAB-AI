@@ -948,6 +948,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       if (!resObj && startData.jobId) {
         activeBackendJobId = startData.jobId;
         let transientPollErrors = 0;
+        let jobNotFoundRecoveries = 0;
 
         while (!resObj) {
           if (op.signal.aborted || op.isStale()) {
@@ -987,7 +988,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
               } | null;
               result?: VoiceCloneResult;
               error?: string;
-            }>(`/api/voice-clone/jobs/${encodeURIComponent(startData.jobId)}`, {
+            }>(`/api/voice-clone/jobs/${encodeURIComponent(activeBackendJobId)}`, {
               method: 'GET',
               signal: op.signal
             });
@@ -1029,12 +1030,60 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             if (pollErr?.isJobTerminalFailure) {
               throw pollErr;
             }
-            transientPollErrors += 1;
+
             const msg = String(pollErr?.message || '');
+            const isMissingJob =
+              msg.includes('JOB_NOT_FOUND') ||
+              msg.toLowerCase().includes('not found or expired') ||
+              msg.toLowerCase().includes('job not found');
+
+            if (isMissingJob && jobNotFoundRecoveries < 2) {
+              jobNotFoundRecoveries += 1;
+              updateOperationStage(op.operationId, {
+                stageIndex: 1,
+                stageLabel: 'Reconnecting after server restart — resuming from cached chunks...'
+              });
+              const resumed = await fetchApiJson<{
+                status?: string;
+                jobId?: string;
+                result?: VoiceCloneResult;
+              }>('/api/voice-clone/generate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                operationId: op.operationId,
+                signal: op.signal,
+                body: JSON.stringify({
+                  referenceFileId: activeSavedVoice ? undefined : referenceAnalysis?.fileId,
+                  savedVoiceId: activeSavedVoice ? activeSavedVoice.voiceId : undefined,
+                  language: selectedLang,
+                  text: inputText,
+                  referenceTranscript: referenceTranscript.trim() || undefined,
+                  audioQuality,
+                  preservePitchContour,
+                  preserveSpectralTimbre,
+                  reuseCompletedChunks: true,
+                  localEndpointUrl: localEndpointUrl.trim() || undefined,
+                  localNodeToken: localNodeToken.trim() || undefined,
+                  enableCloudVerification,
+                  consentConfirmed,
+                  asyncJob: true
+                })
+              });
+              if (resumed.result) {
+                resObj = resumed.result;
+                break;
+              }
+              if (resumed.jobId) {
+                activeBackendJobId = resumed.jobId;
+                transientPollErrors = 0;
+                continue;
+              }
+            }
+
+            transientPollErrors += 1;
             const isFatal =
               transientPollErrors >= 15 ||
-              msg.includes('JOB_NOT_FOUND') ||
-              msg.includes('not found') ||
+              isMissingJob ||
               msg.includes('ZeroGPU') ||
               msg.includes('Mode 2');
             if (isFatal) {

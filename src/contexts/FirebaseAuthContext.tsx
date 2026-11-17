@@ -463,31 +463,55 @@ export const FirebaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
       if (existingSnap.exists()) {
         return; // Server already persisted metadata & chunks cleanly
       }
+    } catch {
+      // Proceed to creation if existence pre-check could not read
+    }
+
+    const safeEmail = (auth.currentUser.email || v.ownerEmail || '').trim().slice(0, 254);
+    if (!safeEmail || safeEmail.length < 5) return;
+
+    const hex64 = /^[a-f0-9]{64}$/;
+    const fallbackSha = '0'.repeat(64);
+    const speakerSha = hex64.test(String(v.speakerConditioningSha256 || ''))
+      ? v.speakerConditioningSha256
+      : fallbackSha;
+    const promptSha = hex64.test(String(v.promptConditioningSha256 || ''))
+      ? v.promptConditioningSha256
+      : fallbackSha;
+    const cleanStorageKey = /^[a-zA-Z0-9_\-/]{5,200}$/.test(String(v.storageKey || ''))
+      ? v.storageKey
+      : `${v.ownerUid}/${v.voiceId}`.slice(0, 200);
+    const allowedGrades = ['Studio Grade', 'Good', 'Acceptable (Noisy)', 'Poor / Corrupted'];
+    const qualityGrade = allowedGrades.includes(v.qualityGrade) ? v.qualityGrade : 'Good';
+    const allowedSources = ['cloned_output', 'reference_upload', 'microphone', 'studio_sample'];
+    const sourceType = allowedSources.includes(v.sourceType) ? v.sourceType : 'reference_upload';
+
+    try {
       const refDur = Math.max(0.1, Math.min(1800, Number(v.referenceDurationSec) || 1));
       const promptDur = Math.max(0.1, Math.min(60, Number(v.promptDurationSec) || 1));
       await setDoc(docRef, {
         voiceId: v.voiceId,
         ownerUid: v.ownerUid,
-        ownerEmail: (auth.currentUser.email || v.ownerEmail).slice(0, 254),
+        ownerEmail: safeEmail,
         name: (String(v.name || 'Saved Voice').trim() || 'Saved Voice').slice(0, 80),
-        language: v.language,
+        language: ['bn', 'hi', 'en'].includes(v.language) ? v.language : 'bn',
         languageName: (String(v.languageName || v.language).trim() || 'Voice').slice(0, 64),
         conditioningMethod: (String(v.conditioningMethod || 'zero-shot-canonical-wav-v1').trim() || 'zero-shot-canonical-wav-v1').slice(0, 80),
         modelCheckpoint: (String(v.modelCheckpoint || 'Mode 2 Zero-Shot Neural').trim() || 'Mode 2 Zero-Shot Neural').slice(0, 160),
-        speakerConditioningSha256: v.speakerConditioningSha256,
-        promptConditioningSha256: v.promptConditioningSha256,
+        speakerConditioningSha256: speakerSha,
+        promptConditioningSha256: promptSha,
         referenceTranscript: String(v.referenceTranscript || '').slice(0, 1000),
         referenceDurationSec: refDur,
         promptDurationSec: promptDur,
-        fundamentalFreqHz: Number(v.fundamentalFreqHz) || 0,
-        pitchMinHz: Number(v.pitchMinHz) || 0,
-        pitchMaxHz: Number(v.pitchMaxHz) || 0,
-        spectralWarmthRatio: Number(v.spectralWarmthRatio) || 0,
-        estimatedSnrDb: Number(v.estimatedSnrDb) || 0,
-        qualityGrade: v.qualityGrade || 'Good',
-        sourceType: v.sourceType || 'reference_upload',
+        fundamentalFreqHz: Math.max(0, Math.min(1000, Number(v.fundamentalFreqHz) || 0)),
+        pitchMinHz: Math.max(0, Math.min(1000, Number(v.pitchMinHz) || 0)),
+        pitchMaxHz: Math.max(0, Math.min(2000, Number(v.pitchMaxHz) || 0)),
+        spectralWarmthRatio: Math.max(0, Math.min(1000, Number(v.spectralWarmthRatio) || 0)),
+        estimatedSnrDb: Math.max(-100, Math.min(200, Number(v.estimatedSnrDb) || 0)),
+        qualityGrade,
+        sourceType,
         sourceFileName: (String(v.sourceFileName || `${v.voiceId}.wav`).trim() || `${v.voiceId}.wav`).slice(0, 160),
-        storageKey: String(v.storageKey || `${v.ownerUid}/${v.voiceId}`).slice(0, 200),
+        storageKey: cleanStorageKey,
         consentConfirmed: true,
         usageCount: 0,
         lastUsedAt: serverTimestamp(),

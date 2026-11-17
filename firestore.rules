@@ -569,7 +569,7 @@ service cloud.firestore {
 
     // Persistent User-Isolated Saved Voice Profiles (Strictly owned and accessible by ownerUid only)
     match /savedVoices/{voiceId} {
-      allow get: if isValidId(voiceId) && isVerifiedUser() && existing().ownerUid == request.auth.uid;
+      allow get: if isValidId(voiceId) && isVerifiedUser() && (resource == null || existing().ownerUid == request.auth.uid);
       allow list: if isVerifiedUser() && resource.data.ownerUid == request.auth.uid;
       allow create: if isValidId(voiceId) &&
         isVerifiedUser() &&
@@ -621,8 +621,8 @@ service cloud.firestore {
         allow get: if isValidId(voiceId) &&
           isValidId(chunkId) &&
           isVerifiedUser() &&
-          existing().ownerUid == request.auth.uid &&
-          get(/databases/$(database)/documents/savedVoices/$(voiceId)).data.ownerUid == request.auth.uid;
+          get(/databases/$(database)/documents/savedVoices/$(voiceId)).data.ownerUid == request.auth.uid &&
+          (resource == null || existing().ownerUid == request.auth.uid);
         allow list: if isVerifiedUser() && resource.data.ownerUid == request.auth.uid;
         allow create: if isValidId(voiceId) &&
           isValidId(chunkId) &&
