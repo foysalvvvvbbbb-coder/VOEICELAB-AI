@@ -389,9 +389,9 @@ export async function inspectAndValidateAudioFile(
   }
 
   let qualityGrade: AudioSignalAnalysis['qualityGrade'] = 'Studio Grade';
-  if (pcmStats.rmsDb < -55 || durationSeconds < 0.4) {
+  if ((pcmStats.rmsDb < -64 && pcmStats.peakDb < -44) || pcmStats.rmsDb < -74 || durationSeconds < 0.4) {
     qualityGrade = 'Poor / Corrupted';
-  } else if (estimatedSnrDb < 14 || sampleRateHz < 16000) {
+  } else if (estimatedSnrDb < 14 || sampleRateHz < 16000 || pcmStats.rmsDb < -48) {
     qualityGrade = 'Acceptable (Noisy)';
   } else if (estimatedSnrDb < 22 || warnings.length > 0) {
     qualityGrade = 'Good';
@@ -3648,6 +3648,7 @@ export function formatSegmentsToSrt(segments: SrtSegment[]): string {
 
 export interface Auto10SecExtractResult {
   trimmed: boolean;
+  normalized?: boolean;
   outputPath: string;
   originalDurationSec: number;
   extractedDurationSec: number;
@@ -3655,10 +3656,129 @@ export interface Auto10SecExtractResult {
   windowEndSec: number;
 }
 
+interface SpeechWindowScanResult {
+  bestStartSec: number;
+  bestActiveRatio: number;
+  windowRmsDb: number;
+}
+
+async function scanBestSpeechWindowInRange(
+  inputPath: string,
+  scanStartSec: number,
+  scanDurationSec: number,
+  targetMaxSec: number,
+  scanPcmPath: string
+): Promise<SpeechWindowScanResult | null> {
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-ss',
+      String(scanStartSec),
+      '-i',
+      inputPath,
+      '-t',
+      String(scanDurationSec),
+      '-vn',
+      '-ar',
+      '8000',
+      '-ac',
+      '1',
+      '-f',
+      's16le',
+      scanPcmPath
+    ],
+    { timeout: 20_000 }
+  );
+  const pcmBuf = await fs.promises.readFile(scanPcmPath);
+  const frameSamples = 1600; // 200ms frames at 8kHz
+  const frameSec = 0.2;
+  const totalSamples = Math.floor(pcmBuf.length / 2);
+  const frameCount = Math.floor(totalSamples / frameSamples);
+  const windowFrames = Math.max(10, Math.round(targetMaxSec / frameSec)); // 50 frames = 10s
+  if (frameCount <= windowFrames) return null;
+
+  const frameDbs: number[] = [];
+  const framePeaks: number[] = [];
+  for (let f = 0; f < frameCount; f++) {
+    let sumSq = 0;
+    let peak = 0;
+    const base = f * frameSamples;
+    for (let s = 0; s < frameSamples; s++) {
+      const val = pcmBuf.readInt16LE((base + s) * 2) / 32768.0;
+      const absVal = Math.abs(val);
+      if (absVal > peak) peak = absVal;
+      sumSq += val * val;
+    }
+    const rms = Math.sqrt(sumSq / frameSamples);
+    frameDbs.push(rms > 1e-6 ? 20 * Math.log10(rms) : -96.0);
+    framePeaks.push(peak > 1e-6 ? 20 * Math.log10(peak) : -96.0);
+  }
+
+  const sortedDb = [...frameDbs].sort((a, b) => a - b);
+  const noiseFloorDb = sortedDb[Math.floor(sortedDb.length * 0.15)] ?? -65;
+  const p80Db = sortedDb[Math.floor(sortedDb.length * 0.8)] ?? -24;
+  // Adaptive speech threshold that works cleanly even for quiet -50 dBFS recordings
+  const speechThreshDb = Math.max(
+    -58,
+    Math.min(-24, noiseFloorDb + Math.max(6, (p80Db - noiseFloorDb) * 0.35))
+  );
+
+  let bestScore = -Infinity;
+  let bestFrameIdx = 0;
+  let bestActiveRatio = 0;
+  let bestWindowRmsDb = -96;
+
+  for (let start = 0; start <= frameCount - windowFrames; start++) {
+    let activeCount = 0;
+    let dbSum = 0;
+    let clippedCount = 0;
+    let windowAllDbSum = 0;
+    for (let k = 0; k < windowFrames; k++) {
+      const db = frameDbs[start + k];
+      windowAllDbSum += db;
+      if (db >= speechThreshDb) {
+        activeCount++;
+        dbSum += Math.min(-10, db);
+      }
+      if (framePeaks[start + k] > -0.8) {
+        clippedCount++;
+      }
+    }
+    const activeRatio = activeCount / windowFrames;
+    const avgActiveDbNorm = activeCount > 0 ? Math.max(0, (dbSum / activeCount + 55) / 45) : 0;
+    const earlyBias = 0.04 * (1 - start / Math.max(1, frameCount - windowFrames));
+    const score = activeRatio * 2.0 + avgActiveDbNorm * 0.35 - (clippedCount / windowFrames) * 0.4 + earlyBias;
+    if (score > bestScore) {
+      bestScore = score;
+      bestFrameIdx = start;
+      bestActiveRatio = activeRatio;
+      bestWindowRmsDb = windowAllDbSum / windowFrames;
+    }
+  }
+
+  // Trim leading silence inside the chosen 10s window when possible
+  let firstActiveOffset = 0;
+  for (let k = 0; k < Math.min(windowFrames - 10, 15); k++) {
+    if (frameDbs[bestFrameIdx + k] >= speechThreshDb) {
+      firstActiveOffset = k;
+      break;
+    }
+  }
+  const adjustedStartFrame = Math.min(frameCount - windowFrames, bestFrameIdx + firstActiveOffset);
+  const bestStartSec = Number(Math.max(0, scanStartSec + adjustedStartFrame * frameSec).toFixed(2));
+  return {
+    bestStartSec,
+    bestActiveRatio,
+    windowRmsDb: bestWindowRmsDb
+  };
+}
+
 /**
  * Automatically cuts the cleanest, most speech-rich 10-second window from any
  * reference voice exceeding 10 seconds, converting it to a canonical 24kHz mono WAV.
- * Files <= 10.05s pass through untouched.
+ * Quiet recordings (< -28 dBFS) are automatically loudness-normalized so zero-shot
+ * cloning receives healthy, non-silent speaker conditioning.
  */
 export async function extractAuto10SecVoiceCloneReference(
   inputPath: string,
@@ -3682,8 +3802,48 @@ export async function extractAuto10SecVoiceCloneReference(
   }
 
   if (originalDurationSec <= targetMaxSec + 0.05) {
+    // Check if short upload is very quiet (-68..-28 dBFS) and normalize it cleanly
+    try {
+      const quickStats = await analyzeVocalAcousticsFromAudioFile(inputPath);
+      if (quickStats.rmsDb < -28 && quickStats.peakDb > -66) {
+        const dur = Math.max(0.4, originalDurationSec || targetMaxSec);
+        const fadeOutStart = Math.max(0.1, dur - 0.02).toFixed(3);
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-y',
+            '-i',
+            inputPath,
+            '-vn',
+            '-af',
+            `asetpts=PTS-STARTPTS,highpass=f=70,loudnorm=I=-18:TP=-1.5:LRA=11,afade=t=in:ss=0:d=0.015,afade=t=out:st=${fadeOutStart}:d=0.015`,
+            '-ar',
+            '24000',
+            '-ac',
+            '1',
+            '-c:a',
+            'pcm_s16le',
+            outputWavPath
+          ],
+          { timeout: 20_000 }
+        );
+        return {
+          trimmed: false,
+          normalized: true,
+          outputPath: outputWavPath,
+          originalDurationSec,
+          extractedDurationSec: originalDurationSec,
+          windowStartSec: 0,
+          windowEndSec: originalDurationSec
+        };
+      }
+    } catch {
+      // Fall through to untouched original file
+    }
+
     return {
       trimmed: false,
+      normalized: false,
       outputPath: inputPath,
       originalDurationSec,
       extractedDurationSec: originalDurationSec,
@@ -3693,99 +3853,44 @@ export async function extractAuto10SecVoiceCloneReference(
   }
 
   let bestStartSec = 0;
-  const scanLimitSec = Math.min(originalDurationSec, 180);
+  let bestActiveRatio = 1;
+  let bestWindowRmsDb = -20;
   const scanPcmPath = `${outputWavPath}.scan8k.pcm`;
 
   try {
-    await execFileAsync(
-      'ffmpeg',
-      [
-        '-y',
-        '-i',
-        inputPath,
-        '-t',
-        String(scanLimitSec),
-        '-vn',
-        '-ar',
-        '8000',
-        '-ac',
-        '1',
-        '-f',
-        's16le',
-        scanPcmPath
-      ],
-      { timeout: 15_000 }
+    const firstPassDur = Math.min(originalDurationSec, 180);
+    const firstPass = await scanBestSpeechWindowInRange(
+      inputPath,
+      0,
+      firstPassDur,
+      targetMaxSec,
+      scanPcmPath
     );
-    const pcmBuf = await fs.promises.readFile(scanPcmPath);
-    const frameSamples = 1600; // 200ms frames at 8kHz
-    const frameSec = 0.2;
-    const totalSamples = Math.floor(pcmBuf.length / 2);
-    const frameCount = Math.floor(totalSamples / frameSamples);
-    const windowFrames = Math.max(10, Math.round(targetMaxSec / frameSec)); // 50 frames = 10s
+    if (firstPass) {
+      bestStartSec = firstPass.bestStartSec;
+      bestActiveRatio = firstPass.bestActiveRatio;
+      bestWindowRmsDb = firstPass.windowRmsDb;
+    }
 
-    if (frameCount > windowFrames) {
-      const frameDbs: number[] = [];
-      const framePeaks: number[] = [];
-      for (let f = 0; f < frameCount; f++) {
-        let sumSq = 0;
-        let peak = 0;
-        const base = f * frameSamples;
-        for (let s = 0; s < frameSamples; s++) {
-          const val = pcmBuf.readInt16LE((base + s) * 2) / 32768.0;
-          const absVal = Math.abs(val);
-          if (absVal > peak) peak = absVal;
-          sumSq += val * val;
-        }
-        const rms = Math.sqrt(sumSq / frameSamples);
-        frameDbs.push(rms > 1e-6 ? 20 * Math.log10(rms) : -96.0);
-        framePeaks.push(peak > 1e-6 ? 20 * Math.log10(peak) : -96.0);
+    // If the first 3 minutes were mostly intro music/silence, also scan 180s..600s
+    if (bestActiveRatio < 0.35 && originalDurationSec > 180 + targetMaxSec) {
+      const secondPassDur = Math.min(originalDurationSec - 180, 420);
+      const secondPass = await scanBestSpeechWindowInRange(
+        inputPath,
+        180,
+        secondPassDur,
+        targetMaxSec,
+        scanPcmPath
+      );
+      if (secondPass && secondPass.bestActiveRatio > bestActiveRatio) {
+        bestStartSec = secondPass.bestStartSec;
+        bestActiveRatio = secondPass.bestActiveRatio;
+        bestWindowRmsDb = secondPass.windowRmsDb;
       }
+    }
 
-      const sortedDb = [...frameDbs].sort((a, b) => a - b);
-      const noiseFloorDb = sortedDb[Math.floor(sortedDb.length * 0.15)] ?? -60;
-      const p80Db = sortedDb[Math.floor(sortedDb.length * 0.8)] ?? -20;
-      const speechThreshDb = Math.max(-46, Math.min(-24, noiseFloorDb + Math.max(8, (p80Db - noiseFloorDb) * 0.35)));
-
-      let bestScore = -Infinity;
-      let bestFrameIdx = 0;
-
-      for (let start = 0; start <= frameCount - windowFrames; start++) {
-        let activeCount = 0;
-        let dbSum = 0;
-        let clippedCount = 0;
-        for (let k = 0; k < windowFrames; k++) {
-          const db = frameDbs[start + k];
-          if (db >= speechThreshDb) {
-            activeCount++;
-            dbSum += Math.min(-10, db);
-          }
-          if (framePeaks[start + k] > -0.8) {
-            clippedCount++;
-          }
-        }
-        const activeRatio = activeCount / windowFrames;
-        const avgActiveDbNorm = activeCount > 0 ? Math.max(0, (dbSum / activeCount + 45) / 35) : 0;
-        const earlyBias = 0.04 * (1 - start / Math.max(1, frameCount - windowFrames));
-        const score = activeRatio * 2.0 + avgActiveDbNorm * 0.35 - (clippedCount / windowFrames) * 0.4 + earlyBias;
-        if (score > bestScore) {
-          bestScore = score;
-          bestFrameIdx = start;
-        }
-      }
-
-      // Trim any leading silence inside the chosen 10s window while keeping full 10s when available
-      let firstActiveOffset = 0;
-      for (let k = 0; k < Math.min(windowFrames - 10, 15); k++) {
-        if (frameDbs[bestFrameIdx + k] >= speechThreshDb) {
-          firstActiveOffset = k;
-          break;
-        }
-      }
-      const adjustedStartFrame = Math.min(frameCount - windowFrames, bestFrameIdx + firstActiveOffset);
-      bestStartSec = Number(Math.max(0, adjustedStartFrame * frameSec).toFixed(2));
-      if (bestStartSec + targetMaxSec > originalDurationSec) {
-        bestStartSec = Number(Math.max(0, originalDurationSec - targetMaxSec).toFixed(2));
-      }
+    if (bestStartSec + targetMaxSec > originalDurationSec) {
+      bestStartSec = Number(Math.max(0, originalDurationSec - targetMaxSec).toFixed(2));
     }
   } catch {
     bestStartSec = 0;
@@ -3793,20 +3898,34 @@ export async function extractAuto10SecVoiceCloneReference(
     await fs.promises.unlink(scanPcmPath).catch(() => {});
   }
 
-  const fadeOutStart = Math.max(0.1, targetMaxSec - 0.02).toFixed(3);
+  const actualClipDur = Math.max(0.5, Math.min(targetMaxSec, originalDurationSec - bestStartSec));
+  const fadeOutStart = Math.max(0.1, actualClipDur - 0.02).toFixed(3);
+  const filters: string[] = ['asetpts=PTS-STARTPTS'];
+
+  if (bestActiveRatio < 0.25) {
+    // Compact heavy pauses only when speech density inside the best window is low
+    filters.push('silenceremove=start_periods=1:start_threshold=-45dB:stop_periods=-1:stop_duration=0.4:stop_threshold=-45dB');
+  }
+
+  const needsGainRescue = bestWindowRmsDb < -26;
+  if (needsGainRescue) {
+    filters.push('highpass=f=70', 'loudnorm=I=-18:TP=-1.5:LRA=11');
+  }
+  filters.push(`afade=t=in:ss=0:d=0.015`, `afade=t=out:st=${fadeOutStart}:d=0.015`);
+
   await execFileAsync(
     'ffmpeg',
     [
       '-y',
-      '-i',
-      inputPath,
       '-ss',
       String(bestStartSec),
+      '-i',
+      inputPath,
       '-t',
-      String(targetMaxSec),
+      String(actualClipDur),
       '-vn',
       '-af',
-      `afade=t=in:ss=0:d=0.015,afade=t=out:st=${fadeOutStart}:d=0.015`,
+      filters.join(','),
       '-ar',
       '24000',
       '-ac',
@@ -3818,13 +3937,71 @@ export async function extractAuto10SecVoiceCloneReference(
     { timeout: 25_000 }
   );
 
+  const preNormStat = await fs.promises.stat(outputWavPath).catch(() => null);
+  if (bestActiveRatio < 0.25 && (!preNormStat || preNormStat.size < 44 + 24000 * 2 * 0.5)) {
+    const safeFilters = filters.filter((f) => !f.startsWith('silenceremove='));
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-ss',
+        String(bestStartSec),
+        '-i',
+        inputPath,
+        '-t',
+        String(actualClipDur),
+        '-vn',
+        '-af',
+        safeFilters.join(','),
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        outputWavPath
+      ],
+      { timeout: 25_000 }
+    );
+  }
+
+  // Double-check if compacted or quiet extracted clip still needs normalization
+  try {
+    const outStats = await analyzeVocalAcousticsFromAudioFile(outputWavPath);
+    if (outStats.rmsDb < -30 && outStats.peakDb > -68) {
+      const normalizedTmp = `${outputWavPath}.norm.wav`;
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          outputWavPath,
+          '-af',
+          'highpass=f=70,loudnorm=I=-18:TP=-1.5:LRA=11',
+          '-ar',
+          '24000',
+          '-ac',
+          '1',
+          '-c:a',
+          'pcm_s16le',
+          normalizedTmp
+        ],
+        { timeout: 15_000 }
+      );
+      await fs.promises.rename(normalizedTmp, outputWavPath);
+    }
+  } catch {
+    // Non-fatal fallback
+  }
+
   const stat = await fs.promises.stat(outputWavPath).catch(() => null);
   const extractedDurationSec = stat
     ? Number(Math.max(0.1, (stat.size - 44) / (24000 * 2)).toFixed(2))
-    : targetMaxSec;
+    : actualClipDur;
 
   return {
     trimmed: true,
+    normalized: needsGainRescue,
     outputPath: outputWavPath,
     originalDurationSec,
     extractedDurationSec,

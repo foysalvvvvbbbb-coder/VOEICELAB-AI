@@ -32,7 +32,13 @@ function loadFirebaseTarget(): { projectId: string; databaseId: string; docsBase
   }
 }
 
-const FIREBASE_TARGET = loadFirebaseTarget();
+let cachedFirebaseTarget: { projectId: string; databaseId: string; docsBaseUrl: string } | null = null;
+
+function getFirebaseTarget(): { projectId: string; databaseId: string; docsBaseUrl: string } | null {
+  if (cachedFirebaseTarget) return cachedFirebaseTarget;
+  cachedFirebaseTarget = loadFirebaseTarget();
+  return cachedFirebaseTarget;
+}
 
 export function extractBearerTokenFromAuthHeader(authHeader: string | undefined): string | null {
   const raw = String(authHeader || '').trim();
@@ -42,11 +48,12 @@ export function extractBearerTokenFromAuthHeader(authHeader: string | undefined)
 }
 
 function docResourceName(relativePath: string): string {
-  if (!FIREBASE_TARGET) {
+  const target = getFirebaseTarget();
+  if (!target) {
     throw new Error('Firebase configuration unavailable.');
   }
   const cleanRel = relativePath.replace(/^\/+/, '');
-  return `projects/${FIREBASE_TARGET.projectId}/databases/${FIREBASE_TARGET.databaseId}/documents/${cleanRel}`;
+  return `projects/${target.projectId}/databases/${target.databaseId}/documents/${cleanRel}`;
 }
 
 function decodeFsValue(val: any): any {
@@ -153,8 +160,9 @@ async function commitWritesInBatches(
   writes: any[],
   batchSize = 6
 ): Promise<void> {
-  if (!FIREBASE_TARGET || writes.length === 0) return;
-  const commitUrl = `${FIREBASE_TARGET.docsBaseUrl}:commit`;
+  const target = getFirebaseTarget();
+  if (!target || writes.length === 0) return;
+  const commitUrl = `${target.docsBaseUrl}:commit`;
   for (let i = 0; i < writes.length; i += batchSize) {
     const slice = writes.slice(i, i + batchSize);
     await firestoreFetchJson(commitUrl, bearerToken, {
@@ -275,7 +283,8 @@ export async function persistSavedVoiceAndAudioToFirestore(params: {
   promptWavPath: string;
   vaultDir: string;
 }): Promise<{ synced: boolean; uploadedChunks: number; error?: string }> {
-  if (!FIREBASE_TARGET || !params.bearerToken) {
+  const target = getFirebaseTarget();
+  if (!target || !params.bearerToken) {
     return { synced: false, uploadedChunks: 0, error: 'Missing Firebase config or user token.' };
   }
 
@@ -291,7 +300,7 @@ export async function persistSavedVoiceAndAudioToFirestore(params: {
     }
 
     // Ensure parent profile doc exists FIRST (required by firestore.rules Master Gate on subcollection create)
-    const profileUrl = `${FIREBASE_TARGET.docsBaseUrl}/savedVoices/${encodeURIComponent(params.profile.voiceId)}`;
+    const profileUrl = `${target.docsBaseUrl}/savedVoices/${encodeURIComponent(params.profile.voiceId)}`;
     let parentExists = false;
     try {
       await firestoreFetchJson(profileUrl, params.bearerToken, { method: 'GET' });
@@ -381,8 +390,9 @@ async function queryVoiceConditioningChunks(
   voiceId: string,
   ownerUid: string
 ): Promise<RawConditioningChunk[]> {
-  if (!FIREBASE_TARGET) return [];
-  const queryUrl = `${FIREBASE_TARGET.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}:runQuery`;
+  const target = getFirebaseTarget();
+  if (!target) return [];
+  const queryUrl = `${target.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}:runQuery`;
   const rows = await firestoreFetchJson(queryUrl, bearerToken, {
     method: 'POST',
     body: JSON.stringify({
@@ -422,9 +432,10 @@ export async function listUserSavedVoicesFromFirestore(
   bearerToken: string | null,
   ownerUid: string
 ): Promise<SavedVoiceProfile[]> {
-  if (!FIREBASE_TARGET || !bearerToken || !ownerUid) return [];
+  const target = getFirebaseTarget();
+  if (!target || !bearerToken || !ownerUid) return [];
   try {
-    const queryUrl = `${FIREBASE_TARGET.docsBaseUrl}:runQuery`;
+    const queryUrl = `${target.docsBaseUrl}:runQuery`;
     const rows = await firestoreFetchJson(queryUrl, bearerToken, {
       method: 'POST',
       body: JSON.stringify({
@@ -461,9 +472,10 @@ export async function fetchSingleSavedVoiceFromFirestore(
   bearerToken: string | null,
   voiceId: string
 ): Promise<SavedVoiceProfile | null> {
-  if (!FIREBASE_TARGET || !bearerToken || !voiceId) return null;
+  const target = getFirebaseTarget();
+  if (!target || !bearerToken || !voiceId) return null;
   try {
-    const url = `${FIREBASE_TARGET.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}`;
+    const url = `${target.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}`;
     const doc = await firestoreFetchJson(url, bearerToken, { method: 'GET' });
     const decoded = decodeFsDocument(doc);
     return decoded ? mapDecodedProfile(decoded) : null;
@@ -477,9 +489,10 @@ export async function checkCloudConditioningExists(
   voiceId: string,
   ownerUid: string
 ): Promise<boolean> {
-  if (!FIREBASE_TARGET || !bearerToken || !voiceId || !ownerUid) return false;
+  const target = getFirebaseTarget();
+  if (!target || !bearerToken || !voiceId || !ownerUid) return false;
   try {
-    const queryUrl = `${FIREBASE_TARGET.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}:runQuery`;
+    const queryUrl = `${target.docsBaseUrl}/savedVoices/${encodeURIComponent(voiceId)}:runQuery`;
     const rows = await firestoreFetchJson(queryUrl, bearerToken, {
       method: 'POST',
       body: JSON.stringify({
@@ -533,7 +546,7 @@ export async function hydrateSavedVoiceFilesFromFirestore(params: {
   hydrated: boolean;
   profile: SavedVoiceProfile | null;
 }> {
-  if (!FIREBASE_TARGET || !params.bearerToken) {
+  if (!getFirebaseTarget() || !params.bearerToken) {
     return { hydrated: false, profile: null };
   }
 
@@ -598,7 +611,7 @@ export async function renameSavedVoiceInFirestore(
   voiceId: string,
   nextName: string
 ): Promise<void> {
-  if (!FIREBASE_TARGET || !bearerToken) return;
+  if (!getFirebaseTarget() || !bearerToken) return;
   await commitWritesInBatches(bearerToken, [
     {
       update: {
@@ -618,7 +631,7 @@ export async function incrementSavedVoiceUsageInFirestore(
   bearerToken: string | null,
   voiceId: string
 ): Promise<void> {
-  if (!FIREBASE_TARGET || !bearerToken) return;
+  if (!getFirebaseTarget() || !bearerToken) return;
   await commitWritesInBatches(bearerToken, [
     {
       update: {
@@ -641,7 +654,7 @@ export async function deleteSavedVoiceFromFirestore(
   voiceId: string,
   ownerUid: string
 ): Promise<void> {
-  if (!FIREBASE_TARGET || !bearerToken) return;
+  if (!getFirebaseTarget() || !bearerToken) return;
   const chunks = await queryVoiceConditioningChunks(bearerToken, voiceId, ownerUid).catch(() => []);
   const deletes: any[] = chunks.map((c) => ({
     delete: docResourceName(`savedVoices/${voiceId}/conditioningChunks/${c.chunkId}`)

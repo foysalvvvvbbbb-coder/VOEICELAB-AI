@@ -117,6 +117,7 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
     savedVoicesLoading,
     saveVoiceProfile,
     renameSavedVoiceProfile,
+    restoreSavedVoiceConditioning,
     deleteSavedVoiceProfile,
     recordSavedVoiceUsage,
     fetchSavedVoicePreviewBlobUrl,
@@ -144,6 +145,9 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
   const [renameLoadingId, setRenameLoadingId] = useState<string | null>(null);
   const [deletingVoiceId, setDeletingVoiceId] = useState<string | null>(null);
   const [deleteLoadingId, setDeleteLoadingId] = useState<string | null>(null);
+  const [restoringVoiceId, setRestoringVoiceId] = useState<string | null>(null);
+  const restoreTargetVoiceIdRef = useRef<string | null>(null);
+  const restoreFileInputRef = useRef<HTMLInputElement | null>(null);
   const [previewVoiceId, setPreviewVoiceId] = useState<string | null>(null);
   const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
   const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
@@ -762,6 +766,61 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
       });
     } finally {
       setDeleteLoadingId(null);
+    }
+  };
+
+  const handleRestoreVoiceFromReferenceId = async (voice: SavedVoiceProfile, refFileId: string) => {
+    setRestoringVoiceId(voice.voiceId);
+    setSaveVoiceFeedback(null);
+    try {
+      const resp = await restoreSavedVoiceConditioning(voice.voiceId, refFileId);
+      setSelectedSavedVoiceId(resp.voice.voiceId);
+      setSaveVoiceFeedback({
+        type: 'success',
+        text: `Restored "${resp.voice.name}" conditioning audio permanently to Cloud Vault.`
+      });
+    } catch (err: any) {
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: err?.message || 'Failed to restore voice conditioning audio.'
+      });
+    } finally {
+      setRestoringVoiceId(null);
+    }
+  };
+
+  const handleTriggerRestoreFilePicker = (voiceId: string) => {
+    restoreTargetVoiceIdRef.current = voiceId;
+    if (restoreFileInputRef.current) {
+      restoreFileInputRef.current.value = '';
+      restoreFileInputRef.current.click();
+    }
+  };
+
+  const handleRestoreFileSelected = async (file: File | undefined) => {
+    const targetVoiceId = restoreTargetVoiceIdRef.current;
+    restoreTargetVoiceIdRef.current = null;
+    if (!file || !targetVoiceId) return;
+    const targetVoice = savedVoices.find((v) => v.voiceId === targetVoiceId);
+    if (!targetVoice) return;
+
+    setRestoringVoiceId(targetVoiceId);
+    setSaveVoiceFeedback(null);
+    try {
+      const formData = new FormData();
+      formData.append('audio', file);
+      formData.append('workspace', 'voice-cloning');
+      const uploadRes = await fetchApiJson<{ analysis: AudioSignalAnalysis }>('/api/audio/upload', {
+        method: 'POST',
+        body: formData
+      });
+      await handleRestoreVoiceFromReferenceId(targetVoice, uploadRes.analysis.fileId);
+    } catch (err: any) {
+      setSaveVoiceFeedback({
+        type: 'error',
+        text: err?.message || 'Failed to upload & restore voice conditioning audio.'
+      });
+      setRestoringVoiceId(null);
     }
   };
 
@@ -1424,9 +1483,39 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
                       <span>Permanent Cloud + Vault Speaker Conditioning Active</span>
                     </div>
                   ) : (
-                    <div className="text-[10px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-2 py-1">
-                      Speaker conditioning audio missing. Re-upload reference once to restore
-                      cloud vault.
+                    <div className="text-[10px] text-amber-300 bg-amber-950/50 border border-amber-500/40 rounded-lg px-2 py-1.5 space-y-1.5">
+                      <div>
+                        Speaker conditioning audio missing. Restore once to sync permanently to cloud vault.
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleTriggerRestoreFilePicker(voice.voiceId)}
+                          disabled={restoringVoiceId === voice.voiceId}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/35 border border-amber-400/50 text-amber-100 font-semibold cursor-pointer disabled:opacity-50"
+                        >
+                          {restoringVoiceId === voice.voiceId ? (
+                            <>
+                              <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                              <span>Restoring...</span>
+                            </>
+                          ) : (
+                            <span>Restore Audio</span>
+                          )}
+                        </button>
+                        {referenceAnalysis?.isValid && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleRestoreVoiceFromReferenceId(voice, referenceAnalysis.fileId)
+                            }
+                            disabled={restoringVoiceId === voice.voiceId}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#16A36A]/25 hover:bg-[#16A36A]/40 border border-[#16A36A]/50 text-[#42D9A0] font-semibold cursor-pointer disabled:opacity-50"
+                          >
+                            <span>Link Step 01 Audio</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
                   )}
 
@@ -1534,6 +1623,13 @@ export const VoiceCloningWorkspace: React.FC<VoiceCloningWorkspaceProps> = ({
             {saveVoiceFeedback.text}
           </div>
         )}
+        <input
+          ref={restoreFileInputRef}
+          type="file"
+          accept="audio/*"
+          className="hidden"
+          onChange={(e) => void handleRestoreFileSelected(e.target.files?.[0])}
+        />
       </div>
 
       {/* Main Two-Column Studio Grid */}

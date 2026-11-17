@@ -76,7 +76,12 @@ function resolveFirebaseProjectId(): string {
   return '';
 }
 
-const FIREBASE_PROJECT_ID = resolveFirebaseProjectId();
+let cachedFirebaseProjectId = resolveFirebaseProjectId();
+function getFirebaseProjectId(): string {
+  if (cachedFirebaseProjectId) return cachedFirebaseProjectId;
+  cachedFirebaseProjectId = resolveFirebaseProjectId();
+  return cachedFirebaseProjectId;
+}
 const FIREBASE_JWKS = createRemoteJWKSet(
   new URL(
     'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'
@@ -1599,7 +1604,8 @@ async function startServer() {
   async function extractVerifiedFirebaseIdentity(
     req: express.Request
   ): Promise<VerifiedFirebaseIdentity | null> {
-    if (!FIREBASE_PROJECT_ID) return null;
+    const projectId = getFirebaseProjectId();
+    if (!projectId) return null;
     const authHeader = String(req.headers.authorization || '').trim();
     if (!authHeader.toLowerCase().startsWith('bearer ')) return null;
     const token = authHeader.slice(7).trim();
@@ -1607,8 +1613,8 @@ async function startServer() {
 
     try {
       const { payload } = await jwtVerify(token, FIREBASE_JWKS, {
-        issuer: `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`,
-        audience: FIREBASE_PROJECT_ID
+        issuer: `https://securetoken.google.com/${projectId}`,
+        audience: projectId
       });
       const uid = typeof payload.sub === 'string' ? payload.sub : '';
       const email = typeof payload.email === 'string' ? payload.email.toLowerCase() : '';
@@ -2086,18 +2092,24 @@ async function startServer() {
             trimmed10sPath,
             10
           );
-          if (autoExtract.trimmed && fs.existsSync(autoExtract.outputPath)) {
+          if ((autoExtract.trimmed || autoExtract.normalized) && fs.existsSync(autoExtract.outputPath)) {
             activeAudioPath = autoExtract.outputPath;
             effectiveMimeType = 'audio/wav';
-            autoTrimMeta = {
-              originalDurationSec: autoExtract.originalDurationSec,
-              windowStartSec: autoExtract.windowStartSec,
-              windowEndSec: autoExtract.windowEndSec
-            };
-            await fs.promises.unlink(req.file.path).catch(() => {});
+            if (autoExtract.trimmed) {
+              autoTrimMeta = {
+                originalDurationSec: autoExtract.originalDurationSec,
+                windowStartSec: autoExtract.windowStartSec,
+                windowEndSec: autoExtract.windowEndSec
+              };
+            }
+            if (autoExtract.outputPath !== req.file.path) {
+              await fs.promises.unlink(req.file.path).catch(() => {});
+            }
             emitServerOperationProgress(operationId, {
               stageIndex: 1,
-              stageLabel: `Auto-cut cleanest 10.0s speech clip from ${autoExtract.originalDurationSec}s reference audio...`,
+              stageLabel: autoExtract.trimmed
+                ? `Auto-cut cleanest 10.0s speech clip from ${autoExtract.originalDurationSec}s reference audio...`
+                : 'Auto-normalized quiet reference audio for clean speaker conditioning...',
               progressPct: null,
               progressSource: 'indeterminate-inference',
               status: 'running'
@@ -3502,6 +3514,135 @@ async function startServer() {
     } catch (err: any) {
       res.status(400).type('application/json').json({
         error: err?.message || 'Failed to save persistent voice profile.'
+      });
+    }
+  });
+
+  app.post('/api/voices/:voiceId/restore', requireAuthenticatedSession, requireVerifiedUser, async (req, res) => {
+    const identity = (req as any).firebaseIdentity as VerifiedFirebaseIdentity;
+    const bearerToken = extractBearerTokenFromAuthHeader(req.headers.authorization);
+    const voiceId = String(req.params.voiceId || '').trim();
+    if (!SAFE_IDENTIFIER_REGEX.test(voiceId)) {
+      res.status(400).type('application/json').json({ error: 'Invalid voice profile identifier.' });
+      return;
+    }
+
+    const cleanRefId = typeof req.body?.referenceFileId === 'string' ? req.body.referenceFileId.trim() : '';
+    if (!cleanRefId || !SAFE_IDENTIFIER_REGEX.test(cleanRefId)) {
+      res.status(400).type('application/json').json({
+        error: 'Valid reference audio identifier is required to restore cloud speaker conditioning.'
+      });
+      return;
+    }
+
+    const refEntry =
+      uploadedFilesRegistry.get(cleanRefId) || (await resolveUploadedFileEntry(cleanRefId));
+    if (!refEntry || !fs.existsSync(refEntry.filePath)) {
+      res.status(404).type('application/json').json({
+        error: 'Reference audio recording was not found. Please upload reference audio first.'
+      });
+      return;
+    }
+
+    let existing: ServerSavedVoiceRecord | undefined = savedVoicesRegistry.get(voiceId);
+    if (!existing && bearerToken) {
+      const cloudProfile = await fetchSingleSavedVoiceFromFirestore(bearerToken, voiceId);
+      if (cloudProfile) {
+        existing = {
+          ...cloudProfile,
+          hasConditioningAudio: false,
+          referenceAnalysis: buildSyntheticAnalysisFromProfile(cloudProfile)
+        };
+      }
+    }
+    if (!existing) {
+      res.status(404).type('application/json').json({ error: 'Saved voice profile not found.' });
+      return;
+    }
+    if (existing.ownerUid !== identity.uid) {
+      res.status(403).type('application/json').json({
+        error: 'Access denied: You can only restore your own saved voice profiles.',
+        code: 'VOICE_FORBIDDEN'
+      });
+      return;
+    }
+
+    const vaultPaths = resolveVaultVoicePaths(identity.uid, voiceId);
+    if (!vaultPaths) {
+      res.status(400).type('application/json').json({ error: 'Invalid user or voice profile identifier.' });
+      return;
+    }
+
+    try {
+      await fs.promises.mkdir(vaultPaths.dir, { recursive: true });
+      await execFileAsync(
+        'ffmpeg',
+        ['-y', '-i', refEntry.filePath, '-ar', '24000', '-ac', '1', '-c:a', 'pcm_s16le', vaultPaths.refWavPath],
+        { timeout: 20_000 }
+      );
+
+      const refBytes = await fs.promises.readFile(vaultPaths.refWavPath);
+      const speakerConditioningSha256 = crypto.createHash('sha256').update(refBytes).digest('hex');
+      const promptBytes = await prepareCanonicalSpeakerPromptWav(
+        refBytes,
+        vaultPaths.dir,
+        speakerConditioningSha256
+      );
+      await fs.promises.writeFile(vaultPaths.promptWavPath, promptBytes);
+      const promptConditioningSha256 = crypto.createHash('sha256').update(promptBytes).digest('hex');
+
+      const canonicalAnalysis = await inspectAndValidateAudioFile(
+        vaultPaths.refWavPath,
+        voiceId,
+        refEntry.analysis.fileName || existing.sourceFileName || `${voiceId}.wav`,
+        'audio/wav',
+        `/api/voices/${encodeURIComponent(voiceId)}/preview`
+      );
+      if (refEntry.analysis.detectedSpokenLanguage) {
+        canonicalAnalysis.detectedSpokenLanguage = refEntry.analysis.detectedSpokenLanguage;
+      }
+
+      const promptDurationSec = Number(Math.max(0.3, (promptBytes.length - 44) / (24000 * 2)).toFixed(2));
+      const updatedRecord: ServerSavedVoiceRecord = {
+        ...existing,
+        speakerConditioningSha256,
+        promptConditioningSha256,
+        referenceDurationSec: Number(canonicalAnalysis.durationSeconds || existing.referenceDurationSec || 1),
+        promptDurationSec,
+        fundamentalFreqHz: Number(canonicalAnalysis.fundamentalFreqHz || existing.fundamentalFreqHz || 0),
+        pitchMinHz: Number(canonicalAnalysis.pitchRangeHz?.[0] || existing.pitchMinHz || 0),
+        pitchMaxHz: Number(canonicalAnalysis.pitchRangeHz?.[1] || existing.pitchMaxHz || 0),
+        spectralWarmthRatio: Number(canonicalAnalysis.spectralWarmthRatio || existing.spectralWarmthRatio || 0),
+        estimatedSnrDb: Number(canonicalAnalysis.estimatedSnrDb || existing.estimatedSnrDb || 0),
+        qualityGrade: canonicalAnalysis.qualityGrade || existing.qualityGrade || 'Good',
+        hasConditioningAudio: true,
+        updatedAt: new Date().toISOString(),
+        referenceAnalysis: {
+          ...canonicalAnalysis,
+          fileId: voiceId,
+          previewUrl: `/api/voices/${encodeURIComponent(voiceId)}/preview`
+        }
+      };
+
+      await persistSavedVoiceProfileRecord(updatedRecord);
+      const serialized = serializeSavedVoiceProfile(updatedRecord, true);
+
+      const cloudPersist = await persistSavedVoiceAndAudioToFirestore({
+        bearerToken,
+        profile: serialized,
+        refWavPath: vaultPaths.refWavPath,
+        promptWavPath: vaultPaths.promptWavPath,
+        vaultDir: vaultPaths.dir
+      });
+
+      res.status(200).type('application/json').json({
+        voice: serialized,
+        cloudSynced: cloudPersist.synced,
+        cloudSyncWarning: cloudPersist.synced ? undefined : cloudPersist.error
+      });
+    } catch (err: any) {
+      res.status(400).type('application/json').json({
+        error: err?.message || 'Failed to restore speaker conditioning audio.'
       });
     }
   });

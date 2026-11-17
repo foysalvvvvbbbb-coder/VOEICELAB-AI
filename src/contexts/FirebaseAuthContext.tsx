@@ -301,6 +301,10 @@ interface FirebaseAuthContextValue {
     deduplicateByPromptHash?: boolean;
   }) => Promise<{ voice: SavedVoiceProfile; deduplicated?: boolean }>;
   renameSavedVoiceProfile: (voiceId: string, nextName: string) => Promise<SavedVoiceProfile>;
+  restoreSavedVoiceConditioning: (
+    voiceId: string,
+    referenceFileId: string
+  ) => Promise<{ voice: SavedVoiceProfile; cloudSynced?: boolean }>;
   deleteSavedVoiceProfile: (voiceId: string) => Promise<void>;
   recordSavedVoiceUsage: (voiceId: string) => Promise<void>;
   fetchSavedVoicePreviewBlobUrl: (voiceId: string) => Promise<string>;
@@ -796,6 +800,26 @@ export const FirebaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
     [refreshSavedVoices]
   );
 
+  const restoreSavedVoiceConditioning = useCallback(
+    async (
+      voiceId: string,
+      referenceFileId: string
+    ): Promise<{ voice: SavedVoiceProfile; cloudSynced?: boolean }> => {
+      const resp = await fetchApiJson<{
+        voice: SavedVoiceProfile;
+        cloudSynced?: boolean;
+        cloudSyncWarning?: string;
+      }>(`/api/voices/${encodeURIComponent(voiceId)}/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ referenceFileId })
+      });
+      await refreshSavedVoices();
+      return { voice: resp.voice, cloudSynced: resp.cloudSynced };
+    },
+    [refreshSavedVoices]
+  );
+
   const deleteSavedVoiceProfile = useCallback(
     async (voiceId: string): Promise<void> => {
       await fetchApiJson(`/api/voices/${encodeURIComponent(voiceId)}`, {
@@ -1146,6 +1170,7 @@ export const FirebaseAuthProvider: React.FC<{ children: React.ReactNode }> = ({ 
         refreshSavedVoices,
         saveVoiceProfile,
         renameSavedVoiceProfile,
+        restoreSavedVoiceConditioning,
         deleteSavedVoiceProfile,
         recordSavedVoiceUsage,
         fetchSavedVoicePreviewBlobUrl,
