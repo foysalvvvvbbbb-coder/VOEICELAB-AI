@@ -686,7 +686,7 @@ const cleanupIntervalTimer = setInterval(() => {
 cleanupIntervalTimer.unref?.();
 
 async function startServer() {
-  await verifyMediaBinaries();
+  void verifyMediaBinaries();
 
   const app = express();
   app.disable('x-powered-by');
@@ -4442,14 +4442,34 @@ async function startServer() {
     });
   });
 
-  // Mount Vite dev server or static production assets
+  // Mount Vite dev server (initialized in parallel so /api/* routes listen on port 3000 immediately)
+  // or static production assets
   if (!IS_PRODUCTION) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa'
+    let resolvedViteMiddlewares: express.RequestHandler | null = null;
+    const viteReadyPromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: process.env.DISABLE_HMR === 'true' ? false : undefined
+        },
+        appType: 'spa'
+      });
+      resolvedViteMiddlewares = vite.middlewares;
+      return vite.middlewares;
+    })();
+    viteReadyPromise.catch((viteErr) => {
+      console.error('[VoiceLab AI] Vite middleware initialization error:', viteErr);
     });
-    app.use(vite.middlewares);
+
+    app.use(async (req, res, next) => {
+      try {
+        const handler = resolvedViteMiddlewares || (await viteReadyPromise);
+        handler(req, res, next);
+      } catch (err) {
+        next(err);
+      }
+    });
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(

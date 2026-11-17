@@ -110,6 +110,85 @@ async function recoverAuthBridgeSessionViaHiddenIframe(): Promise<boolean> {
   });
 }
 
+function isWarmupHtmlResponse(status: number, contentType: string, rawText: string): boolean {
+  const trimmed = rawText.trimStart();
+  const lower = trimmed.toLowerCase();
+  const isHtml =
+    contentType.toLowerCase().includes('text/html') ||
+    lower.startsWith('<!doctype') ||
+    lower.startsWith('<html');
+  if (!isHtml) return false;
+  if (trimmed.includes('__cookie_check') || trimmed.includes('applet-auth-bridge')) {
+    return false;
+  }
+  return (
+    trimmed.includes('Starting Server') ||
+    lower.includes('starting server') ||
+    lower.includes('warmup') ||
+    lower.includes('warming up') ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+async function waitForServerWarmupReady(
+  signal?: AbortSignal | null,
+  onRetry?: (attempt: number, reason: string) => void
+): Promise<boolean> {
+  const healthUrl = resolveApiUrl('/api/health');
+  const maxChecks = 20; // Up to ~30 seconds for cold container startup
+  for (let i = 0; i < maxChecks; i++) {
+    if (signal?.aborted) {
+      const abortErr = new Error('The operation was aborted.');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+    onRetry?.(i + 1, 'Server warming up — waiting for backend readiness');
+    try {
+      const res = await fetch(healthUrl, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        signal,
+        headers: {
+          Accept: 'application/json',
+          'X-Requested-With': 'VoiceLab-Web-Client'
+        }
+      });
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      const body = (await res.text()).trimStart();
+      if (res.ok && (ct.includes('application/json') || body.startsWith('{'))) {
+        return true;
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || signal?.aborted) {
+        throw err;
+      }
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, 1500);
+      const onAbort = () => {
+        clearTimeout(timer);
+        const abortErr = new Error('The operation was aborted.');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+      };
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+  return false;
+}
+
 /**
  * Performs a lightweight GET /api/auth/session handshake.
  * Ensures both the Express session cookie (voicelab_sid) and the AI Studio Nginx
@@ -135,16 +214,32 @@ export async function ensureSessionInitialized(force = false): Promise<boolean> 
         headers.set('X-VoiceLab-Session', cachedSessionToken);
       }
 
-      const res = await fetch(sessionUrl, {
+      let res = await fetch(sessionUrl, {
         method: 'GET',
         headers,
         credentials: 'include',
         cache: 'no-store'
       });
 
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-      const rawText = await res.text();
-      const trimmed = rawText.trimStart();
+      let contentType = (res.headers.get('content-type') || '').toLowerCase();
+      let rawText = await res.text();
+      let trimmed = rawText.trimStart();
+
+      // If proxy returned "Starting Server..." warmup page, wait for /api/health JSON first
+      if (isWarmupHtmlResponse(res.status, contentType, rawText)) {
+        const ready = await waitForServerWarmupReady();
+        if (ready) {
+          res = await fetch(sessionUrl, {
+            method: 'GET',
+            headers,
+            credentials: 'include',
+            cache: 'no-store'
+          });
+          contentType = (res.headers.get('content-type') || '').toLowerCase();
+          rawText = await res.text();
+          trimmed = rawText.trimStart();
+        }
+      }
 
       const isHtml =
         contentType.includes('text/html') ||
@@ -351,7 +446,7 @@ function executeTransportRequest(
 export async function fetchApiJson<T = any>(
   url: string,
   options: ApiRequestOptions = {},
-  maxWarmupRetries = 3
+  maxWarmupRetries = 5
 ): Promise<T> {
   const targetUrl = resolveApiUrl(url);
   const method = String(options.method || 'GET').toUpperCase();
@@ -398,7 +493,25 @@ export async function fetchApiJson<T = any>(
       headers.set('X-VoiceLab-Session', cachedSessionToken);
     }
 
-    const response = await executeTransportRequest(targetUrl, method, headers, options);
+    let response: RawTransportResponse;
+    try {
+      response = await executeTransportRequest(targetUrl, method, headers, options);
+    } catch (transportErr: any) {
+      if (
+        transportErr?.name !== 'AbortError' &&
+        !options.signal?.aborted &&
+        (typeof navigator === 'undefined' || navigator.onLine) &&
+        attempt < 2
+      ) {
+        attempt++;
+        const ready = await waitForServerWarmupReady(options.signal, options.onRetry);
+        if (ready) {
+          await ensureSessionInitialized(true);
+          continue;
+        }
+      }
+      throw transportErr;
+    }
 
     if (response.refreshedSessionToken) {
       cachedSessionToken = response.refreshedSessionToken;
@@ -415,20 +528,6 @@ export async function fetchApiJson<T = any>(
       trimmed.toLowerCase().startsWith('<html');
 
     if (isHtmlPayload) {
-      const isWarmupPage =
-        trimmed.includes('Starting Server') ||
-        trimmed.includes('warmup') ||
-        response.status === 502 ||
-        response.status === 503 ||
-        response.status === 504;
-
-      if (isWarmupPage && attempt < maxWarmupRetries) {
-        attempt++;
-        options.onRetry?.(attempt, 'Server warming up — retrying request');
-        await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
-        continue;
-      }
-
       const isCookieCheckOrAuth =
         response.redirected ||
         response.responseUrl.includes('__cookie_check') ||
@@ -448,6 +547,23 @@ export async function fetchApiJson<T = any>(
         throw new Error(
           `Session authentication check intercepted the API request to ${url}. Please refresh the page and try again.`
         );
+      }
+
+      const isWarmupPage =
+        isWarmupHtmlResponse(response.status, contentType, rawText) ||
+        response.status === 502 ||
+        response.status === 503 ||
+        response.status === 504;
+
+      if (isWarmupPage && attempt < maxWarmupRetries) {
+        attempt++;
+        const ready = await waitForServerWarmupReady(options.signal, options.onRetry);
+        if (ready) {
+          await ensureSessionInitialized(true);
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+        continue;
       }
 
       const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
